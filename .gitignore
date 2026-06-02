@@ -1,0 +1,38 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Build output
+build/
+dist/
+*.whl
+*.tar.gz
+
+# Resolver lockfile — this is a library; it resolves fresh against the
+# published dependency ranges rather than pinning a committed lock.
+uv.lock
+
+# Virtual environments
+.venv/
+venv/
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Editor and IDE directories
+.idea/
+.vscode/
+*.swp
