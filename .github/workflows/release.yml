@@ -1,0 +1,107 @@
+name: release
+
+# ONE-TIME registry setup: at pypi.org configure a GitHub Actions Trusted
+# Publisher (OIDC) with these EXACT fields:
+#     Owner             : cardanowall
+#     Repository        : cip309-py
+#     Workflow filename : release.yml
+#     PyPI Project Name : cardanowall-sdk
+#     Environment       : (leave blank)
+#
+# PyPI supports a PENDING publisher: this mapping can be created BEFORE the
+# project exists, so the very first publish already authenticates over OIDC and
+# no token is ever required. The PYPI_API_TOKEN secret (UV_PUBLISH_TOKEN) is an
+# OPTIONAL fallback only — leave it unset when a (pending) Trusted Publisher is
+# configured.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run (build + twine check; skip the PyPI upload and the GitHub Release)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  # id-token is required for PyPI Trusted-Publisher OIDC (`uv publish`).
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Sync dependencies (runtime + dev)
+        run: uv sync
+
+      # ---- Gates: the standalone CI suite, re-run as release-blockers ----------
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Type-check (mypy --strict)
+        run: uv run mypy --strict src tests
+
+      - name: Test (pytest)
+        run: uv run pytest -q
+
+      # ---- Build + validate artifacts -----------------------------------------
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Check distribution metadata (twine)
+        run: uvx twine check dist/*
+
+      # ---- Publish to PyPI (OIDC Trusted Publishing) -----------------------------
+      # Publishes via the repo's configured PyPI Trusted Publisher (OIDC) — no
+      # token. Do NOT set UV_PUBLISH_TOKEN to an empty value here: uv would then
+      # attempt empty-token auth and fail with 403 instead of using trusted
+      # publishing. For a token-based publish instead, set UV_PUBLISH_TOKEN in the
+      # job env from a PYPI_API_TOKEN secret.
+      - name: Publish to PyPI (dry-run on workflow_dispatch)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            # uv publish has no --dry-run flag; the build + twine check above
+            # already validated the artifacts, so skip the upload entirely.
+            echo "Dry-run: skipping uv publish"
+          else
+            uv publish dist/* --trusted-publishing automatic
+          fi
+
+      # ---- GitHub Release ------------------------------------------------------
+      - name: Detect pre-release tag
+        id: prerelease
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          if [[ "${{ github.ref_name }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-.+$ ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "CIP-309 Python SDK ${{ github.ref_name }}"
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
+          files: |
+            dist/*
