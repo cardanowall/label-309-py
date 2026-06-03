@@ -9,12 +9,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > change in backward-incompatible ways until a 1.0 release. Pre-1.0 versions do
 > not carry the stability guarantees of [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.0] - 2026-06-02
 
 ### Added
 
-- Initial public release of the CIP-309 Python SDK: the standalone verifier
-  (structural / public / recipient roles), the gateway-agnostic HTTP client,
-  the canonical-CBOR structural validator, the sealed-PoE wrap/unwrap
-  primitives, off-host signing, and the raw-seed identity surface. A
-  byte-identical parity twin of the TypeScript and Rust reference SDKs.
+- Initial public release of the CIP-309 Python SDK (`cardanowall-sdk`).
+- A byte-identical parity twin of the TypeScript and Rust SDKs against the shared conformance vectors.

@@ -89,11 +89,11 @@ self-hosted one.
 
 ```python
 import asyncio
-from cardanowall import CardanowallClient, signer_from_seed
+from cardanowall import Cip309Client, signer_from_seed
 
 async def main() -> None:
     signer = signer_from_seed(seed=b"\x00" * 32)  # 32-byte seed; SDK never sees the private key persisted
-    async with CardanowallClient(
+    async with Cip309Client(
         base_url="https://gateway.example.com",
         api_key="<opaque-bearer>",
     ) as client:
@@ -136,7 +136,7 @@ fetches sealed-PoE ciphertext bounded by `DEFAULT_OUTBOUND_MAX_BYTES`.
 
 ### Gateway-agnostic client (`cardanowall.client`)
 
-`CardanowallClient(base_url=..., api_key=..., http_client=...)` exposes four
+`Cip309Client(base_url=..., api_key=..., http_client=...)` exposes four
 namespaces:
 
 - `client.poe` — `quote(...)`, `publish_content(...)`, `publish_sealed(...)`,
@@ -146,7 +146,7 @@ namespaces:
 - `client.inbox` — sealed-PoE discovery for a recipient.
 - `client.account` — `balance()` and account-scoped reads.
 
-All client failures raise typed errors inheriting from `CardanowallHttpError`:
+All client failures raise typed errors inheriting from `Cip309HttpError`:
 `RateLimitedError`, `InsufficientFundsError`, `QuoteExpiredError`,
 `QuoteAlreadyConsumedError`, `QuoteNotFoundError`, `FxStaleError`,
 `IdempotencyConflictError`, `UnauthenticatedError`, `InsufficientScopeError`,

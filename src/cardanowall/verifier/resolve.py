@@ -22,7 +22,7 @@ class ResolvedTx:
     provider_url: str
 
 
-class NotACardanowallRecordError(Exception):
+class NotACip309RecordError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.code: str = "NOT_A_CARDANOWALL_RECORD"
@@ -42,7 +42,7 @@ async def resolve_cardano_tx(*, input: VerifyTxInput, fetch_fn: FetchOutbound) -
     for koios_url in koios_chain:
         try:
             return await _resolve_via_koios(input.tx_hash, koios_url, fetch_fn)
-        except NotACardanowallRecordError:
+        except NotACip309RecordError:
             raise
         except Exception as e:
             last_err = e
@@ -52,7 +52,7 @@ async def resolve_cardano_tx(*, input: VerifyTxInput, fetch_fn: FetchOutbound) -
             return await _resolve_via_blockfrost(
                 input.tx_hash, input.blockfrost_project_id, fetch_fn
             )
-        except NotACardanowallRecordError:
+        except NotACip309RecordError:
             raise
         except Exception as e:
             last_err = e
@@ -74,7 +74,7 @@ async def _resolve_via_koios(tx_hash: str, koios_url: str, fetch_fn: FetchOutbou
         raise RuntimeError(f"koios_tx_cbor_{cbor_res.status}")
     cbor_json = _parse_json(cbor_res.bytes)
     if not isinstance(cbor_json, list) or len(cbor_json) == 0:
-        raise NotACardanowallRecordError("koios returned empty array for tx_cbor; tx may not exist")
+        raise NotACip309RecordError("koios returned empty array for tx_cbor; tx may not exist")
     cbor_entry_raw = cbor_json[0]
     if not isinstance(cbor_entry_raw, dict):
         raise RuntimeError("koios_tx_cbor_malformed_entry")
@@ -100,7 +100,7 @@ async def _resolve_via_koios(tx_hash: str, koios_url: str, fetch_fn: FetchOutbou
         raise RuntimeError(f"koios_tx_info_{info_res.status}")
     info_json = _parse_json(info_res.bytes)
     if not isinstance(info_json, list) or len(info_json) == 0:
-        raise NotACardanowallRecordError("koios returned empty array for tx_info")
+        raise NotACip309RecordError("koios returned empty array for tx_info")
     info_entry_raw = info_json[0]
     if not isinstance(info_entry_raw, dict):
         raise RuntimeError("koios_tx_info_malformed_entry")
