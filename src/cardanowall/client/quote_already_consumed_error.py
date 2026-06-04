@@ -12,14 +12,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from .http_error import Cip309HttpError, ProblemDetails
+from .http_error import Label309HttpError, ProblemDetails
 
 
 def _read_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
-class QuoteAlreadyConsumedError(Cip309HttpError):
+class QuoteAlreadyConsumedError(Label309HttpError):
     quote_id: str | None
 
     def __init__(

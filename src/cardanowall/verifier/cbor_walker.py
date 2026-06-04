@@ -251,7 +251,7 @@ def _reassemble_label_309_value(tx_cbor: bytes, value_start: int, value_end: int
     """Reassemble the label-309 record body from its on-chain shape.
 
     Cardano caps individual metadata `bstr` / `tstr` values at 64 bytes, so a
-    CIP-309 record's canonical CBOR is emitted as a `bytes-chunk-array`
+    Label 309 record's canonical CBOR is emitted as a `bytes-chunk-array`
     (`[ bstr .size (1..64), … ]`). The verifier byte-concatenates the chunks IN
     ORDER before validation. Small records (<= 64 bytes) MAY be a single `bstr`
     directly; a bare CBOR map value is accepted for backward-compat with older

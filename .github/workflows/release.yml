@@ -3,7 +3,7 @@ name: release
 # ONE-TIME registry setup: at pypi.org configure a GitHub Actions Trusted
 # Publisher (OIDC) with these EXACT fields:
 #     Owner             : cardanowall
-#     Repository        : cip309-py
+#     Repository        : label-309-py
 #     Workflow filename : release.yml
 #     PyPI Project Name : cardanowall-sdk
 #     Environment       : (leave blank)
@@ -99,7 +99,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          name: "CIP-309 Python SDK ${{ github.ref_name }}"
+          name: "Label 309 Python SDK ${{ github.ref_name }}"
           generate_release_notes: true
           draft: false
           prerelease: ${{ steps.prerelease.outputs.is_prerelease }}

@@ -6,9 +6,9 @@ import httpx
 import pytest
 
 from cardanowall.client.account import AccountNamespace
-from cardanowall.client.cip309_client import (
-    Cip309Client,
+from cardanowall.client.label309_client import (
     InvalidClientConfigError,
+    Label309Client,
 )
 from cardanowall.client.poe import PoeNamespace
 from cardanowall.client.records import RecordsNamespace
@@ -27,7 +27,7 @@ _RECORDS_LIST_BODY = {
 
 def test_namespaces_wired() -> None:
     async def run() -> None:
-        async with Cip309Client(base_url="https://gateway.example.com") as client:
+        async with Label309Client(base_url="https://gateway.example.com") as client:
             assert isinstance(client.poe, PoeNamespace)
             assert isinstance(client.records, RecordsNamespace)
             assert isinstance(client.account, AccountNamespace)
@@ -43,7 +43,7 @@ def test_custom_base_url_strips_trailing_slash() -> None:
             captured["url"] = str(req.url)
             return httpx.Response(200, json=_RECORDS_LIST_BODY)
 
-        async with Cip309Client(
+        async with Label309Client(
             base_url="http://localhost:3000/",
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         ) as client:
@@ -76,7 +76,7 @@ def test_threads_api_key_into_authorization_header() -> None:
                 },
             )
 
-        async with Cip309Client(
+        async with Label309Client(
             api_key=FIXTURE_API_KEY,
             base_url="http://test",
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
@@ -98,7 +98,7 @@ def test_forwards_arbitrary_opaque_key_verbatim() -> None:
         # A third-party gateway may issue keys in any format; the client must
         # not validate or reshape the bearer token.
         opaque = "vendor.token~with/odd+chars=123"
-        async with Cip309Client(
+        async with Label309Client(
             base_url="https://gateway.example.com",
             api_key=opaque,
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
@@ -117,7 +117,7 @@ def test_anonymous_client_sends_no_authorization_header() -> None:
             captured["auth"] = req.headers.get("authorization")
             return httpx.Response(200, json=_RECORDS_LIST_BODY)
 
-        async with Cip309Client(
+        async with Label309Client(
             base_url="https://gateway.example.com",
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         ) as client:
@@ -135,7 +135,7 @@ def test_targets_explicit_base_url_verbatim() -> None:
             captured["url"] = str(req.url)
             return httpx.Response(200, json=_RECORDS_LIST_BODY)
 
-        async with Cip309Client(
+        async with Label309Client(
             base_url="https://gateway.example.com",
             api_key=FIXTURE_API_KEY,
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
@@ -148,10 +148,10 @@ def test_targets_explicit_base_url_verbatim() -> None:
 
 def test_raises_when_base_url_missing() -> None:
     with pytest.raises(InvalidClientConfigError) as ei:
-        Cip309Client(api_key=FIXTURE_API_KEY)
+        Label309Client(api_key=FIXTURE_API_KEY)
     assert "base_url is required" in str(ei.value)
 
 
 def test_raises_when_base_url_empty() -> None:
     with pytest.raises(InvalidClientConfigError):
-        Cip309Client(base_url="   ")
+        Label309Client(base_url="   ")

@@ -181,7 +181,7 @@ def validate(cbor_bytes: bytes) -> ValidateResult:
     # Step 2 — canonical CBOR decode. Every decode failure — malformed bytes,
     # indefinite-length encodings, non-canonical (unsorted) map-key ordering,
     # duplicate map keys, non-minimal ints, invalid UTF-8 — surfaces as the
-    # single MALFORMED_CBOR code per the CIP-309 taxonomy (no separate code).
+    # single MALFORMED_CBOR code per the Label 309 taxonomy (no separate code).
     try:
         decoded = decode_canonical_cbor(cbor_bytes)
     except CanonicalCborError as cause:
@@ -578,7 +578,7 @@ def _validate_one_uri(chunks: object, path: _Path, issues: list[ValidationIssue]
                 _issue(
                     path,
                     "INVALID_URI",
-                    "ipfs:// URI is not a valid CID under the CIP-309 profile",
+                    "ipfs:// URI is not a valid CID under the Label 309 profile",
                 )
             )
 
@@ -618,7 +618,7 @@ def _validate_encryption(enc: object, path: _Path, issues: list[ValidationIssue]
                 (*path, "aead"),
                 "UNAUTHENTICATED_CIPHER_FORBIDDEN",
                 f"{aead!r} is an unauthenticated cipher; "
-                "CIP-309 mandates an authenticated (AEAD) cipher",
+                "Label 309 mandates an authenticated (AEAD) cipher",
             )
         )
         return

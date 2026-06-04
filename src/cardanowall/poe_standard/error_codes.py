@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Final, Literal
 
-# CIP-309 error-code catalogue. Single source of truth for SCREAMING_SNAKE
+# Label 309 error-code catalogue. Single source of truth for SCREAMING_SNAKE
 # code strings emitted by the structural validator (Part A) AND the verifier
 # layer (Part B) — verifier-only codes are exported here so downstream
 # verifiers can `from cardanowall.poe_standard.error_codes import ErrorCode`

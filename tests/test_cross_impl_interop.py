@@ -4,7 +4,7 @@ Mirrors the cross-impl interop guard in @cardanowall/crypto-core.
 This SDK does NOT ship an envelope-plaintext validator (envelope build/unlock
 lives in the TypeScript stack only); the Python parity test exercises the same
 simulation via a test-local v=1-only validator stub against a hand-constructed
-v=2 plaintext object — the same "third-party CIP-309 implementer" interop
+v=2 plaintext object — the same "third-party Label 309 implementer" interop
 contract the TypeScript sibling pins.
 """
 

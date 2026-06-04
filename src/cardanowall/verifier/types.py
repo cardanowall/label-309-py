@@ -293,7 +293,7 @@ class SupersedesResolved:
 # These surfaces describe the Cardano transaction that carried the PoE: which
 # wallet vkey(s) authorised/paid for it, the fee, and the outputs. This is the
 # "who submitted and paid for this anchoring" view — orthogonal to
-# `record_signatures`, which is the optional CIP-309 record-level authorship
+# `record_signatures`, which is the optional Label 309 record-level authorship
 # claim. A failed `signature_valid` here is INFORMATIONAL: it never changes the
 # verifier's verdict (the content claim does not depend on who paid the fee).
 @dataclass(frozen=True, kw_only=True)

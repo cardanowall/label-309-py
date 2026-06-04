@@ -10,11 +10,11 @@ from cardanowall._crypto.cbor import encode_canonical_cbor
 from cardanowall._crypto.cose_sign1 import (
     CARDANO_POE_SIG_DOMAIN_PREFIX,
     CoseSign1BuildError,
-    build_cip309_sig_structure,
+    build_label309_sig_structure,
     build_sig_structure,
     cose_sign1_build,
-    cose_sign1_cip309_build,
-    cose_sign1_cip309_verify,
+    cose_sign1_label309_build,
+    cose_sign1_label309_verify,
     cose_sign1_verify,
 )
 from cardanowall._crypto.sig import sign_ed25519
@@ -105,21 +105,21 @@ def test_cose_sign1_strict_ed25519_low_order() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CIP-309 v1 record-signature parity.
+# Label 309 v1 record-signature parity.
 # Vectors live under sign1-build.json → cardano_poe_vectors (mirrored byte-
 # identically with the TS canonical tree).
 # ---------------------------------------------------------------------------
 
 
-def _cip309_vectors() -> list[dict[str, Any]]:
+def _label309_vectors() -> list[dict[str, Any]]:
     data = json.loads((FIXTURES_DIR / "sign1-build.json").read_text())
     return cast(list[dict[str, Any]], data["cardano_poe_vectors"])
 
 
-CIP309_VECTORS = _cip309_vectors()
+LABEL309_VECTORS = _label309_vectors()
 
 
-def test_cip309_domain_prefix_pinned() -> None:
+def test_label309_domain_prefix_pinned() -> None:
     assert CARDANO_POE_SIG_DOMAIN_PREFIX == b"cardano-poe-record-sig-v1"
     assert len(CARDANO_POE_SIG_DOMAIN_PREFIX) == 25
     assert (
@@ -136,9 +136,9 @@ def _protected_header_for(vector: dict[str, Any]) -> dict[int | str, object]:
     return h
 
 
-@pytest.mark.parametrize("vector", CIP309_VECTORS, ids=lambda v: cast(str, v["name"]))
-def test_cose_sign1_cip309_build_matches_kat(vector: dict[str, Any]) -> None:
-    cose = cose_sign1_cip309_build(
+@pytest.mark.parametrize("vector", LABEL309_VECTORS, ids=lambda v: cast(str, v["name"]))
+def test_cose_sign1_label309_build_matches_kat(vector: dict[str, Any]) -> None:
+    cose = cose_sign1_label309_build(
         protected_header=_protected_header_for(vector),
         unprotected_header={},
         record_body_cbor=bytes.fromhex(vector["record_body_cbor_hex"]),
@@ -147,21 +147,21 @@ def test_cose_sign1_cip309_build_matches_kat(vector: dict[str, Any]) -> None:
     assert cose.hex() == vector["expected_cose_sign1_hex"], vector["name"]
 
 
-@pytest.mark.parametrize("vector", CIP309_VECTORS, ids=lambda v: cast(str, v["name"]))
-def test_build_cip309_sig_structure_matches_kat(vector: dict[str, Any]) -> None:
+@pytest.mark.parametrize("vector", LABEL309_VECTORS, ids=lambda v: cast(str, v["name"]))
+def test_build_label309_sig_structure_matches_kat(vector: dict[str, Any]) -> None:
     protected_bytes = encode_canonical_cbor(cast(Any, _protected_header_for(vector)))
-    sig_structure = build_cip309_sig_structure(
+    sig_structure = build_label309_sig_structure(
         body_protected_bytes=protected_bytes,
         record_body_cbor=bytes.fromhex(vector["record_body_cbor_hex"]),
     )
     assert sig_structure.hex() == vector["expected_sig_structure_hex"], vector["name"]
 
 
-@pytest.mark.parametrize("vector", CIP309_VECTORS, ids=lambda v: cast(str, v["name"]))
-def test_cose_sign1_cip309_verify_round_trip(vector: dict[str, Any]) -> None:
+@pytest.mark.parametrize("vector", LABEL309_VECTORS, ids=lambda v: cast(str, v["name"]))
+def test_cose_sign1_label309_verify_round_trip(vector: dict[str, Any]) -> None:
     if "expected_cose_sign1_hex" not in vector:
         pytest.skip("legacy vector without expected COSE_Sign1 hex")
-    result = cose_sign1_cip309_verify(
+    result = cose_sign1_label309_verify(
         message=bytes.fromhex(vector["expected_cose_sign1_hex"]),
         detached_record_body_cbor=bytes.fromhex(vector["record_body_cbor_hex"]),
     )
@@ -170,11 +170,11 @@ def test_cose_sign1_cip309_verify_round_trip(vector: dict[str, Any]) -> None:
     assert result["alg"] == -8
 
 
-@pytest.mark.parametrize("vector", CIP309_VECTORS, ids=lambda v: cast(str, v["name"]))
-def test_cose_sign1_cip309_verify_rejects_mutated_body(vector: dict[str, Any]) -> None:
+@pytest.mark.parametrize("vector", LABEL309_VECTORS, ids=lambda v: cast(str, v["name"]))
+def test_cose_sign1_label309_verify_rejects_mutated_body(vector: dict[str, Any]) -> None:
     mutated = bytearray(bytes.fromhex(vector["record_body_cbor_hex"]))
     mutated[-1] ^= 0xFF
-    result = cose_sign1_cip309_verify(
+    result = cose_sign1_label309_verify(
         message=bytes.fromhex(vector["expected_cose_sign1_hex"]),
         detached_record_body_cbor=bytes(mutated),
     )
@@ -182,17 +182,17 @@ def test_cose_sign1_cip309_verify_rejects_mutated_body(vector: dict[str, Any]) -
     assert result["error"]["code"] == "SIGNATURE_INVALID"
 
 
-def test_cose_sign1_cip309_verify_rejects_attached_payload() -> None:
+def test_cose_sign1_label309_verify_rejects_attached_payload() -> None:
     """MALFORMED_SIG_COSE_SIGN1 on non-null COSE_Sign1[2] (even h'')."""
-    vector = CIP309_VECTORS[-1]
+    vector = LABEL309_VECTORS[-1]
     protected_bytes = encode_canonical_cbor(cast(Any, _protected_header_for(vector)))
-    sig_structure = build_cip309_sig_structure(
+    sig_structure = build_label309_sig_structure(
         body_protected_bytes=protected_bytes,
         record_body_cbor=bytes.fromhex(vector["record_body_cbor_hex"]),
     )
     sig = sign_ed25519(bytes.fromhex(vector["signer_secret_key_hex"]), sig_structure)
     cose_attached = encode_canonical_cbor(cast(Any, [protected_bytes, {}, b"", sig]))
-    result = cose_sign1_cip309_verify(
+    result = cose_sign1_label309_verify(
         message=cose_attached,
         detached_record_body_cbor=bytes.fromhex(vector["record_body_cbor_hex"]),
     )
@@ -200,10 +200,10 @@ def test_cose_sign1_cip309_verify_rejects_attached_payload() -> None:
     assert result["error"]["code"] == "MALFORMED_SIG_COSE_SIGN1"
 
 
-def test_cose_sign1_cip309_build_via_signer_closure() -> None:
+def test_cose_sign1_label309_build_via_signer_closure() -> None:
     """Composer-side signing path: caller injects a closure that never reveals
     the seed to the builder. Output MUST be byte-identical to the seed path."""
-    vector = CIP309_VECTORS[-1]
+    vector = LABEL309_VECTORS[-1]
     seed = bytes.fromhex(vector["signer_secret_key_hex"])
     captured: list[bytes] = []
 
@@ -211,7 +211,7 @@ def test_cose_sign1_cip309_build_via_signer_closure() -> None:
         captured.append(sig_structure)
         return sign_ed25519(seed, sig_structure)
 
-    cose = cose_sign1_cip309_build(
+    cose = cose_sign1_label309_build(
         protected_header=_protected_header_for(vector),
         unprotected_header={},
         record_body_cbor=bytes.fromhex(vector["record_body_cbor_hex"]),
@@ -222,10 +222,10 @@ def test_cose_sign1_cip309_build_via_signer_closure() -> None:
     assert captured[0].hex() == vector["expected_sig_structure_hex"]
 
 
-def test_cose_sign1_cip309_build_rejects_missing_signer() -> None:
-    vector = CIP309_VECTORS[-1]
+def test_cose_sign1_label309_build_rejects_missing_signer() -> None:
+    vector = LABEL309_VECTORS[-1]
     with pytest.raises(CoseSign1BuildError) as exc:
-        cose_sign1_cip309_build(
+        cose_sign1_label309_build(
             protected_header=_protected_header_for(vector),
             unprotected_header={},
             record_body_cbor=bytes.fromhex(vector["record_body_cbor_hex"]),
@@ -233,10 +233,10 @@ def test_cose_sign1_cip309_build_rejects_missing_signer() -> None:
     assert exc.value.code == CoseSign1BuildError.SIGNER_NOT_PROVIDED
 
 
-def test_cose_sign1_cip309_build_rejects_both_signer_and_seed() -> None:
-    vector = CIP309_VECTORS[-1]
+def test_cose_sign1_label309_build_rejects_both_signer_and_seed() -> None:
+    vector = LABEL309_VECTORS[-1]
     with pytest.raises(CoseSign1BuildError) as exc:
-        cose_sign1_cip309_build(
+        cose_sign1_label309_build(
             protected_header=_protected_header_for(vector),
             unprotected_header={},
             record_body_cbor=bytes.fromhex(vector["record_body_cbor_hex"]),
@@ -248,7 +248,7 @@ def test_cose_sign1_cip309_build_rejects_both_signer_and_seed() -> None:
 
 @pytest.mark.parametrize(
     "vector",
-    [v for v in CIP309_VECTORS if "expected_cose_sign1_chunks_hex" in v],
+    [v for v in LABEL309_VECTORS if "expected_cose_sign1_chunks_hex" in v],
     ids=lambda v: cast(str, v["name"]),
 )
 def test_chunked_cose_sign1_matches_kat(vector: dict[str, Any]) -> None:

@@ -1,6 +1,6 @@
 # Security Policy
 
-`cardanowall-sdk` is the Python implementation of CIP-309, an open standard
+`cardanowall-sdk` is the Python implementation of Label 309, an open standard
 for cryptographic Proof of Existence anchored on the Cardano blockchain. Its
 verifier, structural validator, and sealed-PoE primitives have real security
 properties, so we ask that suspected vulnerabilities be reported responsibly.
@@ -18,9 +18,9 @@ In scope for a report here:
 Out of scope here (report it in the relevant repository instead):
 
 - An ambiguity or flaw in the **standard itself**, or in the canonical
-  conformance vectors — report it in `cip309` (the standard repository).
-- A bug in another implementation — `cip309-ts`, `cip309-rs`, or the
-  `cip309-cli` tool. Use that repository's security policy.
+  conformance vectors — report it in `label-309` (the standard repository).
+- A bug in another implementation — `label-309-ts`, `label-309-rs`, or the
+  `label-309-cli` tool. Use that repository's security policy.
 
 ## Core security goals
 
@@ -59,4 +59,4 @@ hash, or steps), and the impact with any suggested remediation.
 - Because this SDK is a **pre-1.0 release**, fixes land on the current version;
   there are no long-term-supported released versions yet.
 
-Thank you for helping keep CIP-309 trustworthy.
+Thank you for helping keep Label 309 trustworthy.

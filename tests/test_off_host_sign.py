@@ -22,7 +22,7 @@ from cardanowall._crypto.cbor import (
     encode_canonical_cbor,
 )
 from cardanowall._crypto.cose_sign1 import (
-    build_cip309_sig_structure,
+    build_label309_sig_structure,
     build_sig_structure,
     decode_cose_sign1,
     encode_cose_sign1,
@@ -143,10 +143,10 @@ def test_in_process_byte_equivalence(vector: dict[str, Any]) -> None:
 
     # In-process reconstruction via the primitive layer (no server-side
     # equivalent in Python; mirrors the TS inline form): build protected_bytes →
-    # build_cip309_sig_structure → sign → encode_cose_sign1 → chunk_bytes.
+    # build_label309_sig_structure → sign → encode_cose_sign1 → chunk_bytes.
     protected_header: dict[int | str, object] = {1: -8, 4: pub}
     protected_bytes = encode_canonical_cbor(cast(CanonicalCborValue, protected_header))
-    sig_struct_in_proc = build_cip309_sig_structure(
+    sig_struct_in_proc = build_label309_sig_structure(
         body_protected_bytes=protected_bytes,
         record_body_cbor=encode_record_body_for_signing(record),
     )

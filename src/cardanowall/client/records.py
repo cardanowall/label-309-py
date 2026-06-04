@@ -151,7 +151,7 @@ class RecordsNamespace:
     async def verify(
         self, tx_hash: str, input: PoeVerifyInput | None = None
     ) -> dict[str, Any]:
-        """Run the canonical CIP-309 verifier against the record at ``tx_hash``.
+        """Run the canonical Label 309 verifier against the record at ``tx_hash``.
 
         Returns the same ``VerifyReport`` JSON shape the standalone verifier
         emits — ``VerifyReport`` IS the wire body of this endpoint, no

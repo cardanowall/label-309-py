@@ -1,5 +1,5 @@
 """Decodes an RFC 7807 ``application/problem+json`` body into the
-most-specific :class:`Cip309HttpError` subclass.
+most-specific :class:`Label309HttpError` subclass.
 
 Dispatch order:
 
@@ -11,7 +11,7 @@ Dispatch order:
 
 The dispatcher is intentionally exhaustive over the codes emitted by the
 server's problem-json builder; codes the SDK doesn't recognise fall through
-to the parent :class:`Cip309HttpError` with the verbatim problem
+to the parent :class:`Label309HttpError` with the verbatim problem
 document. Forward-compatibility: the server can introduce new codes without
 breaking older SDKs — consumers either catch the parent class or dispatch
 on ``err.code`` directly.
@@ -25,7 +25,7 @@ from .batch_empty_error import BatchEmptyError
 from .batch_too_large_error import BatchTooLargeError
 from .forbidden_error import ForbiddenError
 from .http_error import (
-    Cip309HttpError,
+    Label309HttpError,
     ProblemDetails,
     ProblemErrorEntry,
     extract_problem_extensions,
@@ -125,7 +125,7 @@ def _to_problem_details(
     return cast(ProblemDetails, out)
 
 
-_DISPATCH: dict[str, type[Cip309HttpError]] = {
+_DISPATCH: dict[str, type[Label309HttpError]] = {
     "unauthorized": UnauthorizedError,
     "forbidden": ForbiddenError,
     "csrf-invalid": ForbiddenError,
@@ -158,10 +158,10 @@ def parse_http_error(
     body: Any,
     request_id: str | None = None,
     retry_after_seconds: int | None = None,
-) -> Cip309HttpError:
+) -> Label309HttpError:
     problem = _to_problem_details(http_status, body, request_id)
     extensions = extract_problem_extensions(problem)
-    klass = _DISPATCH.get(problem["code"], Cip309HttpError)
+    klass = _DISPATCH.get(problem["code"], Label309HttpError)
     return klass(
         problem=problem,
         extensions=extensions,

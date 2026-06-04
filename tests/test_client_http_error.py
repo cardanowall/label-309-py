@@ -16,7 +16,7 @@ from cardanowall.client.batch_empty_error import BatchEmptyError
 from cardanowall.client.batch_too_large_error import BatchTooLargeError
 from cardanowall.client.forbidden_error import ForbiddenError
 from cardanowall.client.http_error import (
-    Cip309HttpError,
+    Label309HttpError,
     extract_problem_extensions,
 )
 from cardanowall.client.idempotency_conflict_error import IdempotencyConflictError
@@ -97,7 +97,7 @@ def test_request_id_falls_back_to_trace_id_when_header_absent() -> None:
 
 def test_synthesises_problem_for_non_rfc7807_bodies() -> None:
     err = parse_http_error(http_status=418, body=None)
-    assert isinstance(err, Cip309HttpError)
+    assert isinstance(err, Label309HttpError)
     assert not isinstance(err, RateLimitedError)
     assert err.code == "http-418"
     assert err.http_status == 418
@@ -108,7 +108,7 @@ def test_synthesises_problem_for_unrecognised_body_shape() -> None:
     # A dict that lacks both `code` and `title` is non-conforming and is
     # treated as if no body had been returned.
     err = parse_http_error(http_status=503, body={"random": "junk"})
-    assert isinstance(err, Cip309HttpError)
+    assert isinstance(err, Label309HttpError)
     assert err.code == "http-503"
     assert err.http_status == 503
 
@@ -140,7 +140,7 @@ def test_unauthorized_maps_to_unauthorized_error() -> None:
         body=_problem_body(code="unauthorized", status=401),
     )
     assert isinstance(err, UnauthorizedError)
-    assert isinstance(err, Cip309HttpError)
+    assert isinstance(err, Label309HttpError)
     # The legacy alias still resolves to the same class.
     assert isinstance(err, UnauthenticatedError)
 
@@ -355,7 +355,7 @@ def test_unknown_code_falls_through_to_parent_with_verbatim_body() -> None:
         http_status=451,
         body=_problem_body(code="unavailable-for-legal-reasons", status=451),
     )
-    assert isinstance(err, Cip309HttpError)
+    assert isinstance(err, Label309HttpError)
     assert not isinstance(err, InternalServerError)
     assert err.code == "unavailable-for-legal-reasons"
 
@@ -397,5 +397,5 @@ def test_every_subclass_inherits_from_parent_and_exception(klass: type) -> None:
     problem = _problem_body(code="example", status=400)
     instance = klass(problem=problem)
     assert isinstance(instance, Exception)
-    assert isinstance(instance, Cip309HttpError)
+    assert isinstance(instance, Label309HttpError)
     assert isinstance(instance, klass)

@@ -1,4 +1,4 @@
-"""CIP-309 Merkle leaves-list codec tests.
+"""Label 309 Merkle leaves-list codec tests.
 
 The 4-leaf canonical CBOR bytes pinned below (275 bytes) drive the
 byte-identical encode/decode round-trip.

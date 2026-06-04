@@ -11,7 +11,7 @@ import hmac
 from collections.abc import Sequence
 from typing import Final
 
-# Identifier registered in the CIP-309 Merkle list-commitment registry.
+# Identifier registered in the Label 309 Merkle list-commitment registry.
 MERKLE_ALG_ID: Final[str] = "rfc9162-sha256"
 
 _DIGEST_LENGTH: Final[int] = 32

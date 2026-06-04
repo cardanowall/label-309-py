@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .http_error import Cip309HttpError, ProblemDetails
+from .http_error import Label309HttpError, ProblemDetails
 
 
 def _read_scope_array(value: Any) -> tuple[str, ...]:
@@ -23,7 +23,7 @@ def _read_scope_array(value: Any) -> tuple[str, ...]:
     return tuple(item for item in value if isinstance(item, str))
 
 
-class InsufficientScopeError(Cip309HttpError):
+class InsufficientScopeError(Label309HttpError):
     required_scopes: tuple[str, ...]
     granted_scopes: tuple[str, ...]
 

@@ -15,8 +15,8 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from cardanowall.client.cip309_client import Cip309Client
 from cardanowall.client.insufficient_scope_error import InsufficientScopeError
+from cardanowall.client.label309_client import Label309Client
 from cardanowall.client.unauthorized_error import UnauthorizedError
 
 # Stable opaque bearer token — forwarded verbatim, never parsed by the client.
@@ -27,9 +27,9 @@ def _client_with_handler(
     handler: Callable[[httpx.Request], httpx.Response],
     *,
     api_key: str | None = FIXTURE_API_KEY,
-) -> Cip309Client:
+) -> Label309Client:
     transport = httpx.MockTransport(handler)
-    return Cip309Client(
+    return Label309Client(
         api_key=api_key,
         base_url="http://test.example",
         http_client=httpx.AsyncClient(transport=transport),

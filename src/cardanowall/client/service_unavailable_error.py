@@ -6,10 +6,10 @@ surfaced on ``err.retry_after_seconds``.
 
 from __future__ import annotations
 
-from .http_error import Cip309HttpError
+from .http_error import Label309HttpError
 
 
-class ServiceUnavailableError(Cip309HttpError):
+class ServiceUnavailableError(Label309HttpError):
     pass
 
 

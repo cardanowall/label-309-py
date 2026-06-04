@@ -27,7 +27,7 @@ def chunk_bytes(value: bytes) -> list[bytes]:
 def chunk_text(value: str, max_bytes: int = CHUNK_MAX_BYTES) -> list[str]:
     """Split a logical text string into ≤ ``max_bytes``-byte UTF-8 chunks.
 
-    Implements the CIP-309 ``uri-chunk-array`` producer-side splitter:
+    Implements the Label 309 ``uri-chunk-array`` producer-side splitter:
     each output chunk's UTF-8 encoding is ≤ ``max_bytes``, AND no multi-byte
     UTF-8 codepoint is split across chunk boundaries. The split is greedy:
     each chunk holds as many whole codepoints as fit in the byte budget. The

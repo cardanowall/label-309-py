@@ -5,10 +5,10 @@ least one record.
 
 from __future__ import annotations
 
-from .http_error import Cip309HttpError
+from .http_error import Label309HttpError
 
 
-class BatchEmptyError(Cip309HttpError):
+class BatchEmptyError(Label309HttpError):
     pass
 
 

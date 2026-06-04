@@ -1,4 +1,4 @@
-"""Public Merkle namespace for the CIP-309 Python SDK.
+"""Public Merkle namespace for the Label 309 Python SDK.
 
 The internal ``cardanowall._crypto`` namespace stays underscore-prefixed
 (parity twin of the ``private: true`` ``@cardanowall/crypto-core`` TS

@@ -5,10 +5,10 @@ server logs.
 
 from __future__ import annotations
 
-from .http_error import Cip309HttpError
+from .http_error import Label309HttpError
 
 
-class InternalServerError(Cip309HttpError):
+class InternalServerError(Label309HttpError):
     pass
 
 

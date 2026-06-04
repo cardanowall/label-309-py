@@ -1,10 +1,10 @@
-"""Public hash namespace for the CIP-309 Python SDK.
+"""Public hash namespace for the Label 309 Python SDK.
 
 Re-exports the closed-catalogue digest primitives from
 ``cardanowall._crypto.hash`` so SDK consumers can build their own Merkle
 leaves (``sha2_256(bytes)``) or content hashes without importing the
 internal underscore-prefixed module. Both algorithms are registered in the
-CIP-309 hash registry:
+Label 309 hash registry:
 
 - ``sha2_256`` — SHA-256 (default content/leaf hash).
 - ``blake2b_256`` — Blake2b-256 (alternative; both ride under ``dual_hash``).

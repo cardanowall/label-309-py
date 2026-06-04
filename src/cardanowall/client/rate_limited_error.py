@@ -8,10 +8,10 @@ Per RFC 7807, no retry hint appears in the problem body.
 
 from __future__ import annotations
 
-from .http_error import Cip309HttpError
+from .http_error import Label309HttpError
 
 
-class RateLimitedError(Cip309HttpError):
+class RateLimitedError(Label309HttpError):
     pass
 
 

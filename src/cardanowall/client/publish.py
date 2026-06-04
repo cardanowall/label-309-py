@@ -8,7 +8,7 @@ single calls for the three common shapes:
 
 2. :py:meth:`PoeNamespace.publish_sealed` — encrypt the content to the
    recipient X25519 public keys (age-style sealed envelope), upload the
-   ciphertext to Arweave via /uploads, build a CIP-309 record with the
+   ciphertext to Arweave via /uploads, build a Label 309 record with the
    resulting ``ar://`` URI, sign, and post to /publish.
 
 3. :py:meth:`PoeNamespace.publish_merkle` — anchor an arbitrary number of
@@ -143,7 +143,7 @@ class PublishContentInput(TypedDict, total=False):
 class PublishPrehashedInput(TypedDict, total=False):
     """Caller-supplied digest map for :py:meth:`PoeNamespace.publish_prehashed`.
 
-    ``hashes`` is keyed by CIP-309 algorithm id (``sha2-256``, ``blake2b-256``).
+    ``hashes`` is keyed by Label 309 algorithm id (``sha2-256``, ``blake2b-256``).
     At least one entry is required; values are hex-encoded digests of the
     expected byte length (32 bytes / 64 hex chars for both registered v1
     algorithms).

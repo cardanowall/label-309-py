@@ -27,7 +27,7 @@ from cardanowall._crypto.cbor import (
     encode_canonical_cbor,
 )
 from cardanowall._crypto.cose_sign1 import (
-    build_cip309_sig_structure,
+    build_label309_sig_structure,
     encode_cose_sign1,
 )
 from cardanowall._crypto.sig import get_public_key_ed25519, sign_ed25519
@@ -77,7 +77,7 @@ def _build_identity_sig_entry(body: PoeRecord) -> dict[str, list[bytes]]:
     assert pubkey.hex() == IDENTITY_PUBKEY_HEX
     protected: dict[int | str, object] = {1: -8, 4: pubkey}
     protected_bytes = encode_canonical_cbor(cast(CanonicalCborValue, protected))
-    sig_structure = build_cip309_sig_structure(
+    sig_structure = build_label309_sig_structure(
         body_protected_bytes=protected_bytes,
         record_body_cbor=encode_record_body_for_signing(body),
     )
@@ -101,7 +101,7 @@ def _build_wallet_sig_entry(body: PoeRecord) -> dict[str, list[bytes]]:
     stake_addr = bytes([MAINNET_HEADER]) + _blake2b_224(pubkey)
     protected: dict[int | str, object] = {1: -8, "address": stake_addr}
     protected_bytes = encode_canonical_cbor(cast(CanonicalCborValue, protected))
-    sig_structure = build_cip309_sig_structure(
+    sig_structure = build_label309_sig_structure(
         body_protected_bytes=protected_bytes,
         record_body_cbor=encode_record_body_for_signing(body),
     )

@@ -1,20 +1,20 @@
-# cardanowall-sdk — the Python SDK for CIP-309 Proof-of-Existence
+# cardanowall-sdk — the Python SDK for Label 309 Proof-of-Existence
 
 A byte-identical parity twin of the TypeScript `@cardanowall/sdk-ts`: a
-standalone CIP-309 verifier, a gateway-agnostic HTTP client, off-host signing,
+standalone Label 309 verifier, a gateway-agnostic HTTP client, off-host signing,
 the structural validator, and the raw-seed identity surface — all in Pythonic,
 mypy-strict form.
 
 ## What it is
 
-CIP-309 is an open standard for anchoring a content hash on the Cardano
+Label 309 is an open standard for anchoring a content hash on the Cardano
 blockchain under transaction metadata label 309, so anyone with the transaction
 reference can later prove "this content existed on or before block time T" —
 without trusting any server, domain, or issuer identity.
 
 `cardanowall-sdk` is the Python member of a five-package family. It bundles the
 **standalone verifier** (the three verifier roles), the **gateway-agnostic HTTP
-client** for publishing and reading records against any CIP-309 service, the
+client** for publishing and reading records against any Label 309 service, the
 **structural validator** over canonical-CBOR record bytes, the **sealed-PoE**
 wrap/unwrap primitives, and **raw-seed identity** helpers. Its cryptographic
 core under `cardanowall._crypto` is a byte-for-byte parity twin of the
@@ -46,7 +46,7 @@ returns a coroutine. For synchronous use, wrap calls in `asyncio.run(...)`.
 
 ## Quick start
 
-### Verify any CIP-309 record — standalone, no service dependency
+### Verify any Label 309 record — standalone, no service dependency
 
 `verify_tx` is the full public/recipient verifier. Given a Cardano transaction
 hash it fetches the metadata from a public explorer, runs structural validation,
@@ -81,7 +81,7 @@ else:
 
 ### Publish with the gateway-agnostic client
 
-The client targets **any** CIP-309 gateway. `base_url` is **required** and used
+The client targets **any** Label 309 gateway. `base_url` is **required** and used
 verbatim; `api_key` is an **opaque bearer token** forwarded as
 `Authorization: Bearer <key>` with no format assumptions. `cardanowall.com` below
 is only one example deployment — substitute any conformant gateway, including a
@@ -89,11 +89,11 @@ self-hosted one.
 
 ```python
 import asyncio
-from cardanowall import Cip309Client, signer_from_seed
+from cardanowall import Label309Client, signer_from_seed
 
 async def main() -> None:
     signer = signer_from_seed(seed=b"\x00" * 32)  # 32-byte seed; SDK never sees the private key persisted
-    async with Cip309Client(
+    async with Label309Client(
         base_url="https://gateway.example.com",
         api_key="<opaque-bearer>",
     ) as client:
@@ -136,7 +136,7 @@ fetches sealed-PoE ciphertext bounded by `DEFAULT_OUTBOUND_MAX_BYTES`.
 
 ### Gateway-agnostic client (`cardanowall.client`)
 
-`Cip309Client(base_url=..., api_key=..., http_client=...)` exposes four
+`Label309Client(base_url=..., api_key=..., http_client=...)` exposes four
 namespaces:
 
 - `client.poe` — `quote(...)`, `publish_content(...)`, `publish_sealed(...)`,
@@ -146,7 +146,7 @@ namespaces:
 - `client.inbox` — sealed-PoE discovery for a recipient.
 - `client.account` — `balance()` and account-scoped reads.
 
-All client failures raise typed errors inheriting from `Cip309HttpError`:
+All client failures raise typed errors inheriting from `Label309HttpError`:
 `RateLimitedError`, `InsufficientFundsError`, `QuoteExpiredError`,
 `QuoteAlreadyConsumedError`, `QuoteNotFoundError`, `FxStaleError`,
 `IdempotencyConflictError`, `UnauthenticatedError`, `InsufficientScopeError`,
@@ -260,7 +260,7 @@ Exit codes: `0` valid, `1` failed (integrity), `2` failed (network), `3` pending
 - **`@cardanowall/crypto-core`** — closed-catalogue cryptographic primitives
   (hash, KDF, signature, KEM, AEAD, CBOR, COSE, sealed-PoE, discovery, Merkle,
   recipient encoding, seed derivation). The portable building blocks.
-- **`@cardanowall/poe-standard`** — the CIP-309 wire-format library: record
+- **`@cardanowall/poe-standard`** — the Label 309 wire-format library: record
   schema, canonical-CBOR encoder, pure structural validator, and error-code
   catalogue.
 - **`@cardanowall/sdk-ts`** — the browser + Node TypeScript SDK; the reference

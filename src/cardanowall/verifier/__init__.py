@@ -18,7 +18,7 @@ from .profile import out_of_profile_issues, profile_at_least
 from .resolve import (
     BLOCKFROST_MAINNET_HOST,
     KOIOS_MAINNET_URL,
-    NotACip309RecordError,
+    NotALabel309RecordError,
     ResolvedTx,
     extract_label_309_metadata,
     resolve_cardano_tx,
@@ -102,7 +102,7 @@ __all__ = [
     "MerkleVerdict",
     "Method",
     "NetworkId",
-    "NotACip309RecordError",
+    "NotALabel309RecordError",
     "OutboundExhaustedError",
     "Profile",
     "Purpose",

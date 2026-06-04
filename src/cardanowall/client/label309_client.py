@@ -19,20 +19,20 @@ def _resolve_base_url(base_url: str | None) -> str:
 
     ``base_url`` is REQUIRED. The client is gateway-agnostic: it targets
     whatever HTTP origin the caller supplies (the cardanowall service, a
-    self-hosted CIP-309 gateway, a local dev server) and never assumes a
+    self-hosted Label 309 gateway, a local dev server) and never assumes a
     default vendor host. A missing or empty value cannot be resolved into a
     target, so it raises :class:`InvalidClientConfigError`.
     """
     if base_url is None or base_url.strip() == "":
         raise InvalidClientConfigError(
-            "Cip309Client: base_url is required. Pass the HTTP origin of "
-            "the CIP-309 gateway to target (e.g. base_url='https://gateway.example.com')."
+            "Label309Client: base_url is required. Pass the HTTP origin of "
+            "the Label 309 gateway to target (e.g. base_url='https://gateway.example.com')."
         )
     return base_url
 
 
-class Cip309Client:
-    """Top-level HTTP client wrapping a CIP-309 gateway REST API.
+class Label309Client:
+    """Top-level HTTP client wrapping a Label 309 gateway REST API.
 
     Gateway-agnostic: ``base_url`` is required and used verbatim, and
     ``api_key`` is an opaque bearer token forwarded as
@@ -48,7 +48,7 @@ class Cip309Client:
     wrap calls in ``asyncio.run(...)``. Use as an async context manager to
     close the underlying ``httpx.AsyncClient`` cleanly:
 
-        async with Cip309Client(base_url="https://gateway.example.com") as client:
+        async with Label309Client(base_url="https://gateway.example.com") as client:
             resource = await client.records.get(tx_hash)
     """
 
@@ -99,4 +99,4 @@ class Cip309Client:
         await self.aclose()
 
 
-__all__ = ["Cip309Client", "InvalidClientConfigError"]
+__all__ = ["InvalidClientConfigError", "Label309Client"]

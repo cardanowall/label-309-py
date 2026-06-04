@@ -179,7 +179,7 @@ class PoeNamespace:
         at publish time against the locked price snapshot.
 
         On HTTP-level failure (auth, rate limit, malformed request) this
-        raises a typed :class:`Cip309HttpError` subclass. Per-file
+        raises a typed :class:`Label309HttpError` subclass. Per-file
         failures inside a 200 response are NOT raised by ``uploads()``
         itself — the response body is returned verbatim. The higher-level
         helpers (``publish_sealed``, ``publish_merkle``) treat any failed
@@ -280,7 +280,7 @@ class PoeNamespace:
         idempotency_key: str | None = None,
     ) -> PublishResponse:
         """High-level hash-only publish: hash the supplied content, build a
-        single-item CIP-309 record, optionally sign with the caller-supplied
+        single-item Label 309 record, optionally sign with the caller-supplied
         signer, and submit. No Arweave, no /uploads — anchors the digest only.
         """
         config = _ResolvedPublishConfig(
@@ -335,7 +335,7 @@ class PoeNamespace:
     ) -> PublishResponse:
         """Sealed-PoE: encrypt content to the recipient public keys (age-style
         sealed envelope), upload the ciphertext to Arweave via /uploads, build a
-        CIP-309 record with the resulting ``ar://`` URI, sign (optional), and
+        Label 309 record with the resulting ``ar://`` URI, sign (optional), and
         submit via /publish.
 
         ``kem`` selects the key-encapsulation mechanism and defaults to

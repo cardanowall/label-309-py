@@ -7,10 +7,10 @@ The per-field issues live on ``err.errors`` (Zod issue codes; e.g.
 
 from __future__ import annotations
 
-from .http_error import Cip309HttpError
+from .http_error import Label309HttpError
 
 
-class ValidationFailedError(Cip309HttpError):
+class ValidationFailedError(Label309HttpError):
     pass
 
 

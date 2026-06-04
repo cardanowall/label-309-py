@@ -10,7 +10,7 @@ from .fetch import DenyHostError, default_fetch_outbound, wrap_fetch_outbound
 from .merkle import check_merkle_commitments
 from .profile import out_of_profile_issues, profile_at_least
 from .resolve import (
-    NotACip309RecordError,
+    NotALabel309RecordError,
     extract_label_309_metadata,
     resolve_cardano_tx,
 )
@@ -67,7 +67,7 @@ async def verify_tx(input: VerifyTxInput) -> VerifyReport:
     # 1. Resolve tx CBOR + confirmation depth via the Cardano gateway chain.
     try:
         resolved = await resolve_cardano_tx(input=input, fetch_fn=fetch_fn)
-    except NotACip309RecordError as e:
+    except NotALabel309RecordError as e:
         # A definitive "no metadata" response is record-attributable (the
         # tx exists but carries no label-309). Exit 1.
         return _base_report(

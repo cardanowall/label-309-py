@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# IPFS CID structural validator for the CIP-309 CID profile.
+# IPFS CID structural validator for the Label 309 CID profile.
 #
 # Pure stdlib, no external CID/multihash/multibase library, so the structural
 # validator stays inside the closed `cbor2 + cryptography + PyNaCl + argon2 +
@@ -156,7 +156,7 @@ def _is_valid_cidv1(s: str) -> bool:
 
 def is_valid_cid(s: str) -> bool:
     """Return True iff ``s`` is a structurally valid IPFS CID inside the
-    CIP-309 v1 CID profile.
+    Label 309 v1 CID profile.
     """
     if not s:
         return False

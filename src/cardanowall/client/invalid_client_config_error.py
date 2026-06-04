@@ -1,4 +1,4 @@
-"""Raised from the Cip309Client constructor when the config cannot be
+"""Raised from the Label309Client constructor when the config cannot be
 resolved into a usable gateway target.
 
 The single trigger: no ``base_url`` was supplied (or it was empty). The client

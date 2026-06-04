@@ -1,7 +1,7 @@
 """RFC 7807 ``application/problem+json`` envelope and the typed error class
 hierarchy raised by the SDK on every non-2xx response.
 
-A conforming CIP-309 gateway's ``/api/v1/*`` routes emit the canonical shape::
+A conforming Label 309 gateway's ``/api/v1/*`` routes emit the canonical shape::
 
     Content-Type: application/problem+json
     {
@@ -37,7 +37,7 @@ from typing import Any, TypedDict
 
 __all__ = [
     "CANONICAL_PROBLEM_KEYS",
-    "Cip309HttpError",
+    "Label309HttpError",
     "ProblemDetails",
     "ProblemErrorEntry",
     "extract_problem_extensions",
@@ -65,7 +65,7 @@ class ProblemDetails(TypedDict, total=False):
     validation responses. ``instance`` is optional per RFC 7807 §3.1.
 
     Additional top-level fields are RFC 7807 §3.2 extension members and
-    are preserved verbatim on ``Cip309HttpError.extensions``.
+    are preserved verbatim on ``Label309HttpError.extensions``.
     """
 
     type: str
@@ -93,7 +93,7 @@ def extract_problem_extensions(problem: ProblemDetails) -> dict[str, Any]:
     return {k: v for k, v in problem.items() if k not in CANONICAL_PROBLEM_KEYS}
 
 
-class Cip309HttpError(Exception):
+class Label309HttpError(Exception):
     """Parent class for every typed SDK HTTP error.
 
     Carries the full RFC 7807 problem document plus headers

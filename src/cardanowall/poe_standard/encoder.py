@@ -13,7 +13,7 @@ from .schema import (
     Slot,
 )
 
-# Canonical-CBOR producer for CIP-309 v1 records. Output bytes are RFC 8949
+# Canonical-CBOR producer for Label 309 v1 records. Output bytes are RFC 8949
 # §4.2.1 deterministic (definite-length, sorted bytewise-lex map keys, no
 # duplicates) — `encode_canonical_cbor` delegates to `cbor2.dumps(...,
 # canonical=True)` which already enforces those rules.
@@ -32,8 +32,8 @@ def encode_record_body_for_signing(record: PoeRecord) -> bytes:
     """Encode the record body MINUS `sigs` to canonical CBOR (the signing body).
 
     Producers (in-process or off-host) prepend the 25-byte UTF-8 domain prefix
-    `cardano-poe-record-sig-v1` before invoking Ed25519; the CIP-309 Sig_structure
-    builder (`build_cip309_sig_structure`) handles that step internally.
+    `cardano-poe-record-sig-v1` before invoking Ed25519; the Label 309 Sig_structure
+    builder (`build_label309_sig_structure`) handles that step internally.
     """
     return encode_canonical_cbor(_record_to_cbor_value(record, include_sigs=False))
 

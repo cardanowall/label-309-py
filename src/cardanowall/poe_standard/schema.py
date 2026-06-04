@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal, NotRequired, TypedDict
 
-# CIP-309 v1 wire-format types. Mirrors the on-wire CBOR shape: top-level
+# Label 309 v1 wire-format types. Mirrors the on-wire CBOR shape: top-level
 # record, items + hashes map, encryption envelope, merkle commits, sig
 # entries, supersedes, and CDDL. TypedDicts are preferred over dataclasses
 # for parity: the JSON-ish on-wire shape is exactly what the validator
@@ -144,7 +144,7 @@ class Supersedes(TypedDict):
 
 
 class PoeRecord(TypedDict):
-    """Top-level CIP-309 record.
+    """Top-level Label 309 record.
 
     A conformant record MUST carry at least one of `items` (≥ 1 entry) or
     `merkle` (≥ 1 entry); cross-field enforcement lives in the validator and an

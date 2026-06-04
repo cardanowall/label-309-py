@@ -17,7 +17,7 @@ CanonicalCborValue = (
 
 class CanonicalCborError(Exception):
     # Every canonical-CBOR decode violation collapses to this single public
-    # CIP-309 taxonomy code: indefinite-length items, duplicate keys, unsorted
+    # Label 309 taxonomy code: indefinite-length items, duplicate keys, unsorted
     # keys, non-minimal integers, invalid UTF-8. The specific cause survives in
     # the human-readable message, not as a separate code.
     MALFORMED_CBOR = "MALFORMED_CBOR"
@@ -45,7 +45,7 @@ def decode_canonical_cbor(data: bytes) -> object:
 
 def decode_cbor_permissive(data: bytes) -> object:
     # Outer Cardano tx CBOR is not constrained to canonical form (indefinite-length,
-    # unsorted maps); CIP-309 records themselves MUST go through decode_canonical_cbor.
+    # unsorted maps); Label 309 records themselves MUST go through decode_canonical_cbor.
     return cbor2.loads(data)
 
 
@@ -56,7 +56,7 @@ def decode_cbor_permissive(data: bytes) -> object:
 # implementations byte/code-identical we run a structural pre-scan here that
 # enforces map-key uniqueness AND canonical bytewise-lexicographic ordering on
 # the encoded key bytes (RFC 8949 §4.2.1). Both violations surface as the same
-# MALFORMED_CBOR code — the CIP-309 taxonomy has no separate duplicate-key
+# MALFORMED_CBOR code — the Label 309 taxonomy has no separate duplicate-key
 # entry. Any structural problem the scan can't parse is left to cbor2 to reject.
 def _scan_for_noncanonical_maps(data: bytes) -> None:
     try:
@@ -76,7 +76,7 @@ def _walk(data: bytes, pos: int) -> int:
     if addl == 31:
         raise _ScanAbort
     if major == 7:
-        # A CIP-309 record carries integers, byte/text strings, arrays, maps and
+        # A Label 309 record carries integers, byte/text strings, arrays, maps and
         # `null` — and nothing else. The major-type-7 surface admits only the
         # three primitives we allow: false (0xf4), true (0xf5), null (0xf6).
         # Everything else on this surface — undefined (0xf7), the simple-value
@@ -91,7 +91,7 @@ def _walk(data: bytes, pos: int) -> int:
             raise CanonicalCborError(
                 CanonicalCborError.MALFORMED_CBOR,
                 "major-type-7 value is not one of {false, true, null} "
-                "(floats, simple values and undefined are not valid in a CIP-309 record)",
+                "(floats, simple values and undefined are not valid in a Label 309 record)",
             )
         return pos
 

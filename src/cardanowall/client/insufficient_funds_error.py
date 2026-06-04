@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .http_error import Cip309HttpError, ProblemDetails
+from .http_error import Label309HttpError, ProblemDetails
 
 
 def _read_int_string(value: Any) -> int | None:
@@ -49,7 +49,7 @@ def _read_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
-class InsufficientFundsError(Cip309HttpError):
+class InsufficientFundsError(Label309HttpError):
     balance_usd_micros: int | None
     required_usd_micros: int | None
     top_up_url: str | None

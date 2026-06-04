@@ -2,7 +2,7 @@
 
 CIP-30 wallets that don't put a 32-byte raw Ed25519 pubkey in the COSE_Sign1
 protected header instead deliver the signer key as a separate ``cbor<COSE_Key>``
-blob, surfaced in the CIP-309 record under the top-level ``signer_keys`` field.
+blob, surfaced in the Label 309 record under the top-level ``signer_keys`` field.
 This helper decodes one such blob and returns the underlying 32-byte Ed25519
 pubkey, or ``None`` when the blob is malformed, uses an unexpected key type /
 curve, or has the wrong ``x`` length.

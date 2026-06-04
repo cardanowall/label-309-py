@@ -6,10 +6,10 @@ subclass.
 
 from __future__ import annotations
 
-from .http_error import Cip309HttpError
+from .http_error import Label309HttpError
 
 
-class NotFoundError(Cip309HttpError):
+class NotFoundError(Label309HttpError):
     pass
 
 

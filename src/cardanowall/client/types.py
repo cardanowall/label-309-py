@@ -1,4 +1,4 @@
-"""Shared types for the Python Cip309Client HTTP surface.
+"""Shared types for the Python Label309Client HTTP surface.
 
 Mirror of the ``@cardanowall/sdk-ts`` client types. Field names mirror the wire
 format (snake_case) byte-equivalently — both languages emit snake_case on the

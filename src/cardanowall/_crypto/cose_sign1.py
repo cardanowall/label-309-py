@@ -13,7 +13,7 @@ from .cbor import (
 from .compare_ct import compare_ct
 from .sig import sign_ed25519, verify_ed25519
 
-# CIP-309 v1 domain separator embedded as a prefix on Sig_structure[3]
+# Label 309 v1 domain separator embedded as a prefix on Sig_structure[3]
 # (`to_sign`). Length pinned at 25 UTF-8 bytes by spec.
 CARDANO_POE_SIG_DOMAIN_PREFIX: bytes = b"cardano-poe-record-sig-v1"
 if len(CARDANO_POE_SIG_DOMAIN_PREFIX) != 25:
@@ -125,7 +125,7 @@ def decode_cose_sign1(data: bytes) -> CoseSign1Decoded:
             )
         # Empty protected header MUST encode as the single byte 0x40 (zero-length bstr),
         # not 0x41 0xA0 (a 1-byte bstr containing an empty CBOR map). RFC 9052 §3 +
-        # CIP-309 canonical-CBOR mandate.
+        # Label 309 canonical-CBOR mandate.
         if len(decoded_protected) == 0:
             raise CoseVerifyError(
                 CoseVerifyError.MALFORMED_SIG_COSE,
@@ -251,10 +251,10 @@ def cose_sign1_verify(
     return CoseVerifySuccess(ok=True, signer_key=signer_key, alg=alg_raw)
 
 
-# CIP-309 v1 specialisation of Sig_structure:
+# Label 309 v1 specialisation of Sig_structure:
 #   to_sign       = utf8("cardano-poe-record-sig-v1") || canonical_cbor(record_body_minus_sigs)
 #   Sig_structure = [ "Signature1", body_protected, h'' (empty), to_sign ]
-def build_cip309_sig_structure(
+def build_label309_sig_structure(
     *,
     body_protected_bytes: bytes,
     record_body_cbor: bytes,
@@ -277,11 +277,11 @@ class CoseSign1BuildError(Exception):
         self.code: str = code
 
 
-# CIP-309 v1 record-signature builder. Caller MUST pass exactly one of
+# Label 309 v1 record-signature builder. Caller MUST pass exactly one of
 # `signer_secret_key` (seed-based test/SDK path) or `signer`
 # (injected closure for session-memory zero-leak composer use). The 25-byte
 # UTF-8 domain prefix is prepended internally — callers MUST NOT pre-concatenate.
-def cose_sign1_cip309_build(
+def cose_sign1_label309_build(
     *,
     protected_header: CoseHeader,
     unprotected_header: CoseHeader,
@@ -292,18 +292,18 @@ def cose_sign1_cip309_build(
     if signer_secret_key is None and signer is None:
         raise CoseSign1BuildError(
             CoseSign1BuildError.SIGNER_NOT_PROVIDED,
-            "cose_sign1_cip309_build requires either signer_secret_key or signer",
+            "cose_sign1_label309_build requires either signer_secret_key or signer",
         )
     if signer_secret_key is not None and signer is not None:
         raise CoseSign1BuildError(
             CoseSign1BuildError.SIGNER_AND_SEED_BOTH_PROVIDED,
-            "cose_sign1_cip309_build accepts signer_secret_key XOR signer (not both)",
+            "cose_sign1_label309_build accepts signer_secret_key XOR signer (not both)",
         )
     if len(protected_header) == 0:
         protected_bytes = b""
     else:
         protected_bytes = encode_canonical_cbor(cast(CanonicalCborValue, protected_header))
-    sig_structure_bytes = build_cip309_sig_structure(
+    sig_structure_bytes = build_label309_sig_structure(
         body_protected_bytes=protected_bytes,
         record_body_cbor=record_body_cbor,
     )
@@ -326,8 +326,8 @@ def cose_sign1_cip309_build(
     )
 
 
-# CIP-309 v1 record-signature verifier.
-def cose_sign1_cip309_verify(
+# Label 309 v1 record-signature verifier.
+def cose_sign1_label309_verify(
     *,
     message: bytes,
     detached_record_body_cbor: bytes,
@@ -406,7 +406,7 @@ def cose_sign1_cip309_verify(
             payload=hashed_payload,
         )
     else:
-        sig_structure_bytes = build_cip309_sig_structure(
+        sig_structure_bytes = build_label309_sig_structure(
             body_protected_bytes=decoded["protected_bytes"],
             record_body_cbor=detached_record_body_cbor,
         )

@@ -1,4 +1,4 @@
-"""CIP-309 v1 off-host signing helper — Python parity twin.
+"""Label 309 v1 off-host signing helper — Python parity twin.
 
 Wire-format invariants enforced by this module:
     - Sig_structure carries the 25-byte UTF-8 domain prefix
@@ -47,7 +47,7 @@ from typing import cast
 from cardanowall._crypto.cbor import CanonicalCborValue, encode_canonical_cbor
 from cardanowall._crypto.cose_sign1 import (
     CARDANO_POE_SIG_DOMAIN_PREFIX,
-    build_cip309_sig_structure,
+    build_label309_sig_structure,
     build_sig_structure,
     encode_cose_sign1,
 )
@@ -117,7 +117,7 @@ def prepare_sig_structure(
         )
     protected_header_bytes = _encode_path1_protected_header(signer_pubkey)
     record_body_cbor = encode_record_body_for_signing(record)
-    sig_structure_bytes = build_cip309_sig_structure(
+    sig_structure_bytes = build_label309_sig_structure(
         body_protected_bytes=protected_header_bytes,
         record_body_cbor=record_body_cbor,
     )

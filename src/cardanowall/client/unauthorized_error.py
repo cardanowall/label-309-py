@@ -7,10 +7,10 @@ revoked / unknown API key.
 
 from __future__ import annotations
 
-from .http_error import Cip309HttpError
+from .http_error import Label309HttpError
 
 
-class UnauthorizedError(Cip309HttpError):
+class UnauthorizedError(Label309HttpError):
     pass
 
 

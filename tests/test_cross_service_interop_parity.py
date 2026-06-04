@@ -2,7 +2,7 @@
 
 Loads the byte-stable cross-service fixture (produced by
 cardanowall._tools.generate_cross_service_interop_fixture and mirrored across
-the TS canonical + Python copies), validates its CIP-309 record bytes via the
+the TS canonical + Python copies), validates its Label 309 record bytes via the
 Python sibling of validatePoeRecord, and runs the Python sibling of
 eciesSealedPoeTrialDecrypt against the pinned recipient secret. The
 (slot_idx, cek) recovered MUST byte-match the values the TS integration test

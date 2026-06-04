@@ -91,7 +91,7 @@ class SeedSigner:
     def sign(self, sig_structure_bytes: bytes, /) -> bytes:
         # `sign_ed25519` takes the 32-byte secret key as the noble-compatible
         # seed and returns a 64-byte raw Ed25519 signature over the canonical
-        # CIP-309 Sig_structure bytes the publish helpers pass in.
+        # Label 309 Sig_structure bytes the publish helpers pass in.
         return sign_ed25519(self._secret_key, sig_structure_bytes)
 
 

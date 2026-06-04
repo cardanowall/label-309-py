@@ -31,7 +31,7 @@ from cardanowall._crypto.sealed_poe import (
     ecies_sealed_poe_unwrap,
 )
 from cardanowall._crypto.sig import get_public_key_ed25519, sign_ed25519
-from cardanowall.client.cip309_client import Cip309Client
+from cardanowall.client.label309_client import Label309Client
 from cardanowall.client.partial_upload_error import PartialUploadError
 from cardanowall.client.publish import PublishError, Signer
 from cardanowall.merkle import merkle_sha2_256_root
@@ -42,9 +42,9 @@ FIXTURE_API_KEY = "opaque-bearer-fixture-token"
 QUOTE_ID = "01956b41-7c00-7000-8000-000000000001"
 
 
-def _client_with_handler(handler: Callable[[httpx.Request], httpx.Response]) -> Cip309Client:
+def _client_with_handler(handler: Callable[[httpx.Request], httpx.Response]) -> Label309Client:
     transport = httpx.MockTransport(handler)
-    return Cip309Client(
+    return Label309Client(
         api_key=FIXTURE_API_KEY,
         base_url="http://test.example",
         http_client=httpx.AsyncClient(transport=transport),

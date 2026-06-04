@@ -12,7 +12,7 @@ def test_every_code_has_severity() -> None:
 
 def test_validator_codes_present() -> None:
     codes = set(get_args(ErrorCode))
-    # Spot-check both renamed and net-new codes from the CIP-309 v2 catalogue.
+    # Spot-check both renamed and net-new codes from the Label 309 v2 catalogue.
     for code in (
         "MALFORMED_CBOR",
         "SCHEMA_EMPTY_RECORD",

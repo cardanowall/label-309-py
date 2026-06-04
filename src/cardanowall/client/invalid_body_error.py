@@ -6,10 +6,10 @@ Schema validation failures emit ``validation-failed`` (→
 
 from __future__ import annotations
 
-from .http_error import Cip309HttpError
+from .http_error import Label309HttpError
 
 
-class InvalidBodyError(Cip309HttpError):
+class InvalidBodyError(Label309HttpError):
     pass
 
 

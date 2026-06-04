@@ -1,14 +1,13 @@
-"""CIP-309 SDK client surface: Cip309Client + HTTP errors + off-host signing helper."""
+"""Label 309 SDK client surface: Label309Client + HTTP errors + off-host signing helper."""
 
 from __future__ import annotations
 
 from .account import AccountNamespace
 from .batch_empty_error import BatchEmptyError
 from .batch_too_large_error import BatchTooLargeError
-from .cip309_client import Cip309Client
 from .forbidden_error import ForbiddenError
 from .http_error import (
-    Cip309HttpError,
+    Label309HttpError,
     ProblemDetails,
     ProblemErrorEntry,
     extract_problem_extensions,
@@ -19,6 +18,7 @@ from .insufficient_scope_error import InsufficientScopeError
 from .internal_server_error import InternalServerError
 from .invalid_body_error import InvalidBodyError
 from .invalid_client_config_error import InvalidClientConfigError
+from .label309_client import Label309Client
 from .malformed_cbor_error import MalformedCborError
 from .not_found_error import NotFoundError
 from .off_host_sign import (
@@ -57,8 +57,6 @@ __all__ = [
     "AccountNamespace",
     "BatchEmptyError",
     "BatchTooLargeError",
-    "Cip309Client",
-    "Cip309HttpError",
     "ForbiddenError",
     "IdempotencyConflictError",
     "InsufficientFundsError",
@@ -66,6 +64,8 @@ __all__ = [
     "InternalServerError",
     "InvalidBodyError",
     "InvalidClientConfigError",
+    "Label309Client",
+    "Label309HttpError",
     "MalformedCborError",
     "NotFoundError",
     "OffHostSignError",

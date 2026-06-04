@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .http_error import Cip309HttpError, ProblemDetails
+from .http_error import Label309HttpError, ProblemDetails
 
 
 def _read_int(value: Any) -> int | None:
@@ -22,7 +22,7 @@ def _read_int(value: Any) -> int | None:
     return None
 
 
-class BatchTooLargeError(Cip309HttpError):
+class BatchTooLargeError(Label309HttpError):
     max: int | None
     got: int | None
 

@@ -1,4 +1,4 @@
-# CIP-309 Merkle leaves-list codec (canonical CBOR normative).
+# Label 309 Merkle leaves-list codec (canonical CBOR normative).
 # The on-storage byte-normative form of the leaves-list file is canonical
 # CBOR per RFC 8949 §4.2.1. Producers publish CBOR bytes to the
 # content-addressed substrate referenced by `merkle[i].uris[]`; verifiers

@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cardanowall-sdk"
-version = "0.1.0"
-description = "Python SDK for the CardanoWall protocol — parity twin of @cardanowall/sdk-ts. Implements the CIP-309 cryptographic primitives byte-identically with the TypeScript reference."
+version = "0.2.0"
+description = "Python SDK for the CardanoWall protocol — parity twin of @cardanowall/sdk-ts. Implements the Label 309 cryptographic primitives byte-identically with the TypeScript reference."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
 authors = [
   { name = "CardanoWall", email = "hello@cardanowall.com" },
 ]
-keywords = ["cardano", "cip-309", "proof-of-existence", "poe", "cardanowall", "sdk"]
+keywords = ["cardano", "label-309", "proof-of-existence", "poe", "cardanowall", "sdk"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
@@ -31,10 +31,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/cardanowall/cip309-py"
-Repository = "https://github.com/cardanowall/cip309-py"
-Issues = "https://github.com/cardanowall/cip309-py/issues"
-Documentation = "https://github.com/cardanowall/cip309-py#readme"
+Homepage = "https://github.com/cardanowall/label-309-py"
+Repository = "https://github.com/cardanowall/label-309-py"
+Issues = "https://github.com/cardanowall/label-309-py/issues"
+Documentation = "https://github.com/cardanowall/label-309-py#readme"
 
 [project.scripts]
 cardanowall-sdk-conformance = "cardanowall.conformance.__main__:main"
@@ -90,7 +90,7 @@ select = ["E", "F", "W", "I", "B", "TID", "RUF", "UP", "S"]
 "pycryptodome".msg = "Use the closed crypto catalogue (cryptography / PyNaCl / cbor2 / argon2-cffi / pyrage)."
 "Crypto".msg = "Top-level Crypto is pycryptodome — use the closed crypto catalogue."
 "Cryptodome".msg = "Top-level Cryptodome is pycryptodomex (a pycryptodome sibling) — use the closed crypto catalogue."
-"cryptography.hazmat.primitives.asymmetric.ed25519".msg = "cryptography's Ed25519 is cofactored (non-conformant for CIP-309 strict ZIP215=false) — use nacl.signing from PyNaCl."
+"cryptography.hazmat.primitives.asymmetric.ed25519".msg = "cryptography's Ed25519 is cofactored (non-conformant for Label 309 strict ZIP215=false) — use nacl.signing from PyNaCl."
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S101"]

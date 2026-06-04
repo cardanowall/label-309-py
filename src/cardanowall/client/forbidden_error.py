@@ -7,10 +7,10 @@ instead.
 
 from __future__ import annotations
 
-from .http_error import Cip309HttpError
+from .http_error import Label309HttpError
 
 
-class ForbiddenError(Cip309HttpError):
+class ForbiddenError(Label309HttpError):
     pass
 
 

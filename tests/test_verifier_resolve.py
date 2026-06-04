@@ -10,7 +10,7 @@ from cardanowall._crypto.cbor import encode_canonical_cbor
 from cardanowall.verifier import (
     FetchOutboundOptions,
     FetchOutboundResult,
-    NotACip309RecordError,
+    NotALabel309RecordError,
     VerifyTxInput,
     extract_label_309_metadata,
     resolve_cardano_tx,
@@ -71,7 +71,7 @@ def test_resolve_via_koios_empty_array_raises_not_a_record() -> None:
         ),
     }
     fetch_fn = _mk_routes(routes)
-    with pytest.raises(NotACip309RecordError):
+    with pytest.raises(NotALabel309RecordError):
         asyncio.run(
             resolve_cardano_tx(
                 input=VerifyTxInput(tx_hash=tx_hash),
@@ -128,7 +128,7 @@ def test_resolve_definitive_empty_does_not_fall_through() -> None:
         ),
     }
     fetch_fn = _mk_routes(routes)
-    with pytest.raises(NotACip309RecordError):
+    with pytest.raises(NotALabel309RecordError):
         asyncio.run(
             resolve_cardano_tx(
                 input=VerifyTxInput(tx_hash=tx_hash, blockfrost_project_id="mainnet01abc"),

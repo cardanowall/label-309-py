@@ -30,7 +30,7 @@ _DECODE_TABLE[ord("o")] = 0
 
 CROCKFORD_ENCODED_LENGTH_FOR_UUID = 26
 
-# The CIP-309 record id is the one prefixed id the standard itself defines.
+# The Label 309 record id is the one prefixed id the standard itself defines.
 # The generic codec below works for any ``<prefix>_<base32>`` id a gateway
 # mints; service entity ids (account / invoice / api-key) live in the service,
 # not in the public standard, so no constants are exported for them here.

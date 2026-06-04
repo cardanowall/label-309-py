@@ -13,8 +13,8 @@ from typing import Any
 import httpx
 import pytest
 
-from cardanowall.client.cip309_client import Cip309Client
 from cardanowall.client.insufficient_funds_error import InsufficientFundsError
+from cardanowall.client.label309_client import Label309Client
 from cardanowall.client.quote_already_consumed_error import QuoteAlreadyConsumedError
 from cardanowall.client.quote_expired_error import QuoteExpiredError
 from cardanowall.client.quote_not_found_error import QuoteNotFoundError
@@ -48,9 +48,9 @@ QUOTE_BODY: dict[str, Any] = {
 }
 
 
-def _client_with_handler(handler: Callable[[httpx.Request], httpx.Response]) -> Cip309Client:
+def _client_with_handler(handler: Callable[[httpx.Request], httpx.Response]) -> Label309Client:
     transport = httpx.MockTransport(handler)
-    return Cip309Client(
+    return Label309Client(
         api_key=FIXTURE_API_KEY,
         base_url="http://test.example",
         http_client=httpx.AsyncClient(transport=transport),
@@ -569,7 +569,7 @@ def test_poe_publish_request_shape_matches_cross_sdk_parity_fixture() -> None:
             return httpx.Response(202, json=PUBLISH_BODY)
 
         transport = httpx.MockTransport(handler)
-        async with Cip309Client(
+        async with Label309Client(
             api_key=parity_key,
             base_url="http://test.example",
             http_client=httpx.AsyncClient(transport=transport),

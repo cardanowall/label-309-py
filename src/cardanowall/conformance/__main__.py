@@ -25,7 +25,7 @@ _USAGE = (
     "       cardanowall-sdk-conformance --version\n"
     "       cardanowall-sdk-conformance --help\n"
     "\n"
-    "Runs the cardanowall-sdk standalone CIP-309 verifier against a single\n"
+    "Runs the cardanowall-sdk standalone Label 309 verifier against a single\n"
     "Cardano transaction. Exit codes:\n"
     "  0 = valid, 1 = failed (integrity), 2 = failed (network), "
     "3 = pending, 4 = CLI input error.\n"
