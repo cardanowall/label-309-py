@@ -48,6 +48,15 @@ def _det_priv(seed: int) -> bytes:
     return bytes([(seed + j) & 0xFF for j in range(32)])
 
 
+# A second, distinct low-order u-coordinate (RFC 7748 §6.1, p+1 reduces to 0).
+# Used to clobber a sibling slot with a low-order point that is NOT byte-equal to
+# the one under test, so the envelope still violates no per-slot KEK-uniqueness
+# rule while every slot's shared secret is all-zero.
+_SECOND_LOW_ORDER_EPK: bytes = bytes.fromhex(
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+)
+
+
 def _all_low_order_envelope(low_order_epk: bytes) -> tuple[SealedEnvelope, bytes]:
     recipient_public_keys = [
         x25519_public_key(_det_priv(0x11)),
@@ -58,7 +67,19 @@ def _all_low_order_envelope(low_order_epk: bytes) -> tuple[SealedEnvelope, bytes
         recipient_public_keys=recipient_public_keys,
         skip_shuffle=True,
     )
-    slots = tuple(SealedSlot(epk=low_order_epk, wrap=s.wrap) for s in out.envelope.slots)
+    # Clobber both slots with low-order points so every slot's shared secret is
+    # all-zero, but give each a DISTINCT epk: an envelope with duplicate per-slot
+    # KEM material is rejected up front (per-slot KEK uniqueness), which is a
+    # different defence than the all-zero shared-secret skip this test exercises.
+    second = (
+        _SECOND_LOW_ORDER_EPK
+        if low_order_epk != _SECOND_LOW_ORDER_EPK
+        else bytes(32)  # the all-zero point, still low-order and distinct
+    )
+    clobbered = (low_order_epk, second)
+    slots = tuple(
+        SealedSlot(epk=clobbered[i], wrap=s.wrap) for i, s in enumerate(out.envelope.slots)
+    )
     env = SealedEnvelope(
         scheme=out.envelope.scheme,
         aead=out.envelope.aead,

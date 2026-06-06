@@ -12,7 +12,7 @@ def test_every_code_has_severity() -> None:
 
 def test_validator_codes_present() -> None:
     codes = set(get_args(ErrorCode))
-    # Spot-check both renamed and net-new codes from the Label 309 v2 catalogue.
+    # Spot-check both renamed and net-new codes from the Label 309 catalogue.
     for code in (
         "MALFORMED_CBOR",
         "SCHEMA_EMPTY_RECORD",
@@ -70,7 +70,7 @@ def test_verifier_codes_present() -> None:
 
 def test_removed_codes_absent() -> None:
     codes = set(get_args(ErrorCode))
-    # Pre-rewrite catalogue entries that MUST NOT appear in v2.
+    # Pre-rewrite catalogue entries that MUST NOT appear in the current catalogue.
     for removed in (
         "IV_LENGTH_MISMATCH",
         "UNSUPPORTED_ENC_VERSION",

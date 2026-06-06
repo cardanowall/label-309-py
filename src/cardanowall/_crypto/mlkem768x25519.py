@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from kyber_py.ml_kem import ML_KEM_768
 
-# X-Wing hybrid KEM (ML-KEM-768 + X25519), per draft-connolly-cfrg-xwing-kem-06
+# X-Wing hybrid KEM (ML-KEM-768 + X25519), per draft-connolly-cfrg-xwing-kem-10
 # / IACR ePrint 2024/039. The construction combines a post-quantum KEM
 # (ML-KEM-768) with a classical one (X25519): an attacker must break BOTH to
 # recover the shared secret, so the hybrid is no weaker than either part.
@@ -82,7 +82,7 @@ def xwing_keygen(seed: bytes) -> tuple[bytes, bytes]:
 
     Returns ``(public_key, secret_seed)`` where ``public_key`` is 1216 bytes
     (ML-KEM-768 encapsulation key ‖ X25519 public key) and ``secret_seed`` is
-    the 32-byte root seed itself — the V06 secret key IS the seed; the secret
+    the 32-byte root seed itself — the X-Wing secret key IS the seed; the secret
     material is re-expanded on demand during decapsulation.
     """
     if len(seed) != _SEED_LENGTH:

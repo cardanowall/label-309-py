@@ -289,6 +289,91 @@ def test_unwrap_n32() -> None:
     _check_unwrap_positive("unwrap-n32.json")
 
 
+def test_unwrap_duplicate_recipient_decrypts() -> None:
+    # A1 positive: the same recipient public key in two slots (fresh distinct
+    # ephemerals, same CEK) MUST decrypt normally — the CEK-conflict check
+    # rejects only DIFFERENT recovered CEKs, never honest recipient padding.
+    _check_unwrap_positive("unwrap-duplicate-recipient.json")
+
+
+def test_cek_conflict_is_rejected() -> None:
+    # A1 negative (behavioral): construct an envelope spliced from two single-slot
+    # wraps that address the SAME recipient but carry DIFFERENT CEKs, then re-key
+    # the slots_mac and content ciphertext to the FIRST slot's CEK so that slot 0
+    # passes the MAC and the content opens. The ONLY thing that should reject this
+    # is the CEK-conflict check: slot 1 recovers a different CEK. A verifier that
+    # selected only the first match and skipped the rest would wrongly ACCEPT it.
+    from cardanowall._crypto.aead import xchacha20_poly1305_encrypt
+    from cardanowall._crypto.sealed_poe import (
+        _ad_content_slots,
+        _compute_slots_hash,
+        _slots_mac_from_hash,
+        _slots_payload_key,
+        ecies_sealed_poe_trial_decrypt,
+    )
+
+    priv = bytes((0xD0 + i) & 0xFF for i in range(32))
+    pub = x25519_public_key(priv)
+    cek_a = bytes([0xAA] * 32)
+    cek_b = bytes([0xBB] * 32)
+    nonce = bytes((0xE0 + i) & 0xFF for i in range(24))
+
+    out_a = ecies_sealed_poe_wrap(
+        plaintext=b"x",
+        recipient_public_keys=[pub],
+        cek=cek_a,
+        nonce=nonce,
+        ephemeral_secrets=[bytes([0x01] * 32)],
+        skip_shuffle=True,
+    )
+    out_b = ecies_sealed_poe_wrap(
+        plaintext=b"x",
+        recipient_public_keys=[pub],
+        cek=cek_b,
+        nonce=nonce,
+        ephemeral_secrets=[bytes([0x02] * 32)],
+        skip_shuffle=True,
+    )
+    slots = (out_a.envelope.slots[0], out_b.envelope.slots[0])
+    # Distinct epks, so the duplicate-KEM-material gate does not pre-empt the
+    # conflict path.
+    assert slots[0].epk != slots[1].epk
+
+    slots_hash = _compute_slots_hash(nonce, slots, "x25519")
+    slots_mac = _slots_mac_from_hash(cek_a, slots_hash)
+    payload_key = _slots_payload_key(cek_a, nonce)
+    aad = _ad_content_slots(nonce, "x25519", slots_hash, slots_mac)
+    ciphertext = xchacha20_poly1305_encrypt(payload_key, nonce, aad, b"conflict-probe")
+
+    envelope = SealedEnvelope(
+        scheme=1,
+        aead="xchacha20-poly1305",
+        kem="x25519",
+        nonce=nonce,
+        slots=slots,
+        slots_mac=slots_mac,
+    )
+
+    # Single-priv path: rejected with the generic TAMPERED_HEADER reason.
+    res = ecies_sealed_poe_unwrap(
+        envelope=envelope, ciphertext=ciphertext, recipient_secret_key=priv
+    )
+    assert res.matched is False
+    assert res.reason == UNWRAP_REASON_TAMPERED_HEADER
+
+    # Multi-priv path: same rejection.
+    res_multi = ecies_sealed_poe_unwrap(
+        envelope=envelope, ciphertext=ciphertext, recipient_secret_keys=[priv]
+    )
+    assert res_multi.matched is False
+    assert res_multi.reason == UNWRAP_REASON_TAMPERED_HEADER
+
+    # Trial-decrypt path: a conflict is the generic aead_pass_no_mac_match, never
+    # a clean match.
+    trial = ecies_sealed_poe_trial_decrypt(envelope=envelope, recipient_secret_keys=[priv])
+    assert trial.kind == "aead_pass_no_mac_match"
+
+
 def test_unwrap_structured_negatives() -> None:
     corpus = cast(
         dict[str, Any],

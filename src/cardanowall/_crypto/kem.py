@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from typing import TypedDict
+import hmac
+from typing import Final, TypedDict
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+
+_X25519_SHARED_SECRET_LENGTH: Final[int] = 32
+_X25519_ALL_ZERO_SHARED: Final[bytes] = b"\x00" * _X25519_SHARED_SECRET_LENGTH
 
 
 class X25519LowOrderPointError(Exception):
@@ -53,9 +57,17 @@ def x25519_ecdh(secret_key: bytes, their_public_key: bytes) -> bytes:
     # A wrong-length key raises here (caller misuse) — let it propagate as-is.
     pub = X25519PublicKey.from_public_bytes(their_public_key)
     try:
-        return priv.exchange(pub)
+        shared = priv.exchange(pub)
     except ValueError as e:
         # `exchange` only fails when the peer public key is a small-order point
         # (all-zero shared secret). Translate that — and only that — into our
         # typed error so trial-decrypt can treat the slot as a non-match.
         raise X25519LowOrderPointError() from e
+    # Reject the all-zero shared secret directly (RFC 7748 §6.1 contributory
+    # check) rather than relying on the backend to do it transitively. The
+    # comparison is constant-time so the rejection leaks no timing on the
+    # shared-secret bytes; a peer public key that drives the shared secret to
+    # zero is treated identically to a small-order point.
+    if hmac.compare_digest(shared, _X25519_ALL_ZERO_SHARED):
+        raise X25519LowOrderPointError()
+    return shared

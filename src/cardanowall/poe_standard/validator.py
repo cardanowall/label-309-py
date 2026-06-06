@@ -12,6 +12,16 @@ from cardanowall._crypto.cbor import (
 )
 from cardanowall._crypto.cose_sign1 import CoseVerifyError, decode_cose_sign1
 
+# The verifier resource bounds the sealed-PoE unwrap layer enforces. Importing
+# the same constants here, rather than re-declaring them, makes the structural
+# validator and the unwrap layer trip the identical thresholds: a divergence is
+# impossible because there is one definition. Both are deployment-pinned
+# reference values, not wire fields.
+from cardanowall._crypto.sealed_poe import (
+    MAX_DECODED_ENVELOPE_BYTES,
+    MAX_SLOTS,
+)
+
 from .chunked import bytes_chunk_array_concat, reconstruct_chunked_uri
 from .cid_profile import is_valid_cid
 from .error_codes import SEVERITY, ErrorCode, Severity
@@ -83,6 +93,13 @@ KEM_FIELD_LENGTH_CODE: Final[dict[KemSlotField, ErrorCode]] = {
     "epk": "KEM_EPK_LENGTH_MISMATCH",
     "kem_ct": "KEM_CT_LENGTH_MISMATCH",
 }
+
+# Fixed envelope-field lengths used by the decoded-envelope byte backstop. The
+# nonce is the XChaCha20-Poly1305 nonce (also the AEAD registry value) and
+# `slots_mac` is a SHA-256 MAC; both are pinned by the construction, so the
+# backstop measures the same aggregate the unwrap layer does.
+_NONCE_LENGTH: Final[int] = 24
+_SLOTS_MAC_LENGTH: Final[int] = 32
 
 # Passphrase-KDF registry; pbkdf2-sha-256 is NOT registered (argon2id only).
 PASSPHRASE_ALGS: Final[frozenset[str]] = frozenset({"argon2id"})
@@ -689,13 +706,71 @@ def _validate_encryption(enc: object, path: _Path, issues: list[ValidationIssue]
                     "slots must be a non-empty array",
                 )
             )
+        elif len(slots) > MAX_SLOTS:
+            # Slot-count resource bound — reject an over-large slot array before
+            # walking every slot. This is the slot-count half of the
+            # partitioning-oracle resource guard; the unwrap layer trips the
+            # identical threshold first, so the two layers agree. Skip the
+            # per-slot, duplicate, and byte-size passes — the array is rejected
+            # outright.
+            issues.append(
+                _issue(
+                    (*path, "slots"),
+                    "ENC_SLOTS_TOO_MANY",
+                    f"slots length {len(slots)} exceeds MAX_SLOTS={MAX_SLOTS}",
+                )
+            )
         else:
             # Only validate slot shape when the KEM resolves to a known
             # descriptor; an unknown / absent KEM already emits its own code
             # above, and we cannot pick a descriptor to branch on.
             if kem_resolved is not None:
+                descriptor = KEM_SLOT_DESCRIPTORS[kem_resolved]
+                # Per-slot KEK uniqueness: the zero-nonce per-slot wrap is safe
+                # only because each slot draws fresh KEM randomness, so two slots
+                # sharing the same encapsulation material derive the same KEK and
+                # repeat a (KEK, zero-nonce) pair. The material that fixes the KEK
+                # is the `epk` (x25519) or the reassembled `kem_ct` (hybrid); a
+                # repeat of either across slots is rejected here, before any
+                # KEM/AEAD primitive — the same check the unwrap layer runs.
+                seen_kem_material: set[bytes] = set()
                 for i, slot in enumerate(slots):
                     _validate_slot(slot, kem_resolved, (*path, "slots", i), issues)
+                    material = _slot_kem_material(slot, descriptor)
+                    if material is not None:
+                        if material in seen_kem_material:
+                            issues.append(
+                                _issue(
+                                    (*path, "slots", i, descriptor.field),
+                                    "ENC_SLOTS_DUPLICATE_KEM_MATERIAL",
+                                    f"slot {i} {descriptor.field} duplicates an earlier slot "
+                                    "— per-slot KEK uniqueness is violated",
+                                )
+                            )
+                        else:
+                            seen_kem_material.add(material)
+
+                # Decoded-envelope byte backstop. Every per-slot field is
+                # fixed-length (the descriptor pins them; a wrong length already
+                # emitted its own code), so the decoded envelope's aggregate size
+                # is determined by the slot count: nonce + slots_mac + count *
+                # (ct-field + wrap). This is the identical measure the unwrap
+                # layer computes, so the two layers trip ENC_ENVELOPE_TOO_LARGE on
+                # the same envelopes. A tighter cap than MAX_SLOTS for honest
+                # records.
+                per_slot_bytes = descriptor.field_length + descriptor.wrap_length
+                decoded_envelope_bytes = (
+                    _NONCE_LENGTH + _SLOTS_MAC_LENGTH + len(slots) * per_slot_bytes
+                )
+                if decoded_envelope_bytes > MAX_DECODED_ENVELOPE_BYTES:
+                    issues.append(
+                        _issue(
+                            (*path, "slots"),
+                            "ENC_ENVELOPE_TOO_LARGE",
+                            f"decoded envelope size {decoded_envelope_bytes} exceeds "
+                            f"MAX_DECODED_ENVELOPE_BYTES={MAX_DECODED_ENVELOPE_BYTES}",
+                        )
+                    )
 
     if has_slots_mac:
         slots_mac = enc_map["slots_mac"]
@@ -862,6 +937,30 @@ def _validate_slot(slot: object, kem: str, path: _Path, issues: list[ValidationI
                 f"wrap length {len(wrap)} != {descriptor.wrap_length}",
             )
         )
+
+
+def _slot_kem_material(slot: object, descriptor: KemSlotDescriptor) -> bytes | None:
+    """The encapsulation material that fixes a slot's per-slot KEK, used for the
+    within-record duplicate check: the `epk` (x25519) or the reassembled
+    `kem_ct` (hybrid). Returns ``None`` when the required field is absent or the
+    wrong type — the shape defect already emitted `ENC_SLOT_INVALID_SHAPE`, so
+    the duplicate pass simply skips that slot.
+    """
+    if not isinstance(slot, dict):
+        return None
+    slot_map = cast(dict[object, object], slot)
+    if descriptor.field == "epk":
+        epk = slot_map.get("epk")
+        return bytes(epk) if isinstance(epk, (bytes, bytearray)) else None
+    raw = slot_map.get("kem_ct")
+    if not isinstance(raw, list) or len(raw) == 0:
+        return None
+    chunks: list[bytes] = []
+    for chunk in raw:
+        if not isinstance(chunk, (bytes, bytearray)):
+            return None
+        chunks.append(bytes(chunk))
+    return bytes_chunk_array_concat(chunks)
 
 
 def _reassemble_kem_ct(

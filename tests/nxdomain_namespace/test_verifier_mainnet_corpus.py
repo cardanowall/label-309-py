@@ -1,4 +1,4 @@
-"""Layer 1 + Layer 2 NXDOMAIN proof against the bootstrap corpus.
+"""Layer 1 + Layer 2 NXDOMAIN proof against the synthetic mainnet corpus.
 
 Layer 1 (the parametrised tests): the verifier MUST emit no HTTP call
 to a cardanowall.com host when given the conformance deny-list AND when
@@ -32,7 +32,7 @@ from cardanowall.verifier import (
 from ._corpus_schema import CorpusRecord, validate_corpus
 from ._stub_fetch import stub_fetch_from_record
 
-# v2-bootstrap synthetic corpus — built by the TypeScript corpus-bootstrap tool.
+# Synthetic mainnet corpus — built by the TypeScript corpus generator.
 
 CORPUS_PATH = Path(
     os.environ.get(

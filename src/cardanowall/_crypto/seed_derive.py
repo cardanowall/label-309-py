@@ -87,7 +87,7 @@ def derive_x25519_keypair_from_seed(seed: bytes) -> DerivedX25519KeyPair:
 
 def derive_mlkem768x25519_keypair_from_seed(seed: bytes) -> DerivedMlKem768X25519KeyPair:
     _assert_seed_length(seed)
-    # The HKDF output IS the X-Wing root seed: V06's secret key is the seed
+    # The HKDF output IS the X-Wing root seed: the secret key is the seed
     # itself, so the returned secret_seed equals this 32-byte derived value.
     xwing_seed = hkdf_sha256(
         ikm=seed,

@@ -139,7 +139,7 @@ def test_mlkem768x25519_keygen_kat() -> None:
         public_key, secret_seed = xwing_keygen(seed)
         assert public_key.hex() == vector["expected_pk_hex"], vector["name"]
         assert secret_seed.hex() == vector["expected_sk_seed_hex"], vector["name"]
-        # V06 secret key IS the 32-byte root seed.
+        # The X-Wing secret key IS the 32-byte root seed.
         assert secret_seed == seed, vector["name"]
 
 
@@ -180,10 +180,27 @@ def test_mlkem768x25519_decapsulate_implicit_rejection_never_raises() -> None:
     assert bad_secret == xwing_decapsulate(secret_seed, bytes(tampered))
 
 
+def test_mlkem768x25519_deterministic_keygen_encaps_kat() -> None:
+    # The full deterministic chain pinned by draft-10 Appendix C: seed -> pk
+    # (keygen) and eseed -> (ct, ss) (encaps). Binds keygen and encaps together
+    # against the externally pinned anchor; the inline encaps KAT above starts
+    # from a hardcoded pk and never re-derives it from the seed.
+    for vector in _vectors("mlkem768x25519-encaps-deterministic-draft10-kat.json"):
+        seed = bytes.fromhex(vector["seed_hex"])
+        public_key, _secret_seed = xwing_keygen(seed)
+        assert public_key.hex() == vector["expected_pk_hex"], vector["name"]
+
+        eseed = bytes.fromhex(vector["eseed_hex"])
+        enc, shared_secret = xwing_encapsulate(public_key, eseed)
+        assert enc.hex() == vector["expected_enc_hex"], vector["name"]
+        assert shared_secret.hex() == vector["expected_ss_hex"], vector["name"]
+
+
 def test_mlkem768x25519_roundtrip_encapsulate_decapsulate() -> None:
-    seed = bytes.fromhex(
-        "7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef26"
-    )
+    # Draw the seed from the shared KAT rather than hardcoding it, so the
+    # round-trip exercises the same pinned identity as the KAT vectors.
+    vector = _vectors("mlkem768x25519-encaps-deterministic-draft10-kat.json")[0]
+    seed = bytes.fromhex(vector["seed_hex"])
     public_key, secret_seed = xwing_keygen(seed)
     enc, shared_secret = xwing_encapsulate(public_key)
     recovered = xwing_decapsulate(secret_seed, enc)

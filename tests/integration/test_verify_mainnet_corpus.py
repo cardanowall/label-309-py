@@ -1,7 +1,7 @@
 """Integration test: Python verifier produces canonical VerifyReport per corpus record.
 
-The captured mainnet corpus is regenerated synthetically against the v2 wire
-schema (items/merkle/sigs[].cose_sign1/...) via the mainnet-corpus refresh
+The captured mainnet corpus is regenerated synthetically against the Label 309
+wire schema (items/merkle/sigs[].cose_sign1/...) via the mainnet-corpus refresh
 pipeline (MODE=synthetic, the default CI-safe path). The per-tx
 expected-report fixtures in `tests/fixtures/verify-reports/<tx_hash>.json` are
 byte-identical to their TypeScript twin in @cardanowall/sdk-ts — this test
@@ -28,7 +28,7 @@ from cardanowall.verifier import (
 from ._corpus_schema import CorpusRecord, validate_corpus
 from ._stub_fetch import stub_fetch_from_record
 
-# v2-bootstrap synthetic corpus — built by the TypeScript corpus-bootstrap tool.
+# Synthetic mainnet corpus — built by the TypeScript corpus generator.
 
 CORPUS_PATH = Path(
     os.environ.get(

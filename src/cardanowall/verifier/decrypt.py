@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import unicodedata
 from typing import Final
 
@@ -8,10 +7,14 @@ from cardanowall._crypto.aead import (
     AeadVerificationError,
     xchacha20_poly1305_decrypt,
 )
+from cardanowall._crypto.cbor import CanonicalCborValue, encode_canonical_cbor
 from cardanowall._crypto.compare_ct import compare_ct
 from cardanowall._crypto.hash import blake2b_256, sha256
-from cardanowall._crypto.kdf import argon2id_v13
+from cardanowall._crypto.kdf import argon2id_v13, hkdf_sha256
 from cardanowall._crypto.sealed_poe import (
+    CARDANO_POE_HKDF_INFO_PAYLOAD_PASSPHRASE,
+    CARDANO_POE_PW_NORM_PROFILE,
+    MAX_SEALED_PLAINTEXT,
     EciesSealedPoeError,
     SealedEnvelope,
     SealedSlot,
@@ -42,10 +45,53 @@ from .types import (
 # The v1 passphrase KDF registry has a single member.
 _PASSPHRASE_KDF_ARGON2ID: Final[str] = "argon2id"  # noqa: S105 — KDF alg id, not a secret
 
-# The passphrase-path content-AEAD AAD is the EMPTY byte string `h''`. (The
-# sealed-recipient path uses `nonce || slots_mac`; that binding lives inside
-# `ecies_sealed_poe_unwrap`.)
-_EMPTY_AAD: Final[bytes] = b""
+# Maximum raw passphrase length, in UTF-8 bytes, enforced BEFORE normalization
+# and the Argon2id KDF. An oversized passphrase would otherwise drive unbounded
+# NFKC / whitespace-collapse work and a large Argon2id input before any
+# cost-bounded primitive runs; capping the raw input closes that pre-KDF DoS.
+# The bound is byte length (len(raw.encode('utf-8'))), not code-point count, so a
+# short string of wide multi-byte characters is still measured by its encoded
+# size. 4096 bytes is far above any human-chosen passphrase. Identical across
+# every SDK.
+MAX_PASSPHRASE_INPUT_BYTES: Final[int] = 4096
+
+# The Unicode `White_Space` property set under Unicode 16.0 — exactly these 25
+# codepoints. The normalization profile collapses every maximal run of these to
+# a single U+0020. This is spelled out explicitly rather than via the `\s` regex
+# class or `str.isspace`, both of which match a different set (e.g. they exclude
+# U+0085 NEL from `\s`, or include codepoints outside `White_Space`), which would
+# derive a different CEK from the same passphrase and break cross-implementation
+# decryption.
+_WHITE_SPACE: Final[frozenset[str]] = frozenset(
+    chr(cp)
+    for cp in (
+        0x0009,
+        0x000A,
+        0x000B,
+        0x000C,
+        0x000D,
+        0x0020,
+        0x0085,
+        0x00A0,
+        0x1680,
+        0x2000,
+        0x2001,
+        0x2002,
+        0x2003,
+        0x2004,
+        0x2005,
+        0x2006,
+        0x2007,
+        0x2008,
+        0x2009,
+        0x200A,
+        0x2028,
+        0x2029,
+        0x202F,
+        0x205F,
+        0x3000,
+    )
+)
 
 
 async def try_decryptions(
@@ -200,9 +246,7 @@ async def try_decryptions(
                 failure = ("tampered-ciphertext", str(e) or "TAMPERED_CIPHERTEXT")
 
         if failure is not None:
-            out.append(
-                VerifyItemDecryption(item_index=idx, verdict=failure[0], reason=failure[1])
-            )
+            out.append(VerifyItemDecryption(item_index=idx, verdict=failure[0], reason=failure[1]))
             continue
         if plaintext is None:
             # Defensive — failure path should already have returned above.
@@ -250,6 +294,47 @@ def _sealed_envelope_from_parsed(enc: EncryptionEnvelope) -> SealedEnvelope | No
     )
 
 
+def _normalize_passphrase(passphrase: str) -> bytes:
+    """Apply the `cardano-poe-pw-norm-v1` profile: NFKC, then collapse every
+    maximal run of `White_Space` codepoints to a single U+0020, then trim
+    leading/trailing space, then encode as UTF-8."""
+    nfkc = unicodedata.normalize("NFKC", passphrase)
+    out: list[str] = []
+    in_run = False
+    for ch in nfkc:
+        if ch in _WHITE_SPACE:
+            if not in_run:
+                out.append(" ")
+                in_run = True
+        else:
+            out.append(ch)
+            in_run = False
+    return "".join(out).strip(" ").encode("utf-8")
+
+
+# Passphrase-path content AAD: a closed map that binds the KDF parameters and
+# the normalization profile id into the content tag. The verifier recomputes it
+# from the received `enc` map, so altering `salt` or any `params` value after
+# encryption changes the AAD and makes the AEAD open fail. Serialised by the
+# shared canonical encoder; the normalization id is a scheme-fixed constant,
+# never on the wire.
+def _ad_content_passphrase(nonce: bytes, kdf: PassphraseKdf) -> bytes:
+    params = kdf["params"]
+    ad: dict[str | int, CanonicalCborValue] = {
+        "scheme": 1,
+        "path": "passphrase",
+        "aead": "xchacha20-poly1305",
+        "nonce": nonce,
+        "passphrase": {
+            "alg": "argon2id",
+            "salt": kdf["salt"],
+            "params": {"m": params["m"], "t": params["t"], "p": params["p"]},
+            "normalization": CARDANO_POE_PW_NORM_PROFILE,
+        },
+    }
+    return encode_canonical_cbor(ad)
+
+
 def _decrypt_passphrase(enc: EncryptionEnvelope, ciphertext: bytes, passphrase: str) -> bytes:
     passphrase_block = enc.get("passphrase")
     if passphrase_block is None:
@@ -258,16 +343,41 @@ def _decrypt_passphrase(enc: EncryptionEnvelope, ciphertext: bytes, passphrase: 
         raise _KdfDerivationError(
             f"KDF_DERIVATION_FAILED: unsupported passphrase alg {passphrase_block['alg']}"
         )
-    # Passphrase normalisation: NFKC -> collapse whitespace -> trim -> UTF-8.
-    normalised = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", passphrase)).strip()
-    password = normalised.encode("utf-8")
+    # Pre-KDF input cap: reject an oversized raw passphrase before normalization
+    # or Argon2id, so it cannot drive unbounded pre-KDF work. Byte length of the
+    # raw UTF-8 encoding, not code-point count.
+    raw_passphrase_bytes = len(passphrase.encode("utf-8"))
+    if raw_passphrase_bytes > MAX_PASSPHRASE_INPUT_BYTES:
+        raise _KdfDerivationError(
+            f"KDF_DERIVATION_FAILED: passphrase length {raw_passphrase_bytes} bytes exceeds "
+            f"the maximum {MAX_PASSPHRASE_INPUT_BYTES} bytes"
+        )
+    password = _normalize_passphrase(passphrase)
     try:
         cek = _derive_kek(password, passphrase_block)
     except (ValueError, KeyError, TypeError) as cause:
         raise _KdfDerivationError(f"KDF_DERIVATION_FAILED: {cause}") from cause
     if enc["aead"] != "xchacha20-poly1305":
         raise _KdfDerivationError(f"KDF_DERIVATION_FAILED: unsupported aead {enc['aead']}")
-    return xchacha20_poly1305_decrypt(cek, enc["nonce"], _EMPTY_AAD, ciphertext)
+    nonce = enc["nonce"]
+    # Reject a payload at or above the XChaCha20-Poly1305 single-shot bound
+    # before invoking the AEAD, matching the slots path.
+    if len(ciphertext) >= MAX_SEALED_PLAINTEXT + 16:
+        raise _KdfDerivationError(
+            f"KDF_DERIVATION_FAILED: ciphertext length={len(ciphertext)} is at or above "
+            f"the single-shot payload bound"
+        )
+    # Content is opened under a payload_key derived from the CEK with the
+    # structured passphrase-path AAD; the CEK never keys the content AEAD
+    # directly.
+    payload_key = hkdf_sha256(
+        ikm=cek,
+        salt=nonce,
+        info=CARDANO_POE_HKDF_INFO_PAYLOAD_PASSPHRASE,
+        length=32,
+    )
+    aad = _ad_content_passphrase(nonce, passphrase_block)
+    return xchacha20_poly1305_decrypt(payload_key, nonce, aad, ciphertext)
 
 
 def _derive_kek(password: bytes, kdf: PassphraseKdf) -> bytes:

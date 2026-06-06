@@ -238,6 +238,6 @@ def test_recipient_secret_keys_from_seed_shape() -> None:
     bundle = recipient_secret_keys_from_seed(SEED_ZERO)
     assert bundle["x25519"] == [keys["x25519"]["secret_key"]]
     assert bundle["mlkem768x25519"] == [keys["mlkem768x25519"]["secret_seed"]]
-    # X25519 private key is 32 bytes; the X-Wing V06 secret IS the 32-byte seed.
+    # X25519 private key is 32 bytes; the X-Wing secret IS the 32-byte seed.
     assert len(bundle["x25519"][0]) == 32
     assert len(bundle["mlkem768x25519"][0]) == 32

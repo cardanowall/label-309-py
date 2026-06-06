@@ -768,6 +768,69 @@ def test_hybrid_kem_ct_length_mismatch_long() -> None:
     assert set(codes) == {"KEM_CT_LENGTH_MISMATCH"}
 
 
+# --- Enc resource bounds (slot-count cap + decoded-envelope size) ----------
+# These build over-bound slot arrays programmatically (too large to freeze in
+# the shared corpus). Constants mirror the sealed-PoE unwrap layer
+# (MAX_SLOTS = 1024, decoded-envelope bound 65536 bytes).
+
+_MAX_SLOTS = 1024
+_MAX_DECODED_ENVELOPE_BYTES = 65536
+_NONCE_LEN = 24
+_SLOTS_MAC_LEN = 32
+
+
+def _distinct_epk_slots(n: int) -> list[dict[str, bytes]]:
+    # Distinct epk per slot (big-endian counter) so the slot-count / byte cap is
+    # what trips, not the duplicate check.
+    return [{"epk": i.to_bytes(32, "big"), "wrap": b"\x06" * 48} for i in range(n)]
+
+
+def test_enc_slots_too_many() -> None:
+    # MAX_SLOTS + 1 trips the slot-count cap, which short-circuits the byte
+    # backstop, so ENC_SLOTS_TOO_MANY is the sole emitted code even though the
+    # x25519 array would also exceed the byte bound at that count.
+    rec = _ok_record_dict()
+    rec["items"][0]["enc"] = _enc_with_slots(_distinct_epk_slots(_MAX_SLOTS + 1))
+    codes = _codes(validate(_enc(rec)))
+    assert set(codes) == {"ENC_SLOTS_TOO_MANY"}
+
+
+def test_enc_envelope_too_large_x25519_byte_backstop() -> None:
+    # x25519 per-slot bytes = 32 + 48 = 80. The byte backstop is the tighter
+    # guard at this width (it trips below MAX_SLOTS); one slot over the floor
+    # emits ENC_ENVELOPE_TOO_LARGE, the floor itself validates.
+    per_slot = 32 + 48
+    just_under = (_MAX_DECODED_ENVELOPE_BYTES - _NONCE_LEN - _SLOTS_MAC_LEN) // per_slot
+    assert just_under < _MAX_SLOTS
+    ok = _ok_record_dict()
+    ok["items"][0]["enc"] = _enc_with_slots(_distinct_epk_slots(just_under))
+    assert isinstance(validate(_enc(ok)), ValidateOk)
+    over = _ok_record_dict()
+    over["items"][0]["enc"] = _enc_with_slots(_distinct_epk_slots(just_under + 1))
+    assert set(_codes(validate(_enc(over)))) == {"ENC_ENVELOPE_TOO_LARGE"}
+
+
+def test_enc_envelope_too_large_hybrid_byte_backstop() -> None:
+    # Hybrid per-slot bytes = 1120 + 48 = 1168; the smallest over-bound slot
+    # count is below MAX_SLOTS, so the byte backstop (not the slot cap) fires.
+    per_slot = MLKEM768X25519_ENC_LENGTH + 48
+    over = (_MAX_DECODED_ENVELOPE_BYTES - _NONCE_LEN - _SLOTS_MAC_LEN) // per_slot + 1
+    assert over <= _MAX_SLOTS
+
+    def _hslots(n: int) -> list[dict[str, object]]:
+        # Distinct kem_ct per slot so the duplicate check does not fire instead.
+        def _ct(i: int) -> bytes:
+            return i.to_bytes(2, "big") + b"\x11" * (MLKEM768X25519_ENC_LENGTH - 2)
+
+        return [{"kem_ct": _chunk64(_ct(i)), "wrap": b"\x09" * 48} for i in range(n)]
+
+    rec = _ok_record_dict()
+    enc = _sealed_hybrid_base()
+    enc["slots"] = _hslots(over)
+    rec["items"][0]["enc"] = enc
+    assert set(_codes(validate(_enc(rec)))) == {"ENC_ENVELOPE_TOO_LARGE"}
+
+
 # --- Supersedes ------------------------------------------------------------
 
 

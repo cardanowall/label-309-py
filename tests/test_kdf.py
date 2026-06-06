@@ -45,6 +45,29 @@ def test_hkdf_sha256_kat() -> None:
         assert actual == expected_hex, vector["name"]
 
 
+def test_hkdf_sha256_empty_salt_kat() -> None:
+    # Zero-length HKDF salt (RFC 5869 section 2.2 absent-salt extract): with
+    # salt="", HKDF-Extract substitutes HashLen zero bytes. This is the exact
+    # shape the sealed-PoE slots_mac HKDF uses (salt="" with a non-empty info
+    # label), so the construction's absent-salt behaviour is pinned by a
+    # byte-exact vector rather than left to the library.
+    corpus = _load_json("hkdf-sha256-empty-salt-kat.json")
+    vectors = corpus["vectors"]
+    assert isinstance(vectors, list)
+    assert len(vectors) >= 1
+    for vector in vectors:
+        assert isinstance(vector, dict)
+        salt_hex = vector["salt_hex"]
+        assert salt_hex == "", "the empty-salt KAT must carry a zero-length salt"
+        actual = hkdf_sha256(
+            bytes.fromhex(str(vector["ikm_hex"])),
+            bytes.fromhex(str(salt_hex)),
+            bytes.fromhex(str(vector["info_hex"])),
+            int(vector["length"]),
+        ).hex()
+        assert actual == vector["expected_hex"], vector["name"]
+
+
 def test_argon2id_v13_kat() -> None:
     corpus = _load_json("argon2id-v13-kat.json")
     vectors = corpus["vectors"]
