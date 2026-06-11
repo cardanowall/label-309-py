@@ -249,15 +249,20 @@ class AccountBalance(TypedDict):
 # =============================================================================
 
 
-class PoeVerifyDecryption(TypedDict, total=False):
-    item_idx: int
-    recipient_secret_key: str
-    passphrase: str
-
-
+# Request body for the hosted verify endpoint.
+#
+# The endpoint is a PUBLIC verifier — structural validation plus record-level
+# signature verification over public chain data. It accepts no decryption
+# credentials: a body carrying any is rejected with 400 validation-failed, and
+# sealed (enc-bearing) items report as unverifiable without decryption.
+# Recipient verification (sealed-envelope decrypt + plaintext-hash recheck)
+# runs locally — use the ``cardanowall.verifier`` module's ``decryption``
+# input, which never leaves the process.
 class PoeVerifyInput(TypedDict, total=False):
-    verify_uris: bool
-    decryption: list[PoeVerifyDecryption]
+    # The master content-fetch switch (item URIs and Merkle leaves lists
+    # alike). The server defaults it to True; pass False to skip content
+    # re-fetching — affected claims then report ``not_checked``.
+    fetch_content: bool
 
 
 __all__ = [
@@ -265,7 +270,6 @@ __all__ = [
     "ConformanceProfile",
     "PoeItemResponse",
     "PoeStatus",
-    "PoeVerifyDecryption",
     "PoeVerifyInput",
     "PublishBatchFailureEntry",
     "PublishBatchFailureError",

@@ -155,8 +155,13 @@ class RecordsNamespace:
         ``cardanowall.verifier.types``).
 
         Auth required (Bearer with ``poe:read`` scope, or NextAuth session
-        cookie). Optional ``verify_uris`` toggles URI hash-equivalence checks;
-        ``decryption[]`` drives trial-decrypt of sealed envelopes per item.
+        cookie). This is the hosted PUBLIC verifier: it accepts no decryption
+        credentials, and sealed items report as unverifiable without
+        decryption. To verify as a recipient (decrypt + plaintext-hash
+        recheck), run the ``cardanowall.verifier`` module locally with its
+        ``decryption`` input — keys never leave the process. Optional
+        ``fetch_content: False`` skips content re-fetching; affected claims
+        report ``not_checked``.
         """
         response = await self._config.http_client.post(
             f"{self._config.base_url}/api/v1/records/{tx_hash}/verify",

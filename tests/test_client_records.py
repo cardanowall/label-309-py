@@ -280,7 +280,7 @@ def test_verify_posts_records_verify_with_json_body_and_returns_typed_verify_rep
             return httpx.Response(200, json=_verify_report_fixture())
 
         async with _client_with_handler(handler) as client:
-            out = await client.records.verify(TX_HASH, {"verify_uris": True})
+            out = await client.records.verify(TX_HASH, {"fetch_content": False})
 
         assert out["verdict"] == "valid"
         assert out["exit_code"] == 0
@@ -290,7 +290,10 @@ def test_verify_posts_records_verify_with_json_body_and_returns_typed_verify_rep
         assert captured["path"] == f"/api/v1/records/{TX_HASH}/verify"
         # Body MUST round-trip the caller-supplied flag — proves the body is
         # actually sent over the wire (not mock-asserted against itself).
-        assert captured["body"] == {"verify_uris": True}
+        # The endpoint is the hosted PUBLIC verifier: ``fetch_content`` is the
+        # ONLY accepted field, so this also pins that the client wire body
+        # carries no decryption credentials.
+        assert captured["body"] == {"fetch_content": False}
 
     asyncio.run(run())
 
