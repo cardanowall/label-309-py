@@ -11,6 +11,8 @@ sibling test.
 
 from __future__ import annotations
 
+import hashlib
+
 from cardanowall._crypto.sealed_poe import (
     UNWRAP_REASON_WRONG_RECIPIENT_KEY,
     ecies_sealed_poe_unwrap,
@@ -36,8 +38,10 @@ def test_inbox_readability_across_three_rotations() -> None:
     # Wrap R_0 to pub(s_0) plus two unrelated padding pubs.
     pad1 = derive_x25519_keypair_from_seed(b"\xd1" * 32)
     pad2 = derive_x25519_keypair_from_seed(b"\xd2" * 32)
+    hashes = {"sha2-256": hashlib.sha256(EXPECTED_PLAINTEXT).digest()}
     out = ecies_sealed_poe_wrap(
         plaintext=EXPECTED_PLAINTEXT,
+        hashes=hashes,
         recipient_public_keys=[x0["public_key"], pad1["public_key"], pad2["public_key"]],
     )
 
@@ -60,6 +64,7 @@ def test_inbox_readability_across_three_rotations() -> None:
     result = ecies_sealed_poe_unwrap(
         envelope=out.envelope,
         ciphertext=out.ciphertext,
+        hashes=hashes,
         recipient_secret_keys=ordered,
         _slots_attempted_out=slots_attempted,
         _privs_attempted_out=privs_attempted,
@@ -83,8 +88,10 @@ def test_inbox_readability_no_match_after_rotation_returns_wrong_recipient_key()
     pad1 = derive_x25519_keypair_from_seed(b"\xd1" * 32)
     pad2 = derive_x25519_keypair_from_seed(b"\xd2" * 32)
     pad3 = derive_x25519_keypair_from_seed(b"\xd3" * 32)
+    hashes = {"sha2-256": hashlib.sha256(EXPECTED_PLAINTEXT).digest()}
     out = ecies_sealed_poe_wrap(
         plaintext=EXPECTED_PLAINTEXT,
+        hashes=hashes,
         recipient_public_keys=[pad1["public_key"], pad2["public_key"], pad3["public_key"]],
     )
     ordered = [x_user_a["secret_key"], x_user_b["secret_key"]]
@@ -93,6 +100,7 @@ def test_inbox_readability_no_match_after_rotation_returns_wrong_recipient_key()
     result = ecies_sealed_poe_unwrap(
         envelope=out.envelope,
         ciphertext=out.ciphertext,
+        hashes=hashes,
         recipient_secret_keys=ordered,
         _slots_attempted_out=slots_attempted,
         _privs_attempted_out=privs_attempted,

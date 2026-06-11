@@ -1,12 +1,12 @@
 """Layer 1 + Layer 2 NXDOMAIN proof against the synthetic mainnet corpus.
 
 Layer 1 (the parametrised tests): the verifier MUST emit no HTTP call
-to a cardanowall.com host when given the conformance deny-list AND when
+to an operator.example host when given the conformance deny-list AND when
 given an empty deny-list. Asserts service-independence is a property of
 the verifier, not a function of the operator's deny-list.
 
 Layer 2 (the optional Docker-only test below): with a real DNS resolver
-configured to NXDOMAIN cardanowall.com, the default `fetch_outbound`
+configured to NXDOMAIN operator.example, the default `fetch_outbound`
 MUST error rather than reach the network.
 """
 
@@ -41,8 +41,8 @@ CORPUS_PATH = Path(
     )
 )
 CONFORMANCE_DENY: tuple[str, ...] = (
-    "cardanowall.com",
-    "*.cardanowall.com",
+    "operator.example",
+    "*.operator.example",
     "localhost",
     "127.0.0.1",
 )
@@ -60,9 +60,9 @@ _PLACEHOLDER: list[CorpusRecord] = [{"tx_hash": "0" * 64}]
 _CORPUS_OR_PLACEHOLDER = CORPUS or _PLACEHOLDER
 
 
-def _is_cardanowall_host(url: str) -> bool:
+def _is_denied_operator_host(url: str) -> bool:
     host = (urlparse(url).hostname or "").strip("[]").rstrip(".").lower()
-    return host == "cardanowall.com" or host.endswith(".cardanowall.com")
+    return host == "operator.example" or host.endswith(".operator.example")
 
 
 def _verify_input(record: CorpusRecord, deny_hosts: tuple[str, ...]) -> VerifyTxInput:
@@ -70,9 +70,7 @@ def _verify_input(record: CorpusRecord, deny_hosts: tuple[str, ...]) -> VerifyTx
     # any recipient secret keys into `decryption`, matching the golden writer.
     use_blockfrost = record.get("provider") == "blockfrost"
     decryption = tuple(
-        DecryptionRecipient(
-            item_index=r["item_index"], recipient_secret_key=bytes.fromhex(r["secret_key"])
-        )
+        DecryptionRecipient(recipient_secret_key=bytes.fromhex(r["secret_key"]))
         for r in record.get("recipient_secret_keys", [])
     )
     return VerifyTxInput(
@@ -92,7 +90,7 @@ def _verify_input(record: CorpusRecord, deny_hosts: tuple[str, ...]) -> VerifyTx
 def test_verifies_record_with_conformance_deny_hosts(record: CorpusRecord) -> None:
     result = asyncio.run(verify_tx(_verify_input(record, CONFORMANCE_DENY)))
     assert result.verdict == record["expected_verdict"]
-    assert all(not _is_cardanowall_host(c.url) for c in result.http_calls)
+    assert all(not _is_denied_operator_host(c.url) for c in result.audit_trail)
 
 
 @pytest.mark.nxdomain
@@ -102,7 +100,7 @@ def test_verifies_record_with_conformance_deny_hosts(record: CorpusRecord) -> No
 def test_verifies_record_with_empty_deny_hosts(record: CorpusRecord) -> None:
     result = asyncio.run(verify_tx(_verify_input(record, ())))
     assert result.verdict == record["expected_verdict"]
-    assert all(not _is_cardanowall_host(c.url) for c in result.http_calls)
+    assert all(not _is_denied_operator_host(c.url) for c in result.audit_trail)
 
 
 @pytest.mark.nxdomain
@@ -114,11 +112,11 @@ def test_rejects_direct_fetch_to_cardanowall_via_dns_nxdomain() -> None:
     async def go() -> None:
         try:
             await default_fetch_outbound(
-                "https://cardanowall.com/probe",
+                "https://operator.example/probe",
                 FetchOutboundOptions(method="GET", purpose="cardano"),
             )
         except (httpx.HTTPError, OSError):
             return
-        raise AssertionError("expected DNS-resolution-class error for cardanowall.com")
+        raise AssertionError("expected DNS-resolution-class error for operator.example")
 
     asyncio.run(go())

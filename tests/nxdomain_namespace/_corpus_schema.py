@@ -7,7 +7,6 @@ from typing import TypedDict
 
 class KoiosTxInfo(TypedDict, total=False):
     tx_hash: str
-    num_confirmations: int
     block_height: int
     tx_timestamp: int
     absolute_slot: int
@@ -26,7 +25,6 @@ class BlockfrostTx(TypedDict, total=False):
     block_time: int
     slot: int
     block_height: int
-    confirmations: int
 
 
 class BlockfrostBlocksLatest(TypedDict, total=False):
@@ -42,11 +40,10 @@ class CapturedGatewayResponses(TypedDict, total=False):
     koios_tx_info: list[KoiosTxInfo]
     koios_tx_cbor: list[KoiosTxCbor]
     koios_tip: list[KoiosTip]
-    blockfrost_tx_metadata: list[object]
     blockfrost_tx_cbor: BlockfrostTxCbor
     blockfrost_tx: BlockfrostTx
     blockfrost_blocks_latest: BlockfrostBlocksLatest
-    arweave_envelope_responses: dict[str, str]
+    arweave_responses: dict[str, str]
 
 
 class RecipientSecretKey(TypedDict):

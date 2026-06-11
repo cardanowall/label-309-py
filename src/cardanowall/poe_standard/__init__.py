@@ -1,20 +1,27 @@
 from __future__ import annotations
 
-from .chunked import (
-    CHUNK_MAX_BYTES,
-    bytes_chunk_array_concat,
-    chunk_bytes,
-    chunk_text,
-    reconstruct_chunked_uri,
-)
 from .cid_profile import is_valid_cid, validate_cid_profile
 from .encoder import encode_poe_record, encode_record_body_for_signing
-from .error_codes import SEVERITY, ErrorCode, Severity
+from .error_codes import (
+    CARRIAGE_ERROR_CODES,
+    DUAL_SEVERITY_CODES,
+    ERROR_CODE_PART,
+    ERROR_CODES,
+    SEVERITY,
+    STRUCTURAL_ERROR_CODES,
+    VERIFIER_ERROR_CODES,
+    ErrorCode,
+    ErrorCodePart,
+    Severity,
+    error_code_registry_index,
+    severity_of,
+)
 from .schema import (
+    EXTENSION_KEY_COMPANION_RE,
+    EXTENSION_KEY_VENDOR_RE,
+    TOP_LEVEL_BASE_KEYS,
     AeadAlgId,
     Argon2Params,
-    ChunkedBytesArray,
-    ChunkedTextArray,
     EncryptionEnvelope,
     HashAlgId,
     Item,
@@ -27,24 +34,35 @@ from .schema import (
     SigEntry,
     Slot,
     Supersedes,
+    is_extension_key,
 )
 from .validator import (
+    DEFAULT_PASSPHRASE_PARAMS_CEILING,
     ValidateFail,
     ValidateOk,
     ValidateResult,
     ValidationIssue,
+    ValidatorRole,
     validate,
 )
 
 __all__ = [
-    "CHUNK_MAX_BYTES",
+    "CARRIAGE_ERROR_CODES",
+    "DEFAULT_PASSPHRASE_PARAMS_CEILING",
+    "DUAL_SEVERITY_CODES",
+    "ERROR_CODES",
+    "ERROR_CODE_PART",
+    "EXTENSION_KEY_COMPANION_RE",
+    "EXTENSION_KEY_VENDOR_RE",
     "SEVERITY",
+    "STRUCTURAL_ERROR_CODES",
+    "TOP_LEVEL_BASE_KEYS",
+    "VERIFIER_ERROR_CODES",
     "AeadAlgId",
     "Argon2Params",
-    "ChunkedBytesArray",
-    "ChunkedTextArray",
     "EncryptionEnvelope",
     "ErrorCode",
+    "ErrorCodePart",
     "HashAlgId",
     "Item",
     "KemAlgId",
@@ -61,13 +79,13 @@ __all__ = [
     "ValidateOk",
     "ValidateResult",
     "ValidationIssue",
-    "bytes_chunk_array_concat",
-    "chunk_bytes",
-    "chunk_text",
+    "ValidatorRole",
     "encode_poe_record",
     "encode_record_body_for_signing",
+    "error_code_registry_index",
+    "is_extension_key",
     "is_valid_cid",
-    "reconstruct_chunked_uri",
+    "severity_of",
     "validate",
     "validate_cid_profile",
 ]

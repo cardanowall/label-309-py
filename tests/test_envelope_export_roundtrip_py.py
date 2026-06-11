@@ -18,7 +18,7 @@ import pyrage.passphrase  # type: ignore[import-untyped]
 AGE_V1_MAGIC = b"age-encryption.org/v1\n"
 # Test fixture only — deterministic dummy passphrase for the pyrage round-trip
 # assertion. Not a real secret; not used outside this test module.
-TEST_PASSPHRASE = "a a a a a a a a a a a a a a a a a a a a a a a a"  # noqa: S105
+TEST_PASSPHRASE = "a a a a a a a a a a a a a a a a a a a a a a a a"
 SEED_BYTES = bytes(b for b in range(32))  # 0x00..0x1f, deterministic 32 bytes
 
 

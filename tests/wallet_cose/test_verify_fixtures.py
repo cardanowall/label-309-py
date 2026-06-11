@@ -12,15 +12,14 @@ CI.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
-from cardanowall.poe_standard import PoeRecord, chunk_bytes
-from cardanowall.verifier import VerifyTxInput, verify_record_signatures
+from cardanowall.poe_standard import PoeRecord
+from cardanowall.verifier import verify_record_signatures
 
 from ._normalized_verdict import NormalizedSigVerdict, to_normalized_sig_verdict
 
@@ -58,8 +57,8 @@ def _build_record(cose_sign1_hex: str, cose_key_hex: str) -> PoeRecord:
             "items": [{"hashes": {"sha2-256": b"\x00" * 32}}],
             "sigs": [
                 {
-                    "cose_sign1": chunk_bytes(bytes.fromhex(cose_sign1_hex)),
-                    "cose_key": chunk_bytes(bytes.fromhex(cose_key_hex)),
+                    "cose_sign1": bytes.fromhex(cose_sign1_hex),
+                    "cose_key": bytes.fromhex(cose_key_hex),
                 }
             ],
         },
@@ -78,7 +77,7 @@ def test_wallet_cose_verifies(fixture_id: str, filename: str) -> None:
         cast(str, fixture["cose_sign1_bytes_hex"]),
         cast(str, fixture["cose_key_bytes_hex"]),
     )
-    results = asyncio.run(verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32)))
+    results = verify_record_signatures(record)
     assert len(results) == 1, fixture_id
     actual: NormalizedSigVerdict = to_normalized_sig_verdict(results[0])
     expected = cast(dict[str, Any], fixture["expected_normalized_verdict"])

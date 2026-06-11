@@ -22,18 +22,18 @@ from cardanowall.verifier.fetch import matches_deny_list
 
 
 def test_matches_deny_list_exact() -> None:
-    assert matches_deny_list("cardanowall.com", ["cardanowall.com"]) is True
-    assert matches_deny_list("other.com", ["cardanowall.com"]) is False
+    assert matches_deny_list("operator.example", ["operator.example"]) is True
+    assert matches_deny_list("other.com", ["operator.example"]) is False
 
 
 def test_matches_deny_list_glob_subdomain() -> None:
-    assert matches_deny_list("api.cardanowall.com", ["*.cardanowall.com"]) is True
+    assert matches_deny_list("api.operator.example", ["*.operator.example"]) is True
     # Bare host does NOT match glob.
-    assert matches_deny_list("cardanowall.com", ["*.cardanowall.com"]) is False
+    assert matches_deny_list("operator.example", ["*.operator.example"]) is False
 
 
 def test_matches_deny_list_case_insensitive_trailing_dot() -> None:
-    assert matches_deny_list("CARDANOWALL.COM.", ["cardanowall.com"]) is True
+    assert matches_deny_list("OPERATOR.EXAMPLE.", ["operator.example"]) is True
 
 
 # --- IP-literal expansion -----------------------------------------------------
@@ -93,7 +93,7 @@ def test_wrap_records_failure_row() -> None:
             wrapped("https://example.com/x", FetchOutboundOptions(method="GET", purpose="cardano"))
         )
     assert len(audit) == 1
-    assert audit[0].status == 0
+    assert audit[0].status is None
     assert audit[0].bytes == 0
 
 
@@ -102,18 +102,18 @@ def test_wrap_records_failure_row() -> None:
 
 def test_wrap_deny_host_short_circuit() -> None:
     audit: list[HttpCallRecord] = []
-    wrapped = wrap_fetch_outbound(_ok_inner, audit, deny_hosts=("cardanowall.com",))
+    wrapped = wrap_fetch_outbound(_ok_inner, audit, deny_hosts=("operator.example",))
     with pytest.raises(DenyHostError) as exc:
         asyncio.run(
             wrapped(
-                "https://cardanowall.com/x",
+                "https://operator.example/x",
                 FetchOutboundOptions(method="GET", purpose="cardano"),
             )
         )
-    assert exc.value.host == "cardanowall.com"
+    assert exc.value.host == "operator.example"
     assert exc.value.code == "SERVICE_INDEPENDENCE_VIOLATION"
     assert len(audit) == 1
-    assert audit[0].status == 0
+    assert audit[0].status is None
     assert audit[0].duration_ms == 0
 
 
@@ -133,7 +133,7 @@ def test_wrap_rejects_data_url_with_UnsupportedProtocolError() -> None:
     assert exc.value.code == "UNSUPPORTED_PROTOCOL"
     assert exc.value.protocol == "data:"
     assert len(audit) == 1
-    assert audit[0].status == 0
+    assert audit[0].status is None
 
 
 def test_wrap_rejects_file_url_with_UnsupportedProtocolError() -> None:

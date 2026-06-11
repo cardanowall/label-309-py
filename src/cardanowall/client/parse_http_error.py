@@ -91,9 +91,7 @@ def _synthesise_problem(http_status: int, request_id: str | None) -> ProblemDeta
     )
 
 
-def _to_problem_details(
-    http_status: int, body: Any, request_id: str | None
-) -> ProblemDetails:
+def _to_problem_details(http_status: int, body: Any, request_id: str | None) -> ProblemDetails:
     if not isinstance(body, dict):
         return _synthesise_problem(http_status, request_id)
 

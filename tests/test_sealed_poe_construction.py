@@ -2,22 +2,23 @@
 
 These are self-generated (no pinned fixture bytes): they encrypt and decrypt
 inside the test, so they exercise the construction's properties without
-depending on the conformance vectors. They lock in the header binding (the slots
-transcript commits scheme/path/aead/kem/nonce), the per-slot KEK-uniqueness
-rejection, the explicit all-zero shared-secret rejection, the hybrid KEK salt
-derivation, the payload-key separation (content keyed under a CEK leaf, never
-the CEK directly), and the single-shot maximum-payload guard.
+depending on the conformance vectors. They lock in the transcript binding (the
+slots transcript commits scheme/path/aead/kem/nonce, the slot set, and the
+item's hashes digest), the nonce-salted per-slot KEK derivation under both
+KEMs, the per-slot KEK-uniqueness rejection, the explicit all-zero
+shared-secret rejection, the payload-key separation (content keyed under a CEK
+leaf, never the CEK directly), and the pinned STREAM constants.
 """
 
 from __future__ import annotations
+
+import hashlib
 
 import pytest
 
 from cardanowall._crypto.kem import x25519_public_key
 from cardanowall._crypto.mlkem768x25519 import xwing_keygen
 from cardanowall._crypto.sealed_poe import (
-    MAX_SEALED_PLAINTEXT,
-    UNWRAP_REASON_TAMPERED_CIPHERTEXT,
     UNWRAP_REASON_TAMPERED_HEADER,
     UNWRAP_REASON_WRONG_RECIPIENT_KEY,
     EciesSealedPoeError,
@@ -25,9 +26,11 @@ from cardanowall._crypto.sealed_poe import (
     SealedSlot,
     _compute_slots_hash,
     _slots_mac_from_hash,
+    _x25519_kek_salt,
     _xwing_kek_salt,
     ecies_sealed_poe_unwrap,
     ecies_sealed_poe_wrap,
+    item_hashes_hash,
 )
 
 
@@ -35,159 +38,197 @@ def _priv(seed: int) -> bytes:
     return bytes((seed + i) & 0xFF for i in range(32))
 
 
+def _hashes_for(plaintext: bytes) -> dict[str, bytes]:
+    return {"sha2-256": hashlib.sha256(plaintext).digest()}
+
+
 # ---------------------------------------------------------------------------
-# Round-trip under the new payload-key + structured-AAD construction.
+# Round-trips under the STREAM content layer.
 # ---------------------------------------------------------------------------
 
 
 def test_classical_roundtrip() -> None:
     priv = _priv(0x11)
+    plaintext = b"classical payload"
+    hashes = _hashes_for(plaintext)
     out = ecies_sealed_poe_wrap(
-        plaintext=b"classical payload",
+        plaintext=plaintext,
         recipient_public_keys=[x25519_public_key(priv)],
+        hashes=hashes,
     )
     res = ecies_sealed_poe_unwrap(
-        envelope=out.envelope, ciphertext=out.ciphertext, recipient_secret_key=priv
+        envelope=out.envelope, ciphertext=out.ciphertext, hashes=hashes, recipient_secret_key=priv
     )
     assert res.matched is True
-    assert res.plaintext == b"classical payload"
+    assert res.plaintext == plaintext
 
 
 def test_hybrid_roundtrip() -> None:
     pub, seed = xwing_keygen(b"\x07" * 32)
+    plaintext = b"hybrid payload"
+    hashes = _hashes_for(plaintext)
     out = ecies_sealed_poe_wrap(
-        plaintext=b"hybrid payload",
+        plaintext=plaintext,
         recipient_public_keys=[pub],
+        hashes=hashes,
         kem="mlkem768x25519",
     )
     res = ecies_sealed_poe_unwrap(
-        envelope=out.envelope, ciphertext=out.ciphertext, recipient_secret_key=seed
+        envelope=out.envelope, ciphertext=out.ciphertext, hashes=hashes, recipient_secret_key=seed
     )
     assert res.matched is True
-    assert res.plaintext == b"hybrid payload"
+    assert res.plaintext == plaintext
+
+
+def test_large_multi_chunk_roundtrip() -> None:
+    # A payload crossing the 65536-byte STREAM chunk boundary round-trips.
+    priv = _priv(0x13)
+    plaintext = bytes(i & 0xFF for i in range(65536 + 1234))
+    hashes = _hashes_for(plaintext)
+    out = ecies_sealed_poe_wrap(
+        plaintext=plaintext,
+        recipient_public_keys=[x25519_public_key(priv)],
+        hashes=hashes,
+    )
+    # Two chunks → two 16-byte tags.
+    assert len(out.ciphertext) == len(plaintext) + 32
+    res = ecies_sealed_poe_unwrap(
+        envelope=out.envelope, ciphertext=out.ciphertext, hashes=hashes, recipient_secret_key=priv
+    )
+    assert res.matched is True
+    assert res.plaintext == plaintext
 
 
 def test_content_not_encrypted_under_cek_directly() -> None:
     """The content payload_key is HKDF(CEK, salt=nonce, info=payload-v1); the CEK
-    itself must NOT open the content ciphertext."""
-    from cardanowall._crypto.aead import AeadVerificationError, xchacha20_poly1305_decrypt
+    itself must NOT open the content STREAM."""
+    from cardanowall._crypto.stream import StreamTamperedError, stream_open
 
     priv = _priv(0x22)
     cek = b"\x5a" * 32
     nonce = b"\x33" * 24
+    plaintext = b"payload-key separation"
+    hashes = _hashes_for(plaintext)
     out = ecies_sealed_poe_wrap(
-        plaintext=b"payload-key separation",
+        plaintext=plaintext,
         recipient_public_keys=[x25519_public_key(priv)],
+        hashes=hashes,
         cek=cek,
         nonce=nonce,
         skip_shuffle=True,
     )
-    # The recovered CEK is `cek`; using it directly against the content AEAD with
-    # any AAD must fail — the content was sealed under the derived payload_key.
-    with pytest.raises(AeadVerificationError):
-        xchacha20_poly1305_decrypt(cek, nonce, b"", out.ciphertext)
+    with pytest.raises(StreamTamperedError):
+        stream_open(cek, out.ciphertext)
 
 
 # ---------------------------------------------------------------------------
-# Header binding: the slots transcript now commits scheme/path/aead/kem/nonce.
+# Transcript binding: scheme/path/aead/kem/nonce + slots + hashes_hash.
 # ---------------------------------------------------------------------------
 
 
-def test_nonce_swap_surfaces_tampered_header() -> None:
-    """The content nonce is bound into the slots transcript, so swapping it
-    while the slot wraps still open yields TAMPERED_HEADER (the candidate CEK is
-    recovered but the recomputed slots_mac disagrees)."""
+def test_nonce_swap_fails_decryption() -> None:
+    """The nonce is bound into every per-slot KEK salt AND the slots
+    transcript, so swapping it makes the recipient's own wrap fail to open —
+    nothing is accepted (the single generic failure)."""
     priv = _priv(0x44)
+    plaintext = b"nonce binding"
+    hashes = _hashes_for(plaintext)
     out = ecies_sealed_poe_wrap(
-        plaintext=b"nonce binding", recipient_public_keys=[x25519_public_key(priv)]
+        plaintext=plaintext, recipient_public_keys=[x25519_public_key(priv)], hashes=hashes
     )
     swapped = SealedEnvelope(
         scheme=1,
-        aead="xchacha20-poly1305",
-        kem="x25519",
+        aead=out.envelope.aead,
+        kem=out.envelope.kem,
         nonce=bytes((b + 1) & 0xFF for b in out.envelope.nonce),
         slots=out.envelope.slots,
         slots_mac=out.envelope.slots_mac,
     )
     res = ecies_sealed_poe_unwrap(
-        envelope=swapped, ciphertext=out.ciphertext, recipient_secret_key=priv
+        envelope=swapped, ciphertext=out.ciphertext, hashes=hashes, recipient_secret_key=priv
     )
     assert res.matched is False
-    assert res.reason == UNWRAP_REASON_TAMPERED_HEADER
-
-
-def test_content_aad_binds_slots_hash() -> None:
-    """A relay that re-MACs the (swapped) header under the recovered CEK so the
-    slot-set MAC passes still cannot open the content: the content AAD carries
-    slots_hash, which the relay cannot make consistent with the original
-    ciphertext. Construct an envelope whose slots_mac matches the swapped nonce
-    but whose ciphertext was sealed to the original transcript → the content AEAD
-    rejects (TAMPERED_CIPHERTEXT)."""
-    priv = _priv(0x46)
-    out = ecies_sealed_poe_wrap(
-        plaintext=b"aad-binds-slots-hash",
-        recipient_public_keys=[x25519_public_key(priv)],
-        skip_shuffle=True,
-    )
-    # Recover the CEK the honest recipient sees.
-    honest = ecies_sealed_poe_unwrap(
-        envelope=out.envelope, ciphertext=out.ciphertext, recipient_secret_key=priv
-    )
-    assert honest.matched is True
-    # We cannot trivially extract the CEK from the public API, so instead assert
-    # the positive direction: the honest ciphertext only opens under the honest
-    # envelope. Flip one ciphertext byte → TAMPERED_CIPHERTEXT (content AEAD).
-    flipped_ct = bytes([out.ciphertext[0] ^ 0x01]) + out.ciphertext[1:]
-    res = ecies_sealed_poe_unwrap(
-        envelope=out.envelope, ciphertext=flipped_ct, recipient_secret_key=priv
-    )
-    assert res.matched is False
-    assert res.reason == UNWRAP_REASON_TAMPERED_CIPHERTEXT
+    assert res.reason == UNWRAP_REASON_WRONG_RECIPIENT_KEY
 
 
 def test_slots_mac_is_hmac_over_slots_hash() -> None:
     """slots_mac = HMAC(HKDF(CEK), slots_hash) where slots_hash =
-    SHA-256(transcript-prefix || canonicalEncode(SLOTS_TRANSCRIPT))."""
+    SHA-256(transcript-prefix || canonicalEncode(SLOTS_TRANSCRIPT)) and the
+    transcript binds the item's hashes digest."""
     priv = _priv(0x48)
     cek = b"\x91" * 32
     nonce = b"\x77" * 24
+    plaintext = b"mac-over-hash"
+    hashes = _hashes_for(plaintext)
     out = ecies_sealed_poe_wrap(
-        plaintext=b"mac-over-hash",
+        plaintext=plaintext,
         recipient_public_keys=[x25519_public_key(priv)],
+        hashes=hashes,
         cek=cek,
         nonce=nonce,
         skip_shuffle=True,
     )
-    slots_hash = _compute_slots_hash(nonce, out.envelope.slots, "x25519")
+    hashes_hash = item_hashes_hash(hashes)
+    slots_hash = _compute_slots_hash(nonce, out.envelope.slots, "x25519", hashes_hash)
     assert len(slots_hash) == 32
     expected_mac = _slots_mac_from_hash(cek, slots_hash)
     assert out.envelope.slots_mac == expected_mac
+    # A different hashes map yields a different transcript hash.
+    other_hash = item_hashes_hash(_hashes_for(b"other"))
+    assert _compute_slots_hash(nonce, out.envelope.slots, "x25519", other_hash) != slots_hash
+
+
+def test_item_hashes_hash_requires_a_content_hash() -> None:
+    with pytest.raises(EciesSealedPoeError) as exc:
+        item_hashes_hash({})
+    assert exc.value.code == "ENC_REQUIRES_CONTENT_HASH"
+    # Deterministic over the canonical map encoding (key order irrelevant).
+    a = item_hashes_hash({"sha2-256": b"\x01" * 32, "blake2b-256": b"\x02" * 32})
+    b = item_hashes_hash({"blake2b-256": b"\x02" * 32, "sha2-256": b"\x01" * 32})
+    assert a == b
 
 
 # ---------------------------------------------------------------------------
-# Hybrid KEK salt: SHA-256(label || kem_ct || pub_R), recomputed on decrypt.
+# Per-slot KEK salts: SHA-256(label || enc.nonce || <KEM material> || pub_R).
 # ---------------------------------------------------------------------------
 
 
-def test_hybrid_kek_salt_binds_kem_ct_and_recipient_pub() -> None:
+def test_x25519_kek_salt_binds_nonce_epk_and_recipient() -> None:
+    nonce = b"\x10" * 24
+    epk = x25519_public_key(_priv(0x31))
+    pub = x25519_public_key(_priv(0x33))
+    salt = _x25519_kek_salt(nonce, epk, pub)
+    assert len(salt) == 32
+    assert _x25519_kek_salt(bytes((b + 1) & 0xFF for b in nonce), epk, pub) != salt
+    assert _x25519_kek_salt(nonce, x25519_public_key(_priv(0x35)), pub) != salt
+    assert _x25519_kek_salt(nonce, epk, x25519_public_key(_priv(0x37))) != salt
+    expected = hashlib.sha256(b"cardano-poe-x25519-kek-salt-v1" + nonce + epk + pub).digest()
+    assert salt == expected
+
+
+def test_hybrid_kek_salt_binds_nonce_kem_ct_and_recipient_pub() -> None:
     pub, _seed = xwing_keygen(b"\x21" * 32)
+    plaintext = b"hybrid salt binding"
+    hashes = _hashes_for(plaintext)
     out = ecies_sealed_poe_wrap(
-        plaintext=b"hybrid salt binding",
+        plaintext=plaintext,
         recipient_public_keys=[pub],
+        hashes=hashes,
         kem="mlkem768x25519",
         skip_shuffle=True,
     )
+    nonce = out.envelope.nonce
     slot = out.envelope.slots[0]
     assert slot.kem_ct is not None
-    salt = _xwing_kek_salt(slot.kem_ct, pub)
+    salt = _xwing_kek_salt(nonce, slot.kem_ct, pub)
     assert len(salt) == 32
-    # The salt is recipient-public-key-dependent: a different recipient public
-    # key yields a different salt.
     other_pub, _ = xwing_keygen(b"\x99" * 32)
-    assert _xwing_kek_salt(slot.kem_ct, other_pub) != salt
-    # And kem_ct-dependent: a one-byte flip changes the salt.
+    assert _xwing_kek_salt(nonce, slot.kem_ct, other_pub) != salt
     flipped = bytes([slot.kem_ct[0] ^ 0x01]) + slot.kem_ct[1:]
-    assert _xwing_kek_salt(flipped, pub) != salt
+    assert _xwing_kek_salt(nonce, flipped, pub) != salt
+    assert _xwing_kek_salt(bytes((b + 1) & 0xFF for b in nonce), slot.kem_ct, pub) != salt
+    expected = hashlib.sha256(b"cardano-poe-xwing-kek-salt-v1" + nonce + slot.kem_ct + pub).digest()
+    assert salt == expected
 
 
 def test_hybrid_decrypt_recomputes_recipient_pub_from_seed() -> None:
@@ -197,17 +238,20 @@ def test_hybrid_decrypt_recomputes_recipient_pub_from_seed() -> None:
     succeeding is the proof the recompute matches."""
     seeds = [b"\x31" * 32, b"\x32" * 32, b"\x33" * 32]
     pubs = [xwing_keygen(s)[0] for s in seeds]
+    plaintext = b"multi-recipient hybrid"
+    hashes = _hashes_for(plaintext)
     out = ecies_sealed_poe_wrap(
-        plaintext=b"multi-recipient hybrid",
+        plaintext=plaintext,
         recipient_public_keys=pubs,
+        hashes=hashes,
         kem="mlkem768x25519",
     )
     for s in seeds:
         res = ecies_sealed_poe_unwrap(
-            envelope=out.envelope, ciphertext=out.ciphertext, recipient_secret_key=s
+            envelope=out.envelope, ciphertext=out.ciphertext, hashes=hashes, recipient_secret_key=s
         )
         assert res.matched is True
-        assert res.plaintext == b"multi-recipient hybrid"
+        assert res.plaintext == plaintext
 
 
 # ---------------------------------------------------------------------------
@@ -215,64 +259,73 @@ def test_hybrid_decrypt_recomputes_recipient_pub_from_seed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_rejects_duplicate_x25519_epk() -> None:
-    """A producer that hands two slots the same epk (a cached/reused KEK) is
-    rejected before anything is committed."""
+def test_unwrap_rejects_duplicate_x25519_epk() -> None:
     priv = _priv(0x52)
+    plaintext = b"x"
+    hashes = _hashes_for(plaintext)
     out = ecies_sealed_poe_wrap(
-        plaintext=b"x",
+        plaintext=plaintext,
         recipient_public_keys=[x25519_public_key(priv)],
+        hashes=hashes,
         skip_shuffle=True,
     )
-    # Construct the duplicate directly and run it through unwrap's structure gate.
     dup = SealedEnvelope(
         scheme=1,
-        aead="xchacha20-poly1305",
+        aead=out.envelope.aead,
         kem="x25519",
         nonce=out.envelope.nonce,
         slots=(out.envelope.slots[0], out.envelope.slots[0]),
         slots_mac=out.envelope.slots_mac,
     )
     with pytest.raises(EciesSealedPoeError) as exc:
-        ecies_sealed_poe_unwrap(envelope=dup, ciphertext=out.ciphertext, recipient_secret_key=priv)
+        ecies_sealed_poe_unwrap(
+            envelope=dup, ciphertext=out.ciphertext, hashes=hashes, recipient_secret_key=priv
+        )
     assert exc.value.code == "ENC_SLOTS_DUPLICATE_KEM_MATERIAL"
 
 
-def test_wrap_rejects_duplicate_recipient_public_key() -> None:
-    """Recipient deduplication failure: the same recipient supplied twice would
-    reuse one slot's KEM material; the producer rejects it."""
+def test_wrap_rejects_duplicate_recipient_with_reused_ephemeral() -> None:
+    """Recipient deduplication failure: the same recipient supplied twice with
+    the same ephemeral would reuse one slot's KEM material; the producer
+    rejects it."""
     priv = _priv(0x54)
     pub = x25519_public_key(priv)
+    plaintext = b"dup recipient"
     with pytest.raises(EciesSealedPoeError) as exc:
         ecies_sealed_poe_wrap(
-            plaintext=b"dup recipient",
+            plaintext=plaintext,
             recipient_public_keys=[pub, pub],
+            hashes=_hashes_for(plaintext),
             ephemeral_secrets=[_priv(0x60), _priv(0x60)],
             skip_shuffle=True,
         )
-    # Identical ephemeral + identical recipient → identical epk → duplicate.
     assert exc.value.code == "ENC_SLOTS_DUPLICATE_KEM_MATERIAL"
 
 
 def test_unwrap_rejects_duplicate_hybrid_kem_ct() -> None:
     pub, seed = xwing_keygen(b"\x41" * 32)
+    plaintext = b"y"
+    hashes = _hashes_for(plaintext)
     out = ecies_sealed_poe_wrap(
-        plaintext=b"y",
+        plaintext=plaintext,
         recipient_public_keys=[pub],
+        hashes=hashes,
         kem="mlkem768x25519",
         skip_shuffle=True,
     )
     slot = out.envelope.slots[0]
     dup = SealedEnvelope(
         scheme=1,
-        aead="xchacha20-poly1305",
+        aead=out.envelope.aead,
         kem="mlkem768x25519",
         nonce=out.envelope.nonce,
         slots=(slot, SealedSlot(kem_ct=slot.kem_ct, wrap=slot.wrap)),
         slots_mac=out.envelope.slots_mac,
     )
     with pytest.raises(EciesSealedPoeError) as exc:
-        ecies_sealed_poe_unwrap(envelope=dup, ciphertext=out.ciphertext, recipient_secret_key=seed)
+        ecies_sealed_poe_unwrap(
+            envelope=dup, ciphertext=out.ciphertext, hashes=hashes, recipient_secret_key=seed
+        )
     assert exc.value.code == "ENC_SLOTS_DUPLICATE_KEM_MATERIAL"
 
 
@@ -283,55 +336,52 @@ def test_unwrap_rejects_duplicate_hybrid_kem_ct() -> None:
 
 def test_all_zero_x25519_shared_is_rejected_explicitly() -> None:
     """The direct constant-time all-zero check in the KEM rejects a peer key
-    that drives the shared secret to zero, surfaced here as a non-match (not a
-    crash)."""
+    that drives the shared secret to zero; the trial-decrypt loop folds it into
+    per-slot acceptance as kem_ok = false (see the low-order regression
+    suite)."""
     from cardanowall._crypto.kem import X25519LowOrderPointError, x25519_ecdh
 
-    # u = 0 is a small-order point; the ECDH output is all-zero.
     with pytest.raises(X25519LowOrderPointError):
         x25519_ecdh(_priv(0x70), bytes(32))
 
 
-# ---------------------------------------------------------------------------
-# Maximum-payload guard.
-# ---------------------------------------------------------------------------
-
-
-def test_max_sealed_plaintext_constant() -> None:
-    assert MAX_SEALED_PLAINTEXT == (1 << 38) - 64
-    assert MAX_SEALED_PLAINTEXT == 274877906880
-
-
-def test_wrap_rejects_ciphertext_at_or_above_bound_on_decrypt() -> None:
-    """The decrypt-side guard rejects an over-bound ciphertext before the AEAD
-    is invoked. A real ciphertext that large is impractical to allocate, so this
-    asserts the guard arithmetic via the public error rather than a 256-GiB
-    buffer."""
-    from cardanowall._crypto.sealed_poe import _enforce_max_ciphertext, _enforce_max_plaintext
-
-    # Exactly at the bound is rejected; one below is allowed.
-    with pytest.raises(EciesSealedPoeError) as exc:
-        _enforce_max_plaintext(MAX_SEALED_PLAINTEXT)
-    assert exc.value.code == "PAYLOAD_TOO_LARGE"
-    _enforce_max_plaintext(MAX_SEALED_PLAINTEXT - 1)  # no raise
-
-    with pytest.raises(EciesSealedPoeError) as exc:
-        _enforce_max_ciphertext(MAX_SEALED_PLAINTEXT + 16)
-    assert exc.value.code == "PAYLOAD_TOO_LARGE"
-    _enforce_max_ciphertext(MAX_SEALED_PLAINTEXT + 15)  # no raise
-
-
-# ---------------------------------------------------------------------------
-# Wrong recipient still surfaces WRONG_RECIPIENT_KEY (no behavioural drift).
-# ---------------------------------------------------------------------------
-
-
-def test_wrong_recipient_surfaces_wrong_recipient_key() -> None:
-    target = _priv(0x80)
-    stranger = _priv(0x81)
-    out = ecies_sealed_poe_wrap(plaintext=b"z", recipient_public_keys=[x25519_public_key(target)])
+def test_all_zero_slot_with_live_sibling_yields_tampered_header() -> None:
+    """A low-order epk clobbering one slot makes that slot fail closed while
+    the sibling still wrap-opens; the clobbered slot set fails slots_mac, so
+    the structured outcome is TAMPERED_HEADER — never a crash."""
+    recipient = _priv(0x72)
+    other = _priv(0x74)
+    plaintext = b"all-zero sibling"
+    hashes = _hashes_for(plaintext)
+    out = ecies_sealed_poe_wrap(
+        plaintext=plaintext,
+        recipient_public_keys=[x25519_public_key(recipient), x25519_public_key(other)],
+        hashes=hashes,
+        skip_shuffle=True,
+    )
+    slots = (out.envelope.slots[0], SealedSlot(epk=bytes(32), wrap=out.envelope.slots[1].wrap))
+    env = SealedEnvelope(
+        scheme=1,
+        aead=out.envelope.aead,
+        kem="x25519",
+        nonce=out.envelope.nonce,
+        slots=slots,
+        slots_mac=out.envelope.slots_mac,
+    )
     res = ecies_sealed_poe_unwrap(
-        envelope=out.envelope, ciphertext=out.ciphertext, recipient_secret_key=stranger
+        envelope=env, ciphertext=out.ciphertext, hashes=hashes, recipient_secret_key=recipient
     )
     assert res.matched is False
-    assert res.reason == UNWRAP_REASON_WRONG_RECIPIENT_KEY
+    assert res.reason == UNWRAP_REASON_TAMPERED_HEADER
+
+
+# ---------------------------------------------------------------------------
+# Pinned STREAM constants (the single-shot payload ceiling is retired).
+# ---------------------------------------------------------------------------
+
+
+def test_stream_constants_are_pinned() -> None:
+    from cardanowall._crypto.stream import CHUNK_SIZE, TAG_SIZE
+
+    assert CHUNK_SIZE == 65536
+    assert TAG_SIZE == 16

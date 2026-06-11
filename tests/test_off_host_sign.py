@@ -8,7 +8,6 @@ cross-language parity gate.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from pathlib import Path
@@ -36,8 +35,8 @@ from cardanowall.client import (
     prepare_sig_structure,
     prepare_sig_structure_hashed,
 )
-from cardanowall.poe_standard import PoeRecord, chunk_bytes, encode_record_body_for_signing
-from cardanowall.verifier import VerifyTxInput, verify_record_signatures
+from cardanowall.poe_standard import PoeRecord, encode_record_body_for_signing
+from cardanowall.verifier import verify_record_signatures
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "cose" / "sign1-build.json"
 CORPUS: dict[str, Any] = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -99,12 +98,9 @@ def test_assemble_cose_sign1_byte_pin(vector: dict[str, Any]) -> None:
         record=record, signer_pubkey=signer_pubkey, signature=sig
     )
     assert cose_sign1_bytes.hex() == vector["expected_cose_sign1_hex"]
-    if "expected_sigs_entry_cbor_hex" in vector:
-        entry_cbor = encode_canonical_cbor(cast(CanonicalCborValue, sig_entry))
-        assert entry_cbor.hex() == vector["expected_sigs_entry_cbor_hex"]
-    if "expected_cose_sign1_chunks_hex" in vector:
-        actual_chunks = [c.hex() for c in sig_entry["cose_sign1"]]
-        assert actual_chunks == vector["expected_cose_sign1_chunks_hex"]
+    assert sig_entry["cose_sign1"] == cose_sign1_bytes
+    entry_cbor = encode_canonical_cbor(cast(CanonicalCborValue, sig_entry))
+    assert entry_cbor.hex() == vector["expected_sigs_entry_cbor_hex"]
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +117,7 @@ def test_verifier_round_trip(vector: dict[str, Any]) -> None:
     sig = sign_ed25519(seed, sig_structure_bytes)
     _, sig_entry = assemble_cose_sign1(record=record, signer_pubkey=signer_pubkey, signature=sig)
     completed_record = cast(PoeRecord, {**record, "sigs": [sig_entry]})
-    out = asyncio.run(verify_record_signatures(completed_record, VerifyTxInput(tx_hash="00" * 32)))
+    out = verify_record_signatures(completed_record)
     assert len(out) == 1
     assert out[0].verdict == "valid"
     assert out[0].signer_type == "in-signature-kid"
@@ -143,7 +139,7 @@ def test_in_process_byte_equivalence(vector: dict[str, Any]) -> None:
 
     # In-process reconstruction via the primitive layer (no server-side
     # equivalent in Python; mirrors the TS inline form): build protected_bytes →
-    # build_label309_sig_structure → sign → encode_cose_sign1 → chunk_bytes.
+    # build_label309_sig_structure → sign → encode_cose_sign1.
     protected_header: dict[int | str, object] = {1: -8, 4: pub}
     protected_bytes = encode_canonical_cbor(cast(CanonicalCborValue, protected_header))
     sig_struct_in_proc = build_label309_sig_structure(
@@ -157,13 +153,12 @@ def test_in_process_byte_equivalence(vector: dict[str, Any]) -> None:
         payload=None,
         signature=sig_in_proc,
     )
-    chunks_in_proc = chunk_bytes(cose_in_proc)
 
     sig_structure_bytes, _ = prepare_sig_structure(record=record, signer_pubkey=pub)
     sig = sign_ed25519(seed, sig_structure_bytes)
     _, sig_entry = assemble_cose_sign1(record=record, signer_pubkey=pub, signature=sig)
 
-    assert [c.hex() for c in sig_entry["cose_sign1"]] == [c.hex() for c in chunks_in_proc]
+    assert sig_entry["cose_sign1"] == cose_in_proc
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +200,7 @@ def test_hashed_mode_byte_pin(vector: dict[str, Any]) -> None:
 
     # Round-trip through the SDK verifier.
     completed = cast(PoeRecord, {**record, "sigs": [sig_entry]})
-    out = asyncio.run(verify_record_signatures(completed, VerifyTxInput(tx_hash="00" * 32)))
+    out = verify_record_signatures(completed)
     assert out[0].verdict == "valid"
     assert out[0].signer_type == "in-signature-kid"
     assert out[0].signer_pub == vector["signer_public_key_hex"]

@@ -7,7 +7,6 @@ the default so `sigs[]` is always read.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 from typing import cast
 
@@ -16,9 +15,8 @@ from cardanowall._crypto.cose_sign1 import cose_sign1_build
 from cardanowall._crypto.sig import get_public_key_ed25519
 from cardanowall.poe_standard import (
     PoeRecord,
-    chunk_bytes,
 )
-from cardanowall.verifier import VerifyTxInput, verify_record_signatures
+from cardanowall.verifier import verify_record_signatures
 from cardanowall.verifier.signatures import CARDANO_POE_SIG_DOMAIN_PREFIX
 
 
@@ -58,7 +56,7 @@ def _mk_record_with_sig_path1(seed: bytes) -> PoeRecord:
         PoeRecord,
         {
             **record_base,
-            "sigs": [{"cose_sign1": chunk_bytes(cose)}],
+            "sigs": [{"cose_sign1": cose}],
         },
     )
 
@@ -103,8 +101,8 @@ def _mk_record_with_sig_path2(seed: bytes, *, address_override: bytes | None = N
             **record_base,
             "sigs": [
                 {
-                    "cose_sign1": chunk_bytes(cose),
-                    "cose_key": chunk_bytes(_mk_cose_key_blob(pub)),
+                    "cose_sign1": cose,
+                    "cose_key": _mk_cose_key_blob(pub),
                 }
             ],
         },
@@ -114,7 +112,7 @@ def _mk_record_with_sig_path2(seed: bytes, *, address_override: bytes | None = N
 def test_path1_in_signature_kid_verifies() -> None:
     seed = _stable_seed(1)
     record = _mk_record_with_sig_path1(seed)
-    results = asyncio.run(verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32)))
+    results = verify_record_signatures(record)
     assert len(results) == 1
     r = results[0]
     assert r.verdict == "valid"
@@ -126,7 +124,7 @@ def test_path1_in_signature_kid_verifies() -> None:
 def test_path2_wallet_inline_key_with_correct_address_verifies() -> None:
     seed = _stable_seed(2)
     record = _mk_record_with_sig_path2(seed)
-    results = asyncio.run(verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32)))
+    results = verify_record_signatures(record)
     assert len(results) == 1
     r = results[0]
     assert r.verdict == "valid"
@@ -140,7 +138,7 @@ def test_path2_with_wrong_address_emits_wallet_address_mismatch() -> None:
     seed = _stable_seed(3)
     bad_address = bytes([0xE1]) + b"\x00" * 28
     record = _mk_record_with_sig_path2(seed, address_override=bad_address)
-    results = asyncio.run(verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32)))
+    results = verify_record_signatures(record)
     assert len(results) == 1
     r = results[0]
     assert r.verdict == "invalid"
@@ -156,7 +154,7 @@ def test_path2_with_non29_byte_address_fails_wallet_binding() -> None:
     # address-binding check.
     seed = _stable_seed(4)
     record = _mk_record_with_sig_path2(seed, address_override=b"\x00" * 28)
-    results = asyncio.run(verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32)))
+    results = verify_record_signatures(record)
     assert results[0].reason == "WALLET_ADDRESS_MISMATCH"
 
 
@@ -184,18 +182,17 @@ def test_path2_with_missing_address_fails_wallet_binding() -> None:
             **record_base,
             "sigs": [
                 {
-                    "cose_sign1": chunk_bytes(cose),
-                    "cose_key": chunk_bytes(_mk_cose_key_blob(pub)),
+                    "cose_sign1": cose,
+                    "cose_key": _mk_cose_key_blob(pub),
                 }
             ],
         },
     )
-    results = asyncio.run(verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32)))
+    results = verify_record_signatures(record)
     assert results[0].reason == "WALLET_ADDRESS_MISMATCH"
 
 
 def test_unsupported_alg_emits_signature_unsupported() -> None:
-    # alg != -8 surfaces as info-severity per-entry.
     seed = _stable_seed(6)
     pub = get_public_key_ed25519(seed)
     record_base: PoeRecord = {
@@ -204,7 +201,9 @@ def test_unsupported_alg_emits_signature_unsupported() -> None:
     }
     to_sign = _to_sign(record_base)
     cose = cose_sign1_build(
-        protected_header={1: -19, 4: pub},  # -19 reserved by validator, future Ed25519
+        # -19 (fully-specified Ed25519) is a registered OPT-INFO codepoint this
+        # verifier does not implement; it surfaces as SIGNATURE_UNSUPPORTED.
+        protected_header={1: -19, 4: pub},
         unprotected_header={},
         payload=to_sign,
         external_aad=b"",
@@ -213,9 +212,9 @@ def test_unsupported_alg_emits_signature_unsupported() -> None:
     )
     record: PoeRecord = cast(
         PoeRecord,
-        {**record_base, "sigs": [{"cose_sign1": chunk_bytes(cose)}]},
+        {**record_base, "sigs": [{"cose_sign1": cose}]},
     )
-    results = asyncio.run(verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32)))
+    results = verify_record_signatures(record)
     assert results[0].verdict == "unsupported"
     assert results[0].reason == "SIGNATURE_UNSUPPORTED"
 
@@ -239,9 +238,9 @@ def test_bad_signature_emits_signature_invalid() -> None:
     )
     record: PoeRecord = cast(
         PoeRecord,
-        {**record_base, "sigs": [{"cose_sign1": chunk_bytes(cose)}]},
+        {**record_base, "sigs": [{"cose_sign1": cose}]},
     )
-    results = asyncio.run(verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32)))
+    results = verify_record_signatures(record)
     assert results[0].verdict == "invalid"
     assert results[0].reason == "SIGNATURE_INVALID"
 
@@ -252,10 +251,10 @@ def test_malformed_cose_sign1_emits_malformed() -> None:
         {
             "v": 1,
             "items": [{"hashes": {"sha2-256": b"\x55" * 32}}],
-            "sigs": [{"cose_sign1": [b"\xff" * 10]}],  # not a valid COSE_Sign1
+            "sigs": [{"cose_sign1": b"\xff" * 10}],  # not a valid COSE_Sign1
         },
     )
-    results = asyncio.run(verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32)))
+    results = verify_record_signatures(record)
     assert results[0].verdict == "invalid"
     assert results[0].reason == "MALFORMED_SIG_COSE_SIGN1"
 
@@ -279,8 +278,8 @@ def test_path1_unresolved_signer_key_emits_signer_key_unresolved() -> None:
     )
     record: PoeRecord = cast(
         PoeRecord,
-        {**record_base, "sigs": [{"cose_sign1": chunk_bytes(cose)}]},
+        {**record_base, "sigs": [{"cose_sign1": cose}]},
     )
-    results = asyncio.run(verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32)))
+    results = verify_record_signatures(record)
     assert results[0].verdict == "unresolved"
     assert results[0].reason == "SIGNER_KEY_UNRESOLVED"

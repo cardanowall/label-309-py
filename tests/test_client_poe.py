@@ -117,9 +117,7 @@ def test_quote_503_pricing_outage_maps_to_service_unavailable() -> None:
 
         async with _client_with_handler(handler) as client:
             with pytest.raises(ServiceUnavailableError):
-                await client.poe.quote(
-                    record_bytes=256, recipient_count=0, file_bytes_total=0
-                )
+                await client.poe.quote(record_bytes=256, recipient_count=0, file_bytes_total=0)
 
     asyncio.run(run())
 
@@ -312,9 +310,7 @@ def test_publish_threads_idempotency_key_into_header() -> None:
             return httpx.Response(202, json=PUBLISH_BODY)
 
         async with _client_with_handler(handler) as client:
-            await client.poe.publish(
-                record="aa", quote_id=QUOTE_ID, idempotency_key="idem-p-1"
-            )
+            await client.poe.publish(record="aa", quote_id=QUOTE_ID, idempotency_key="idem-p-1")
         assert captured["idem"] == "idem-p-1"
 
     asyncio.run(run())
@@ -579,10 +575,7 @@ def test_poe_publish_request_shape_matches_cross_sdk_parity_fixture() -> None:
             await client.poe.publish(record="aa" * 16, quote_id=QUOTE_ID)
 
         fixture_path = (
-            Path(__file__).parent
-            / "fixtures"
-            / "poe-request"
-            / "poe-publish-request.json"
+            Path(__file__).parent / "fixtures" / "poe-request" / "poe-publish-request.json"
         )
         fixture = json.loads(fixture_path.read_text("utf-8"))
 

@@ -17,7 +17,6 @@ check requires a real binding to surface `valid: true`.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 from typing import cast
 
@@ -33,11 +32,10 @@ from cardanowall._crypto.cose_sign1 import (
 from cardanowall._crypto.sig import get_public_key_ed25519, sign_ed25519
 from cardanowall.poe_standard import (
     PoeRecord,
-    chunk_bytes,
     encode_poe_record,
     encode_record_body_for_signing,
 )
-from cardanowall.verifier import VerifyTxInput, verify_record_signatures
+from cardanowall.verifier import verify_record_signatures
 
 IDENTITY_SEED_HEX = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
 WALLET_SEED_HEX = "1111111111111111111111111111111111111111111111111111111111111111"
@@ -63,7 +61,7 @@ def _build_record_body() -> PoeRecord:
                         "sha2-256": bytes.fromhex(A2_SHA),
                         "blake2b-256": bytes.fromhex(A2_BLAKE),
                     },
-                    "uris": [[AR_URI]],
+                    "uris": [AR_URI],
                 }
             ],
         },
@@ -71,7 +69,7 @@ def _build_record_body() -> PoeRecord:
     return body
 
 
-def _build_identity_sig_entry(body: PoeRecord) -> dict[str, list[bytes]]:
+def _build_identity_sig_entry(body: PoeRecord) -> dict[str, bytes]:
     seed = bytes.fromhex(IDENTITY_SEED_HEX)
     pubkey = get_public_key_ed25519(seed)
     assert pubkey.hex() == IDENTITY_PUBKEY_HEX
@@ -88,10 +86,10 @@ def _build_identity_sig_entry(body: PoeRecord) -> dict[str, list[bytes]]:
         payload=None,
         signature=signature,
     )
-    return {"cose_sign1": chunk_bytes(cose)}
+    return {"cose_sign1": cose}
 
 
-def _build_wallet_sig_entry(body: PoeRecord) -> dict[str, list[bytes]]:
+def _build_wallet_sig_entry(body: PoeRecord) -> dict[str, bytes]:
     seed = bytes.fromhex(WALLET_SEED_HEX)
     pubkey = get_public_key_ed25519(seed)
     assert pubkey.hex() == WALLET_PUBKEY_HEX
@@ -115,8 +113,8 @@ def _build_wallet_sig_entry(body: PoeRecord) -> dict[str, list[bytes]]:
     cose_key: dict[int, object] = {1: 1, 3: -8, -1: 6, -2: pubkey}
     cose_key_bytes = encode_canonical_cbor(cast(CanonicalCborValue, cose_key))
     return {
-        "cose_sign1": chunk_bytes(cose),
-        "cose_key": chunk_bytes(cose_key_bytes),
+        "cose_sign1": cose,
+        "cose_key": cose_key_bytes,
     }
 
 
@@ -126,9 +124,7 @@ def test_identity_first_ordering_verifies_both_entries() -> None:
         PoeRecord,
         {**body, "sigs": [_build_identity_sig_entry(body), _build_wallet_sig_entry(body)]},
     )
-    out = asyncio.run(
-        verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32))
-    )
+    out = verify_record_signatures(record)
     assert len(out) == 2
     assert out[0].verdict == "valid"
     assert out[0].signer_type == "in-signature-kid"
@@ -142,9 +138,7 @@ def test_wallet_first_ordering_verifies_both_entries() -> None:
         PoeRecord,
         {**body, "sigs": [_build_wallet_sig_entry(body), _build_identity_sig_entry(body)]},
     )
-    out = asyncio.run(
-        verify_record_signatures(record, VerifyTxInput(tx_hash="00" * 32))
-    )
+    out = verify_record_signatures(record)
     assert len(out) == 2
     assert out[0].verdict == "valid"
     assert out[0].signer_type == "wallet-inline-key"

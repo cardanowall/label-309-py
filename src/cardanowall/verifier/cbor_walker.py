@@ -1,15 +1,16 @@
-"""Position-aware CBOR walker for byte-faithful label-309 metadata extraction.
+"""Position-aware CBOR walker for byte-faithful transaction slicing.
 
-The verifier MUST fetch raw transaction CBOR and extract the label-309 value
-VERBATIM (not via decode-then-re-encode). A re-encode pass would silently
-launder a non-conformant on-chain record into a conformant one because the
+The verifier MUST fetch raw transaction CBOR and consume its components
+VERBATIM (never via decode-then-re-encode). A re-encode pass would silently
+launder a non-conformant on-chain record into a conformant one because a
 decoder normalises non-canonical input (sorts map keys, collapses
-indefinite-length encodings, etc.); the structural validator's canonical-CBOR
-check only catches the violation if it sees the producer's original bytes.
+indefinite-length encodings, …); the structural validator's canonical-CBOR
+check only catches a violation if it sees the producer's original bytes — and
+the transaction-reference integrity binding (blake2b-256 over the body and
+auxiliary-data bytes) is meaningful only over the bytes exactly as fetched.
 
-Pure stdlib walker (no `cbor2` dependency for the slicing path). Rejects
-indefinite-length encodings, which canonical CBOR forbids; the structural
-validator downstream performs the rest of the deterministic-encoding checks.
+Pure stdlib walker (no ``cbor2`` dependency on the slicing path). Rejects
+indefinite-length encodings, which canonical CBOR forbids.
 """
 
 from __future__ import annotations
@@ -20,10 +21,8 @@ from dataclasses import dataclass
 class MalformedTxCborError(ValueError):
     """Raised on a structural CBOR violation while walking raw tx bytes.
 
-    Carries the `MALFORMED_CBOR` code so the verifier surfaces it under the
-    `MALFORMED_CBOR` validation issue (matching the TS twin's
-    `RangeError("MALFORMED_CBOR: …")`).
-    """
+    Carries the ``MALFORMED_CBOR`` code so the verifier surfaces it under the
+    ``MALFORMED_CBOR`` issue."""
 
     def __init__(self, message: str) -> None:
         super().__init__(f"MALFORMED_CBOR: {message}")
@@ -110,196 +109,208 @@ def _skip_cbor_item(data: bytes, pos: int) -> int:
     raise MalformedTxCborError(f"unknown major type {h.mt}")
 
 
-# CBOR tag 259 wraps post-Alonzo auxiliary_data (CIP-29).
+# CBOR tag 259 wraps the keyed-map auxiliary-data form (CIP-29 / Conway).
 _CARDANO_AUX_DATA_TAG = 259
 _POE_LABEL = 309
+# Conway transaction-body key carrying the 32-byte auxiliary_data_hash.
+_BODY_KEY_AUX_DATA_HASH = 7
 
 
 @dataclass(frozen=True)
 class TxComponents:
     """Byte-faithful components of a Cardano transaction.
 
-    `tx_body` and `witness_set` are EXACT on-chain byte slices:
-    `blake2b256(tx_body)` equals the transaction hash, and the witness set
-    decodes to the vkey witnesses that authorised the transaction.
-
-    `label309` is the reassembled label-309 value (chunked-bytes concatenated),
-    `None` when auxiliary_data is null/undefined or label 309 is absent.
-    `aux_metadata_labels` is the ascending-sorted list of every integer key in
-    the auxiliary metadata map (`()` when aux is null).
+    ``tx_body``, ``witness_set``, and ``auxiliary_data`` are EXACT on-chain
+    byte slices: ``blake2b256(tx_body)`` equals the transaction id, and
+    ``blake2b256(auxiliary_data)`` equals the body's ``auxiliary_data_hash``
+    for a transaction that exists on chain. ``auxiliary_data`` is ``None``
+    when the slot is CBOR null/undefined (or absent in a pre-Alonzo
+    three-element transaction).
     """
 
-    label309: bytes | None
     tx_body: bytes
     witness_set: bytes
-    aux_metadata_labels: tuple[int, ...]
+    auxiliary_data: bytes | None
 
 
 def slice_tx_components(tx_cbor: bytes) -> TxComponents:
     """Walk the transaction CBOR once and return its byte-faithful components.
 
-    Raises `MalformedTxCborError` on structural violations. The body and
-    witness-set slices are the producer's ORIGINAL bytes; `label309` carries the
-    same byte-faithful guarantee (no decode-then-re-encode, so non-canonical
-    encodings reach the structural validator unchanged).
+    Accepts the four-element post-Alonzo shape
+    ``[body, witness_set, is_valid, auxiliary_data]`` and the three-element
+    pre-Alonzo shape ``[body, witness_set, auxiliary_data]``. Raises
+    ``MalformedTxCborError`` on structural violations.
     """
     tx_head = _read_head(tx_cbor, 0)
     if tx_head.mt != 4:
         raise MalformedTxCborError(f"tx CBOR is not a CBOR array (major type {tx_head.mt})")
-    if tx_head.value_u64 < 4:
+    if tx_head.value_u64 not in (3, 4):
         raise MalformedTxCborError(
-            f"tx CBOR array has {tx_head.value_u64} elements; expected >= 4 "
-            "(post-Conway: [body, witness_set, is_valid, auxiliary_data])"
+            f"tx CBOR array has {tx_head.value_u64} elements; expected 3 "
+            "([body, witness_set, auxiliary_data]) or 4 "
+            "([body, witness_set, is_valid, auxiliary_data])"
         )
 
     body_start = tx_head.payload_start
     body_end = _skip_cbor_item(tx_cbor, body_start)
     witness_set_start = body_end
     witness_set_end = _skip_cbor_item(tx_cbor, witness_set_start)
-    pos = _skip_cbor_item(tx_cbor, witness_set_end)  # skip is_valid
+    pos = witness_set_end
+    if tx_head.value_u64 == 4:
+        pos = _skip_cbor_item(tx_cbor, pos)  # skip is_valid
 
     tx_body = tx_cbor[body_start:body_end]
     witness_set = tx_cbor[witness_set_start:witness_set_end]
 
     if pos >= len(tx_cbor):
         raise MalformedTxCborError("truncated tx (auxiliary_data missing)")
-    aux_first_byte = tx_cbor[pos]
-    if aux_first_byte in (0xF6, 0xF7):
-        return TxComponents(
-            label309=None, tx_body=tx_body, witness_set=witness_set, aux_metadata_labels=()
-        )
+    if tx_cbor[pos] in (0xF6, 0xF7):
+        return TxComponents(tx_body=tx_body, witness_set=witness_set, auxiliary_data=None)
+    aux_end = _skip_cbor_item(tx_cbor, pos)
+    return TxComponents(
+        tx_body=tx_body, witness_set=witness_set, auxiliary_data=tx_cbor[pos:aux_end]
+    )
 
-    aux_map_pos = pos
-    aux_head = _read_head(tx_cbor, pos)
-    if aux_head.mt == 6:
-        if aux_head.value_u64 != _CARDANO_AUX_DATA_TAG:
+
+def auxiliary_data_hash_from_tx_body(tx_body: bytes) -> bytes | None:
+    """Slice the 32-byte ``auxiliary_data_hash`` (body key 7) out of a
+    byte-faithful transaction-body slice; ``None`` when the body carries no
+    such key. Raises ``MalformedTxCborError`` on structural violations."""
+    body_head = _read_head(tx_body, 0)
+    if body_head.mt != 5:
+        raise MalformedTxCborError(f"tx body is not a CBOR map (major type {body_head.mt})")
+    pos = body_head.payload_start
+    for _ in range(body_head.value_u64):
+        key_head = _read_head(tx_body, pos)
+        value_start = _skip_cbor_item(tx_body, pos)
+        value_end = _skip_cbor_item(tx_body, value_start)
+        if key_head.mt == 0 and key_head.value_u64 == _BODY_KEY_AUX_DATA_HASH:
+            value_head = _read_head(tx_body, value_start)
+            if value_head.mt != 2:
+                raise MalformedTxCborError("auxiliary_data_hash is not a byte string")
+            return tx_body[value_head.payload_start : value_end]
+        pos = value_end
+    return None
+
+
+@dataclass(frozen=True)
+class UnwrappedAuxiliaryData:
+    """The label-309 value slice inside an auxiliary-data envelope.
+
+    ``label_309`` is the raw CBOR bytes of the value under metadata label
+    309 — the transport chunk array, byte-exact — or ``None`` when the
+    well-formed auxiliary data simply carries no label-309 entry.
+    ``metadata_labels`` is the ascending-sorted list of every metadata label
+    in the envelope (empty when the envelope carries no metadata map).
+    """
+
+    label_309: bytes | None
+    metadata_labels: tuple[int, ...]
+
+
+def unwrap_auxiliary_data(aux_bytes: bytes) -> UnwrappedAuxiliaryData:
+    """Unwrap auxiliary-data bytes down to the label-309 value slice.
+
+    Accepts the three era envelope forms, dispatching purely on the top-level
+    CBOR type and tag — NEVER on map-key inspection:
+
+      - an untagged map is always the metadata map itself;
+      - an untagged two-element array is ``[transaction_metadata,
+        auxiliary_scripts]`` — the metadata map is element 0;
+      - tag 259 is the keyed-map form — the metadata map sits under integer
+        key 0 (a tag-259 map with no key 0 is well-formed auxiliary data that
+        carries no metadata).
+
+    Any other top-level shape, and any tag other than 259, raises
+    ``MalformedTxCborError``. Key-sniffing heuristics are forbidden: a
+    metadata map is keyed by integer labels, so treating a map that happens
+    to contain a small-integer key as a keyed wrapper would silently
+    mis-parse legitimate metadata.
+    """
+    head = _read_head(aux_bytes, 0)
+
+    if head.mt == 6:
+        if head.value_u64 != _CARDANO_AUX_DATA_TAG:
             raise MalformedTxCborError(
-                f"auxiliary_data carries unexpected CBOR tag {aux_head.value_u64}; "
-                f"expected {_CARDANO_AUX_DATA_TAG} or bare map"
+                f"auxiliary_data carries CBOR tag {head.value_u64}; only tag "
+                f"{_CARDANO_AUX_DATA_TAG} is an auxiliary-data envelope"
             )
-        aux_map_pos = aux_head.payload_start
+        inner_pos = head.payload_start
+        inner_head = _read_head(aux_bytes, inner_pos)
+        if inner_head.mt != 5:
+            raise MalformedTxCborError(
+                f"tag-259 auxiliary_data payload is not a CBOR map (major type {inner_head.mt})"
+            )
+        metadata_map_pos = _find_tag259_metadata_map(aux_bytes, inner_head)
+        if metadata_map_pos is None:
+            return UnwrappedAuxiliaryData(label_309=None, metadata_labels=())
+        return _walk_metadata_map(aux_bytes, metadata_map_pos)
 
-    map_head = _read_head(tx_cbor, aux_map_pos)
-    if map_head.mt != 5:
-        raise MalformedTxCborError(
-            f"auxiliary_data is not a CBOR map (major type {map_head.mt})"
-        )
+    if head.mt == 4:
+        if head.value_u64 != 2:
+            raise MalformedTxCborError(
+                f"untagged auxiliary_data array has {head.value_u64} elements; the "
+                "metadata-with-scripts form is exactly [transaction_metadata, auxiliary_scripts]"
+            )
+        first_head = _read_head(aux_bytes, head.payload_start)
+        if first_head.mt != 5:
+            raise MalformedTxCborError(
+                "metadata-with-scripts auxiliary_data element 0 is not a CBOR map "
+                f"(major type {first_head.mt})"
+            )
+        return _walk_metadata_map(aux_bytes, head.payload_start)
 
-    # Disambiguate the tagged (post-Alonzo, `{0 -> metadata, 1 -> ...}`) and
-    # bare (pre-Alonzo, the map IS the metadata map) auxiliary_data shapes by
-    # walking the map keys: if any int key in `{0,1,2,3}` is present, treat it
-    # as the post-Alonzo shape and find key 0; else treat the whole map as
-    # metadata directly. Modern Cardano txs (Conway+) are always tag-259
-    # wrapped, but synthetic fixtures often emit the post-Alonzo shape bare.
-    entry_pos = map_head.payload_start
-    saw_aux_key = False
-    found_metadata_at: int | None = None
+    if head.mt == 5:
+        # An untagged map IS the metadata map itself — never key-sniffed.
+        return _walk_metadata_map(aux_bytes, 0)
+
+    raise MalformedTxCborError(
+        f"auxiliary_data has top-level major type {head.mt}; expected map, "
+        "two-element array, or tag 259"
+    )
+
+
+def _find_tag259_metadata_map(aux_bytes: bytes, map_head: _CborHead) -> int | None:
+    pos = map_head.payload_start
     for _ in range(map_head.value_u64):
-        key_head = _read_head(tx_cbor, entry_pos)
-        if key_head.mt == 0 and key_head.value_u64 <= 3:
-            saw_aux_key = True
-            if key_head.value_u64 == 0:
-                found_metadata_at = key_head.payload_start
-        entry_pos = _skip_cbor_item(tx_cbor, entry_pos)  # skip key
-        entry_pos = _skip_cbor_item(tx_cbor, entry_pos)  # skip value
+        key_head = _read_head(aux_bytes, pos)
+        value_start = _skip_cbor_item(aux_bytes, pos)
+        value_end = _skip_cbor_item(aux_bytes, value_start)
+        if key_head.mt == 0 and key_head.value_u64 == 0:
+            return value_start
+        pos = value_end
+    return None
 
-    if saw_aux_key or aux_head.mt == 6:
-        metadata_map_pos = found_metadata_at
-    else:
-        metadata_map_pos = aux_map_pos
 
-    if metadata_map_pos is None:
-        return TxComponents(
-            label309=None, tx_body=tx_body, witness_set=witness_set, aux_metadata_labels=()
-        )
-
-    meta_head = _read_head(tx_cbor, metadata_map_pos)
+def _walk_metadata_map(aux_bytes: bytes, map_pos: int) -> UnwrappedAuxiliaryData:
+    meta_head = _read_head(aux_bytes, map_pos)
     if meta_head.mt != 5:
         raise MalformedTxCborError(f"metadata is not a CBOR map (major type {meta_head.mt})")
     labels: list[int] = []
-    label309: bytes | None = None
-    pair_pos = meta_head.payload_start
+    label_309: bytes | None = None
+    pos = meta_head.payload_start
     for _ in range(meta_head.value_u64):
-        key_head = _read_head(tx_cbor, pair_pos)
-        key_val = _decode_int_key(key_head)
-        labels.append(key_val)
-        value_start = _skip_cbor_item(tx_cbor, pair_pos)
-        value_end = _skip_cbor_item(tx_cbor, value_start)
-        if key_val == _POE_LABEL:
-            label309 = _reassemble_label_309_value(tx_cbor, value_start, value_end)
-        pair_pos = value_end
+        key_head = _read_head(aux_bytes, pos)
+        if key_head.mt != 0:
+            raise MalformedTxCborError(
+                f"metadata map key has major type {key_head.mt}; metadata labels are "
+                "unsigned integers"
+            )
+        labels.append(key_head.value_u64)
+        value_start = _skip_cbor_item(aux_bytes, pos)
+        value_end = _skip_cbor_item(aux_bytes, value_start)
+        if key_head.value_u64 == _POE_LABEL:
+            label_309 = aux_bytes[value_start:value_end]
+        pos = value_end
     labels.sort()
-    return TxComponents(
-        label309=label309,
-        tx_body=tx_body,
-        witness_set=witness_set,
-        aux_metadata_labels=tuple(labels),
-    )
-
-
-def slice_label_309_value(tx_cbor: bytes) -> bytes | None:
-    """Extract the byte slice corresponding to the value under metadata label 309.
-
-    Returns `None` when auxiliary_data is null/undefined or when label 309 is
-    absent. Raises `MalformedTxCborError` on structural violations. Returns the
-    producer's ORIGINAL on-chain bytes — no decode-then-re-encode pass.
-    """
-    return slice_tx_components(tx_cbor).label309
-
-
-def _reassemble_label_309_value(tx_cbor: bytes, value_start: int, value_end: int) -> bytes:
-    """Reassemble the label-309 record body from its on-chain shape.
-
-    Cardano caps individual metadata `bstr` / `tstr` values at 64 bytes, so a
-    Label 309 record's canonical CBOR is emitted as a `bytes-chunk-array`
-    (`[ bstr .size (1..64), … ]`). The verifier byte-concatenates the chunks IN
-    ORDER before validation. Small records (<= 64 bytes) MAY be a single `bstr`
-    directly; a bare CBOR map value is accepted for backward-compat with older
-    producers and small synthetic fixtures.
-    """
-    head = _read_head(tx_cbor, value_start)
-    # Major type 4 = array -> chunked-bytes; concatenate inner bstr items.
-    if head.mt == 4:
-        out = bytearray()
-        chunk_pos = head.payload_start
-        for i in range(head.value_u64):
-            chunk_head = _read_head(tx_cbor, chunk_pos)
-            if chunk_head.mt != 2:
-                raise MalformedTxCborError(
-                    f"label-309 value is a CBOR array but element {i} has major type "
-                    f"{chunk_head.mt}; expected byte string (chunked-bytes shape)"
-                )
-            chunk_value_start = chunk_head.payload_start
-            chunk_value_end = chunk_value_start + chunk_head.value_u64
-            out += tx_cbor[chunk_value_start:chunk_value_end]
-            chunk_pos = chunk_value_end
-        return bytes(out)
-    # Major type 2 = single bstr value. The bstr CONTENTS are the canonical
-    # CBOR record body — strip the bstr head so the validator sees the map.
-    if head.mt == 2:
-        return tx_cbor[head.payload_start : head.payload_start + head.value_u64]
-    # Major type 5 = map directly (bare-canonical shape). Pass through unchanged.
-    if head.mt == 5:
-        return tx_cbor[value_start:value_end]
-    raise MalformedTxCborError(
-        f"label-309 value has major type {head.mt}; "
-        "expected array (chunked), byte string, or map"
-    )
-
-
-def _decode_int_key(h: _CborHead) -> int:
-    if h.mt == 0:
-        return h.value_u64
-    if h.mt == 1:
-        return -1 - h.value_u64
-    raise MalformedTxCborError(
-        f"metadata map key has major type {h.mt}; expected unsigned integer"
-    )
+    return UnwrappedAuxiliaryData(label_309=label_309, metadata_labels=tuple(labels))
 
 
 __all__ = [
     "MalformedTxCborError",
     "TxComponents",
-    "slice_label_309_value",
+    "UnwrappedAuxiliaryData",
+    "auxiliary_data_hash_from_tx_body",
     "slice_tx_components",
+    "unwrap_auxiliary_data",
 ]

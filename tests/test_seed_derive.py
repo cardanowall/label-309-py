@@ -41,12 +41,12 @@ def _check_seed_corpus(corpus_name: str) -> None:
         assert x["public_key"].hex() == vector["expected_x25519_public_hex"], vector["name"]
 
         mlkem = derive_mlkem768x25519_keypair_from_seed(seed)
-        assert (
-            mlkem["secret_seed"].hex() == vector["expected_mlkem768x25519_secret_seed_hex"]
-        ), vector["name"]
-        assert (
-            mlkem["public_key"].hex() == vector["expected_mlkem768x25519_public_key_hex"]
-        ), vector["name"]
+        assert mlkem["secret_seed"].hex() == vector["expected_mlkem768x25519_secret_seed_hex"], (
+            vector["name"]
+        )
+        assert mlkem["public_key"].hex() == vector["expected_mlkem768x25519_public_key_hex"], (
+            vector["name"]
+        )
 
 
 def test_seed_derive_kat_zero() -> None:

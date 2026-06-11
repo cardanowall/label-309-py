@@ -1,21 +1,66 @@
+"""Outbound HTTP egress and content acquisition with attribution.
+
+Two layers live here:
+
+1. The canonical egress wrapper (``wrap_fetch_outbound`` around
+   ``default_fetch_outbound``): deny-list short-circuit, protocol/method
+   allowlist, bounded timeout, exp-backoff retry with jitter, and the audit
+   trail — every outbound call of a verification run (success, failure,
+   retry) is recorded through this single function, so the report can prove
+   service-independence.
+
+2. The shared content-acquisition engine (``iterate_blob_sources``) behind
+   the three fetching consumers — plain-item digests, Merkle leaves-lists,
+   and sealed ciphertext. Multiple URIs are alternative sources for the same
+   bytes, processed first-success-for-availability: sources are yielded in
+   order (caller-supplied out-of-band bytes first, then each URI against its
+   scheme's gateway chain) and the consumer stops at the first source
+   satisfying its claim. Every yielded blob knows its ATTRIBUTION — whether
+   the bytes are bound to the URI's content address (or were supplied
+   out-of-band) — which decides whether a mismatch condemns the record or
+   merely indicts the serving provider:
+
+     - out-of-band bytes            -> attributable;
+     - ipfs:// raw-codec CIDv1      -> attributable iff the multihash
+                                       recompute over the fetched bytes
+                                       verifies;
+     - everything else fetched      -> unattributable (no binding check
+                                       implemented for ar:// L1 / ANS-104 or
+                                       DAG-form CIDs), so mismatches route
+                                       through URI_PROVIDER_INTEGRITY_MISMATCH.
+
+   Per-attempt diagnostics land in the issue sink (URI_FETCH_FAILED
+   warnings, URI_TARGET_FORBIDDEN refusals, SERVICE_INDEPENDENCE_VIOLATION
+   on a denied host), each at the claim's ``uris[j]`` path; the per-claim
+   END-state (CONTENT_UNAVAILABLE vs CONTENT_FETCH_LIMIT_EXCEEDED vs the
+   claim-specific availability code) is the consumer's to emit, with
+   ``flags.limit_exceeded`` recording whether an attempt aborted at the
+   ``max_fetch_bytes`` ceiling. A ceiling abort ENDS the claim: every URI of
+   a claim addresses the same bytes, so any other honest source would abort
+   at the same ceiling.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import random
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
 from typing import Final
 from urllib.parse import urlparse
 
 import httpx
 
+from .content_binding import verify_ipfs_cid_binding
 from .types import (
     FetchOutbound,
     FetchOutboundOptions,
     FetchOutboundResult,
     HttpCallRecord,
-    VerifyUriCheck,
+    IssueSink,
+    Purpose,
 )
 
 DEFAULT_TIMEOUT_MS: Final[int] = 10_000
@@ -32,15 +77,19 @@ DEFAULT_OUTBOUND_MAX_BYTES: Final[int] = 64 * 1024 * 1024
 
 _LOOPBACK_127_RE: Final[re.Pattern[str]] = re.compile(r"^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
 
-# Default Arweave gateway rotation. Tried in order; the first 200 wins.
-ARWEAVE_DEFAULTS: Final[tuple[str, ...]] = (
+# Default Arweave gateway rotation, tried in order; the first 200 wins. IPFS
+# has NO baked-in default: IPFS gateways are not the producer's storage
+# provider, and a silent fallback would couple the verifier to an off-record
+# gateway — a deployment that fetches ipfs:// must configure its own chain,
+# and one that does not is a deployment that declines IPFS
+# (URI_TARGET_FORBIDDEN at fetch time).
+ARWEAVE_GATEWAY_DEFAULTS: Final[tuple[str, ...]] = (
     "https://arweave.net",
     "https://ar-io.net",
     "https://g8way.io",
 )
 
 _ARWEAVE_TXID_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]{43}$")
-_URI_FETCH_SET_RE: Final[re.Pattern[str]] = re.compile(r"^(ar|ipfs)://")
 
 
 class DenyHostError(Exception):
@@ -160,7 +209,7 @@ def wrap_fetch_outbound(
     retryable_statuses: Sequence[int] = DEFAULT_RETRYABLE_STATUSES,
 ) -> FetchOutbound:
     # Per-request timeout is enforced inside default_fetch_outbound; accepted
-    # here for signature parity with the TS wrapper.
+    # here for signature parity with the TypeScript wrapper.
     del timeout_ms
 
     async def wrapped(url: str, opts: FetchOutboundOptions) -> FetchOutboundResult:
@@ -174,7 +223,7 @@ def wrap_fetch_outbound(
                 scheme = ""
             audit.append(
                 HttpCallRecord(
-                    url=url, method="GET", status=0, bytes=0, duration_ms=0, purpose=purpose
+                    url=url, method="GET", status=None, bytes=0, duration_ms=0, purpose=purpose
                 )
             )
             raise UnsupportedProtocolError(protocol=f"{scheme}:" if scheme else "", url=url)
@@ -183,7 +232,7 @@ def wrap_fetch_outbound(
         if not _is_allowed_method(opts.method):
             audit.append(
                 HttpCallRecord(
-                    url=url, method="GET", status=0, bytes=0, duration_ms=0, purpose=purpose
+                    url=url, method="GET", status=None, bytes=0, duration_ms=0, purpose=purpose
                 )
             )
             raise UnsupportedMethodError(method=opts.method, url=url)
@@ -197,7 +246,7 @@ def wrap_fetch_outbound(
                     HttpCallRecord(
                         url=url,
                         method=opts.method,
-                        status=0,
+                        status=None,
                         bytes=0,
                         duration_ms=0,
                         purpose=purpose,
@@ -209,7 +258,7 @@ def wrap_fetch_outbound(
                     HttpCallRecord(
                         url=url,
                         method=opts.method,
-                        status=0,
+                        status=None,
                         bytes=0,
                         duration_ms=0,
                         purpose=purpose,
@@ -231,7 +280,7 @@ def wrap_fetch_outbound(
                     HttpCallRecord(
                         url=url,
                         method=opts.method,
-                        status=0,
+                        status=None,
                         bytes=0,
                         duration_ms=duration_ms,
                         purpose=purpose,
@@ -244,7 +293,7 @@ def wrap_fetch_outbound(
                     HttpCallRecord(
                         url=url,
                         method=opts.method,
-                        status=0,
+                        status=None,
                         bytes=0,
                         duration_ms=duration_ms,
                         purpose=purpose,
@@ -321,130 +370,213 @@ async def default_fetch_outbound(url: str, opts: FetchOutboundOptions) -> FetchO
     return FetchOutboundResult(status=status, bytes=body, duration_ms=duration_ms)
 
 
-class UriTargetForbiddenError(Exception):
-    """Raised when none of the reconstructed URIs name an in-set retrieval
-    scheme (`ar://` / `ipfs://`). Such a URI should already have been rejected
-    by structural validation; rejecting it here too is defence-in-depth."""
-
-    code: Final[str] = "URI_TARGET_FORBIDDEN"
+# -----------------------------------------------------------------------------
+# Claim-level content acquisition (the shared engine behind items / merkle /
+# ciphertext fetching)
+# -----------------------------------------------------------------------------
 
 
-class ContentUnavailableError(Exception):
-    """Raised when an in-set URI was selected but no configured gateway could
-    return its bytes (every gateway in the chain was exhausted, the Arweave
-    txid was malformed, or no IPFS gateway chain was supplied)."""
+@dataclass(frozen=True, kw_only=True)
+class ContentFetchContext:
+    """The per-run fetch configuration shared by every content-acquiring
+    pipeline step, plus the run's issue sink."""
 
-    code: Final[str] = "CONTENT_UNAVAILABLE"
+    fetch_fn: FetchOutbound
+    arweave_gateways: tuple[str, ...]
+    ipfs_gateways: tuple[str, ...]
+    issues: IssueSink
+    max_fetch_bytes: int | None = None
 
 
-async def fetch_item_ciphertext(
+@dataclass(kw_only=True)
+class AcquiredBlob:
+    """One candidate byte string for a claim, plus its content-address
+    attribution. ``attributable`` is computed lazily and memoised: the digest
+    work only runs when a consumer actually needs attribution, i.e. on the
+    mismatch path — bytes that satisfy the record's own commitment never need
+    it (the record's commitment is at least as strong as the storage
+    layer's)."""
+
+    bytes: bytes
+    source: str  # "out_of_band" | "fetched"
+    uri: str | None = None
+    uri_index: int | None = None
+    _binding: str | None = None  # "verified" | "failed" | "unsupported"
+    _cid: str | None = None
+    _cid_path: str = ""
+
+    def attributable(self) -> bool:
+        if self._binding is None:
+            if self.source == "out_of_band":
+                self._binding = "verified"
+            elif self._cid is not None:
+                self._binding = verify_ipfs_cid_binding(
+                    cid=self._cid, path=self._cid_path, data=self.bytes
+                )
+            else:
+                self._binding = "unsupported"
+        return self._binding == "verified"
+
+
+@dataclass
+class BlobIterationFlags:
+    limit_exceeded: bool = False
+
+
+@dataclass(frozen=True)
+class _ParsedFetchUri:
+    scheme: str  # "ar" | "ipfs"
+    address: str  # ar: the txid. ipfs: the CID (authority).
+    path: str  # ipfs only: the '/'-prefixed path within the DAG, '' when absent.
+
+
+_URI_SCHEME_RE: Final[re.Pattern[str]] = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
+
+
+# Scheme matching is case-insensitive (the scheme alone is folded); the
+# remainder of the URI is a case-sensitive content address and is used
+# verbatim.
+def _parse_fetch_uri(uri: str) -> _ParsedFetchUri | None:
+    m = _URI_SCHEME_RE.match(uri)
+    if m is None:
+        return None
+    scheme = m.group(1).lower()
+    rest = uri[m.end() :]
+    if scheme == "ar":
+        if not _ARWEAVE_TXID_RE.fullmatch(rest):
+            return None
+        return _ParsedFetchUri(scheme="ar", address=rest, path="")
+    if scheme == "ipfs":
+        slash = rest.find("/")
+        if slash == -1:
+            return _ParsedFetchUri(scheme="ipfs", address=rest, path="")
+        return _ParsedFetchUri(scheme="ipfs", address=rest[:slash], path=rest[slash:])
+    return None
+
+
+def _join_gateway(base: str, suffix: str) -> str:
+    return f"{base}{suffix}" if base.endswith("/") else f"{base}/{suffix}"
+
+
+async def iterate_blob_sources(
     *,
-    uris: Sequence[Sequence[str]],
-    fetch_fn: FetchOutbound,
-    uri_checks_out: list[VerifyUriCheck],
-    item_index: int,
-    arweave_gateways: Sequence[str] | None = None,
-    ipfs_gateways: Sequence[str] | None = None,
-) -> bytes:
-    """Reconstruct the first in-set URI from a chunked ``uris[]`` list, fetch it
-    over the appropriate gateway chain, and return the raw bytes.
+    uris: Sequence[str],
+    allow_fetch: bool,
+    base_path: tuple[str | int, ...],
+    ctx: ContentFetchContext,
+    flags: BlobIterationFlags,
+    out_of_band: bytes | None = None,
+) -> AsyncIterator[AcquiredBlob]:
+    """Yield candidate blobs for one claim, in source order: caller-supplied
+    out-of-band bytes first, then (when ``allow_fetch``) each URI in record
+    order against its scheme's gateway chain, first 200 per URI. The consumer
+    breaks out at the first acceptable blob; exhaustion of the generator means
+    the claim is left unchecked and the consumer emits the applicable
+    availability end-state."""
+    if out_of_band is not None:
+        yield AcquiredBlob(bytes=out_of_band, source="out_of_band")
+    if not allow_fetch:
+        return
 
-    ``uris`` is the record-item (or merkle-entry) URI list: a list of chunk
-    arrays, each of which reconstructs to one absolute URI. The first URI whose
-    scheme is in the closed v1 fetch set (``ar://`` → Arweave HTTPS rotation,
-    ``ipfs://`` → caller-supplied IPFS rotation) is selected. Each gateway
-    attempt appends one ``VerifyUriCheck`` to ``uri_checks_out``: a failed attempt
-    records ``ok=False`` with the failure reason, the winning attempt records
-    ``ok=True``.
-
-    Returns the bytes of the first gateway response with status 200. Individual
-    gateway failures are non-terminal (the chain advances); a fully exhausted
-    chain raises :class:`ContentUnavailableError` so the caller can emit the
-    terminal verdict. A URI with no in-set scheme raises
-    :class:`UriTargetForbiddenError`.
-    """
-    reconstructed = ["".join(chunks) for chunks in uris]
-    candidate = next((u for u in reconstructed if _URI_FETCH_SET_RE.match(u)), None)
-    if candidate is None:
-        # No in-set URI present — defence-in-depth rejection.
-        for u in reconstructed:
-            uri_checks_out.append(
-                VerifyUriCheck(
-                    item_index=item_index, uri=u, ok=False, reason="URI_TARGET_FORBIDDEN"
-                )
+    for uri_index, uri in enumerate(uris):
+        uri_path: tuple[str | int, ...] = (*base_path, "uris", uri_index)
+        parsed = _parse_fetch_uri(uri)
+        if parsed is None:
+            # Defence-in-depth: a target outside the closed fetch set can only
+            # reach here by bypassing structural validation.
+            ctx.issues.add(
+                "URI_TARGET_FORBIDDEN",
+                uri_path,
+                f'refusing to fetch "{uri}": not a conformant ar:// or ipfs:// content address',
             )
-        raise UriTargetForbiddenError("no in-set URI scheme in uris[]")
+            continue
 
-    if candidate.startswith("ar://"):
-        txid = candidate[5:]
-        if not _ARWEAVE_TXID_RE.match(txid):
-            uri_checks_out.append(
-                VerifyUriCheck(
-                    item_index=item_index, uri=candidate, ok=False, reason="CONTENT_UNAVAILABLE"
+        purpose: Purpose
+        if parsed.scheme == "ar":
+            gateways: Sequence[str] = ctx.arweave_gateways
+            suffix = parsed.address
+            purpose = "arweave"
+        else:
+            gateways = ctx.ipfs_gateways
+            suffix = f"ipfs/{parsed.address}{parsed.path}"
+            purpose = "ipfs"
+            if len(gateways) == 0:
+                # This deployment declines every IPFS fetch — a policy
+                # statement about the verifier, never about the record.
+                ctx.issues.add(
+                    "URI_TARGET_FORBIDDEN",
+                    uri_path,
+                    f'refusing to fetch "{uri}": no IPFS gateway chain is configured',
                 )
-            )
-            raise ContentUnavailableError(f"malformed arweave txid: {txid}")
-        gateways: Sequence[str] = (
-            arweave_gateways if arweave_gateways and len(arweave_gateways) > 0 else ARWEAVE_DEFAULTS
-        )
-        for gw in gateways:
+                continue
+
+        for gateway in gateways:
+            url = _join_gateway(gateway, suffix)
             try:
-                res = await fetch_fn(
-                    f"{gw}/{txid}", FetchOutboundOptions(method="GET", purpose="arweave")
+                res = await ctx.fetch_fn(
+                    url,
+                    FetchOutboundOptions(
+                        method="GET", purpose=purpose, max_bytes=ctx.max_fetch_bytes
+                    ),
                 )
-                if res.status == 200:
-                    uri_checks_out.append(
-                        VerifyUriCheck(item_index=item_index, uri=candidate, ok=True)
-                    )
-                    return res.bytes
-                uri_checks_out.append(
-                    VerifyUriCheck(
-                        item_index=item_index,
-                        uri=candidate,
-                        ok=False,
-                        reason="URI_FETCH_FAILED",
-                    )
+            except BodyTooLargeError:
+                # Aborted at the deployment's per-URI fetch ceiling. Every URI
+                # of a claim addresses the same bytes, so any other honest
+                # source would abort at the same ceiling: end the claim. The
+                # consumer's end-state surfaces CONTENT_FETCH_LIMIT_EXCEEDED.
+                flags.limit_exceeded = True
+                return
+            except DenyHostError:
+                ctx.issues.add(
+                    "SERVICE_INDEPENDENCE_VIOLATION",
+                    uri_path,
+                    f"outbound call to {url} targets a denyHosts entry",
                 )
-            except Exception:
-                uri_checks_out.append(
-                    VerifyUriCheck(
-                        item_index=item_index,
-                        uri=candidate,
-                        ok=False,
-                        reason="URI_FETCH_FAILED",
-                    )
+                continue
+            except Exception as e:
+                ctx.issues.add(
+                    "URI_FETCH_FAILED",
+                    uri_path,
+                    f'fetch of "{uri}" via {gateway} failed: {e}',
                 )
-        raise ContentUnavailableError("all arweave gateways exhausted")
+                continue
+            if res.status != 200:
+                ctx.issues.add(
+                    "URI_FETCH_FAILED",
+                    uri_path,
+                    f'fetch of "{uri}" via {gateway} returned HTTP {res.status}',
+                )
+                continue
+            yield AcquiredBlob(
+                bytes=res.bytes,
+                source="fetched",
+                uri=uri,
+                uri_index=uri_index,
+                _cid=parsed.address if parsed.scheme == "ipfs" else None,
+                _cid_path=parsed.path,
+            )
+            # The consumer pulled the next source: this blob did not settle
+            # the claim (an unattributable mismatch indicts the gateway, not
+            # the address), so the remaining gateways of the same URI are
+            # tried next.
 
-    # ipfs:// — the caller MUST configure an IPFS gateway chain. There is no
-    # baked-in default: IPFS gateways are not the producer's storage provider,
-    # and a silent fallback would couple the verifier to an off-record gateway.
-    cid_part = candidate[len("ipfs://") :]
-    ipfs_cid = cid_part.split("/", 1)[0] or cid_part
-    if not ipfs_gateways or len(ipfs_gateways) == 0:
-        uri_checks_out.append(
-            VerifyUriCheck(
-                item_index=item_index, uri=candidate, ok=False, reason="CONTENT_UNAVAILABLE"
-            )
-        )
-        raise ContentUnavailableError("no ipfs gateway configured")
-    for gw in ipfs_gateways:
-        try:
-            sep = "" if gw.endswith("/") else "/"
-            url = f"{gw}{sep}ipfs/{ipfs_cid}"
-            res = await fetch_fn(url, FetchOutboundOptions(method="GET", purpose="ipfs"))
-            if res.status == 200:
-                uri_checks_out.append(VerifyUriCheck(item_index=item_index, uri=candidate, ok=True))
-                return res.bytes
-            uri_checks_out.append(
-                VerifyUriCheck(
-                    item_index=item_index, uri=candidate, ok=False, reason="URI_FETCH_FAILED"
-                )
-            )
-        except Exception:
-            uri_checks_out.append(
-                VerifyUriCheck(
-                    item_index=item_index, uri=candidate, ok=False, reason="URI_FETCH_FAILED"
-                )
-            )
-    raise ContentUnavailableError("all ipfs gateways exhausted")
+
+__all__ = [
+    "ARWEAVE_GATEWAY_DEFAULTS",
+    "DEFAULT_OUTBOUND_MAX_BYTES",
+    "DEFAULT_RETRIES",
+    "DEFAULT_RETRYABLE_STATUSES",
+    "DEFAULT_TIMEOUT_MS",
+    "AcquiredBlob",
+    "BlobIterationFlags",
+    "BodyTooLargeError",
+    "ContentFetchContext",
+    "DenyHostError",
+    "OutboundExhaustedError",
+    "UnsupportedMethodError",
+    "UnsupportedProtocolError",
+    "default_fetch_outbound",
+    "iterate_blob_sources",
+    "matches_deny_list",
+    "wrap_fetch_outbound",
+]

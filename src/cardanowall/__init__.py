@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from . import hash, merkle
-from ._crypto.sealed_poe import ecies_sealed_poe_unwrap, ecies_sealed_poe_wrap
+from ._crypto.sealed_poe import (
+    ecies_sealed_poe_unwrap,
+    ecies_sealed_poe_wrap,
+    passphrase_sealed_poe_open,
+    passphrase_sealed_poe_seal,
+)
 from .client import (
     BatchEmptyError,
     BatchTooLargeError,
@@ -68,6 +73,10 @@ from .seed_derive import (
     derive_mlkem768x25519_keypair_from_seed,
     derive_x25519_keypair_from_seed,
 )
+from .seed_encoding import (
+    encode_identity_seed,
+    parse_identity_seed,
+)
 from .seed_identity import (
     SeedKeys,
     SeedRecipients,
@@ -86,7 +95,6 @@ from .verifier import (
     VerifyReport,
     VerifyTxInput,
     default_fetch_outbound,
-    fetch_item_ciphertext,
     verify_tx,
 )
 from .verifier.profile import detect_conformance_profile
@@ -155,14 +163,17 @@ __all__ = [
     "encode_age_xwing_recipient",
     "encode_bytes_variable_length",
     "encode_crockford_base32",
+    "encode_identity_seed",
     "encode_poe_record",
     "encode_prefixed_id",
     "encode_record_body_for_signing",
-    "fetch_item_ciphertext",
     "hash",
     "is_prefixed_id",
     "merkle",
     "parse_age_recipient",
+    "parse_identity_seed",
+    "passphrase_sealed_poe_open",
+    "passphrase_sealed_poe_seal",
     "recipient_secret_keys_from_seed",
     "recipients_from_seed",
     "signer_from_seed",

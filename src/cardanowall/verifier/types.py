@@ -1,151 +1,67 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Final, Literal, Protocol
+from dataclasses import dataclass, field
+from typing import Literal, Protocol
 
-from cardanowall.poe_standard import ErrorCode, PoeRecord
+from cardanowall.poe_standard import ErrorCode, PoeRecord, Severity, severity_of
 
-# `VerifyReport.verdict` and `exit_code` are a closed four-state pair.
-# `valid` (exit 0) is the only happy path; `pending` (exit 3)
-# fires exclusively on `INSUFFICIENT_CONFIRMATIONS`; `failed` splits into
-# exit 1 (record-attributable) and exit 2 (network-class — every gateway in a
-# chain exhausted). Keeping these as `Literal` types lets mypy --strict catch
-# any path that synthesises an off-grid combination.
-Verdict = Literal["valid", "pending", "failed"]
+# The machine verdict and its exit-code projection form a closed four-state
+# pair: `valid` → 0, `failed` → 1 (record-attributable outcomes only),
+# `unverifiable` → 2 (a required check could not run or could not be
+# attributed, for network / policy / provider-integrity reasons), `pending` → 3
+# (below the confirmation-depth threshold). Exit codes 4+ are reserved for
+# verifier-host runtime failures and never correspond to a verdict.
+Verdict = Literal["valid", "pending", "unverifiable", "failed"]
 ExitCode = Literal[0, 1, 2, 3]
 Purpose = Literal["cardano", "arweave", "ipfs"]
 Method = Literal["GET", "POST"]
 
-# Four conformance profiles in strict-superset order. `recipient-sealed`
-# is the union; lower profiles skip higher-profile fields with the
-# info-severity `OUT_OF_PROFILE_SKIPPED` code (NOT `SCHEMA_UNKNOWN_FIELD`,
-# which is reserved for fields outside the v1 CDDL).
+# Four conformance profiles in strict-superset order. Lower profiles skip
+# higher-profile fields with the info-severity `OUT_OF_PROFILE_SKIPPED` code
+# (NOT `SCHEMA_UNKNOWN_FIELD`, which is reserved for fields outside the v1
+# grammar).
 Profile = Literal["core", "signed", "sealed", "recipient-sealed"]
 
-NetworkId = Literal["cardano:mainnet"]
-
-
-# Codes the verifier emits in addition to the validator's structural codes.
-# Mirror-only: every literal also appears in
-# `poe_standard.error_codes.ErrorCode`. The dict survives for callers that
-# pre-date the unified literal and want a stable name-lookup table.
-VERIFIER_ONLY_ERROR_CODES: Final[dict[str, str]] = {
-    "METADATA_NOT_FOUND": "METADATA_NOT_FOUND",
-    "INSUFFICIENT_CONFIRMATIONS": "INSUFFICIENT_CONFIRMATIONS",
-    "SIGNER_KEY_UNRESOLVED": "SIGNER_KEY_UNRESOLVED",
-    "SIGNATURE_INVALID": "SIGNATURE_INVALID",
-    "WALLET_ADDRESS_MISMATCH": "WALLET_ADDRESS_MISMATCH",
-    "URI_INTEGRITY_MISMATCH": "URI_INTEGRITY_MISMATCH",
-    "URI_FETCH_FAILED": "URI_FETCH_FAILED",
-    "CONTENT_UNAVAILABLE": "CONTENT_UNAVAILABLE",
-    "URI_TARGET_FORBIDDEN": "URI_TARGET_FORBIDDEN",
-    "CIPHERTEXT_UNAVAILABLE": "CIPHERTEXT_UNAVAILABLE",
-    "WRONG_DECRYPTION_INPUT_SHAPE": "WRONG_DECRYPTION_INPUT_SHAPE",
-    "WRONG_RECIPIENT_KEY": "WRONG_RECIPIENT_KEY",
-    "TAMPERED_HEADER": "TAMPERED_HEADER",
-    "TAMPERED_CIPHERTEXT": "TAMPERED_CIPHERTEXT",
-    "PROVIDER_UNAVAILABLE": "PROVIDER_UNAVAILABLE",
-    "SERVICE_INDEPENDENCE_VIOLATION": "SERVICE_INDEPENDENCE_VIOLATION",
-    "MERKLE_ROOT_MISMATCH": "MERKLE_ROOT_MISMATCH",
-    "MERKLE_LEAVES_UNAVAILABLE": "MERKLE_LEAVES_UNAVAILABLE",
-    "MERKLE_UNSUPPORTED": "MERKLE_UNSUPPORTED",
-    "MERKLE_LEAVES_INFORMATIVE_FORM": "MERKLE_LEAVES_INFORMATIVE_FORM",
-    "SCHEMA_MERKLE_LEAF_COUNT_MISMATCH": "SCHEMA_MERKLE_LEAF_COUNT_MISMATCH",
-    "SCHEMA_MERKLE_LEAVES_FORMAT_UNSUPPORTED": "SCHEMA_MERKLE_LEAVES_FORMAT_UNSUPPORTED",
-    "OUT_OF_PROFILE_SKIPPED": "OUT_OF_PROFILE_SKIPPED",
-    "KDF_DERIVATION_FAILED": "KDF_DERIVATION_FAILED",
-}
+# The report's network identifier names the network of the RESOLVED
+# transaction as established by the explorer chain the verifier is configured
+# against — never a value read from the record body (records carry none).
+NetworkId = Literal["cardano:mainnet", "cardano:preprod", "cardano:preview"]
 
 VerifierIssueCode = ErrorCode
 
+# Three-state per-claim content-check status, so an unchecked claim can never
+# masquerade as a verified one: `checked` — bytes were obtained and every
+# committed digest matched; `mismatched` — attributable fetched (or decrypted)
+# bytes failed a commitment; `not_checked` — the claim was not checked
+# (`fetch_content` off, availability failure, unattributable fetched bytes, or
+# the per-URI fetch ceiling).
+ContentCheck = Literal["checked", "mismatched", "not_checked"]
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, kw_only=True)
 class VerifierIssue:
+    """One typed issue, shared by the structural validator and the verifier
+    layer. Verifier-layer codes that concern the run rather than a record
+    location carry an empty path. `severity` defaults to `error`."""
+
     code: str
     path: tuple[str | int, ...]
     message: str
+    severity: Severity = "error"
 
 
-# Per-entry signature failure reasons. `SIGNATURE_UNSUPPORTED` is
-# info-severity — a hash-only PoE remains `valid` even when every signature
-# is unsupported. `WALLET_ADDRESS_MISMATCH` is the path-2-only check; it is
-# NOT collapsed into `SIGNATURE_INVALID` because the Ed25519 verify itself
-# succeeded — only the address-pubkey binding failed.
+# Per-entry record-signature verdict. `valid` is the only happy path;
+# `unsupported` (SIGNATURE_UNSUPPORTED, info severity) never fails a public
+# hash-only PoE; `invalid` and `unresolved` are error-severity outcomes.
+SignatureVerdict = Literal["valid", "invalid", "unsupported", "unresolved"]
+SignerType = Literal["in-signature-kid", "wallet-inline-key"]
 SigFailureReason = Literal[
     "MALFORMED_SIG_COSE_SIGN1",
     "SIGNATURE_UNSUPPORTED",
     "SIGNER_KEY_UNRESOLVED",
     "SIGNATURE_INVALID",
     "WALLET_ADDRESS_MISMATCH",
-]
-SignerType = Literal["in-signature-kid", "wallet-inline-key"]
-
-# Per-entry record-signature verdict. `valid` is the only happy path; the three
-# failure verdicts mirror the TypeScript twin so the cross-language goldens stay
-# byte-identical. `unsupported` (SIGNATURE_UNSUPPORTED) is info-severity: a
-# public hash-only PoE stays `valid` even when every signature is unsupported.
-SignatureVerdict = Literal["valid", "invalid", "unsupported", "unresolved"]
-
-# Per-decryption verdict. `decrypted` is the only success state; every other
-# value is a distinct failure mode so the UI can render differentiated copy.
-DecryptionVerdict = Literal[
-    "decrypted",
-    "wrong-key",
-    "tampered-header",
-    "tampered-ciphertext",
-    "wrong-input-shape",
-    "no-enc-envelope",
-    "ciphertext-unavailable",
-    "content-unavailable",
-    "skipped",
-    "kdf-failed",
-]
-
-# Per-Merkle-commit verdict. `valid` / `mismatch` are root-bind outcomes;
-# `unavailable` (leaves blob unfetchable) is warning-severity — the on-chain
-# root commitment alone remains structurally valid — and `format-unsupported`
-# / `unsupported` are info/warning-severity, none of which fail the verdict.
-MerkleVerdict = Literal[
-    "valid",
-    "mismatch",
-    "unavailable",
-    "format-unsupported",
-    "unsupported",
-]
-
-# Per-decryption failure reasons. Distinct codes per unwrap-stage failure
-# mode so UI can render differentiated copy.
-DecryptionFailureReason = Literal[
-    "no_enc_envelope",
-    "URI_FETCH_FAILED",
-    "CIPHERTEXT_UNAVAILABLE",
-    "URI_TARGET_FORBIDDEN",
-    "CONTENT_UNAVAILABLE",
-    "WRONG_RECIPIENT_KEY",
-    "TAMPERED_HEADER",
-    "TAMPERED_CIPHERTEXT",
-    "WRONG_DECRYPTION_INPUT_SHAPE",
-    "KDF_DERIVATION_FAILED",
-    "URI_INTEGRITY_MISMATCH",
-]
-
-UriFailureReason = Literal[
-    "URI_FETCH_FAILED",
-    "URI_INTEGRITY_MISMATCH",
-    "URI_TARGET_FORBIDDEN",
-    "CONTENT_UNAVAILABLE",
-]
-
-# Per-Merkle-commit outcome. `MERKLE_LEAVES_UNAVAILABLE` is warning-severity
-# (the on-chain root commitment alone remains structurally valid); every
-# other reason here is error-severity.
-MerkleCheckReason = Literal[
-    "MERKLE_LEAVES_UNAVAILABLE",
-    "MERKLE_ROOT_MISMATCH",
-    "MERKLE_UNSUPPORTED",
-    "SCHEMA_MERKLE_LEAF_COUNT_MISMATCH",
-    "SCHEMA_MERKLE_LEAVES_FORMAT_UNSUPPORTED",
 ]
 
 
@@ -155,10 +71,10 @@ class FetchOutboundOptions:
     purpose: Purpose
     headers: Mapping[str, str] | None = None
     body: str | None = None
-    # Hard cap on the response body the primitive will buffer. Gateway content
-    # (ar:// / ipfs:// / https) is producer-chosen and therefore UNTRUSTED — the
-    # verifier never trusts the producer — so a malicious gateway could otherwise
-    # stream unbounded bytes into memory. None → DEFAULT_OUTBOUND_MAX_BYTES.
+    # Hard cap on the response body the primitive will buffer, enforced
+    # incrementally during streaming. Gateway content is producer-chosen and
+    # therefore untrusted; a hostile gateway must not be able to stream
+    # unbounded bytes into memory. None → DEFAULT_OUTBOUND_MAX_BYTES.
     max_bytes: int | None = None
 
 
@@ -173,65 +89,130 @@ class FetchOutbound(Protocol):
     async def __call__(self, url: str, opts: FetchOutboundOptions) -> FetchOutboundResult: ...
 
 
-# Discriminated decryption union. The `item.enc` shape on the record
-# (`enc.slots` vs `enc.passphrase`) selects which Decryption variant the
-# verifier expects; a mismatch surfaces as WRONG_DECRYPTION_INPUT_SHAPE.
+# -----------------------------------------------------------------------------
+# Decryption keyring
+# -----------------------------------------------------------------------------
+#
+# The `decryption[]` array is the verification run's KEYRING: a set of
+# decryption credentials global to the run, not positionally paired with
+# encrypted items. For each `enc`-bearing item the verifier attempts every
+# applicable credential independently — each supplied private key through that
+# item's trial-decrypt loop, each supplied passphrase through its passphrase
+# path. One credential may open several items; different credentials may
+# succeed on different items. An `enc`-bearing item for which the keyring
+# holds no credential of the applicable shape is reported
+# WRONG_DECRYPTION_INPUT_SHAPE.
 @dataclass(frozen=True, kw_only=True)
 class DecryptionRecipient:
-    """Sealed-recipient path entry. `recipient_secret_key` MUST be 32 B X25519."""
+    """Recipient-key credential: a 32-byte X25519 scalar (`x25519`) or a
+    32-byte X-Wing decapsulation seed (`mlkem768x25519`). Applies to items on
+    the `enc.slots` path."""
 
-    item_index: int
     recipient_secret_key: bytes
 
 
 @dataclass(frozen=True, kw_only=True)
 class DecryptionPassphrase:
-    """Passphrase path entry. The passphrase is normalised NFKC → collapse
-    whitespace → trim → UTF-8 encode before Argon2id."""
+    """Passphrase credential, normalized under the pinned profile before
+    Argon2id. Applies to items on the `enc.passphrase` path."""
 
-    item_index: int
     passphrase: str
 
 
 Decryption = DecryptionRecipient | DecryptionPassphrase
 
 
-# Verifier input. Field names mirror the TS twin with snake_case
-# translation.
+# -----------------------------------------------------------------------------
+# Inputs
+# -----------------------------------------------------------------------------
+
+
 @dataclass(frozen=True, kw_only=True)
-class VerifyTxInput:
-    tx_hash: str
+class VerifyRecordInput:
+    """Option surface shared by the transaction-reference entry point and the
+    record-bytes sibling entry point."""
+
     profile: Profile = "recipient-sealed"
     network: NetworkId = "cardano:mainnet"
-    cardano_gateway_chain: tuple[str, ...] | None = None
-    blockfrost_project_id: str | None = None
     arweave_gateway_chain: tuple[str, ...] | None = None
     ipfs_gateway_chain: tuple[str, ...] | None = None
     confirmation_depth_threshold: int | None = None
-    # Deny-host glob is exact-host or `*.<suffix>`. The default list MUST
-    # exclude any single-implementer domain so a conformance suite can
-    # prove service-independence by running with the default list active
-    # and observing no skipped fixtures.
+    # Deny-host pattern is exact-host or `*.<suffix>`. Every operator domain
+    # MUST be deny-able without breaking verification of any conformant
+    # record; an outbound call to a listed host hard-fails with
+    # SERVICE_INDEPENDENCE_VIOLATION.
     deny_hosts: tuple[str, ...] | None = None
-    # `decryption` carries discriminated-union entries; the verifier dispatches
-    # on the on-wire `item.enc.passphrase` vs `item.enc.slots` shape and emits
-    # WRONG_DECRYPTION_INPUT_SHAPE on mismatch.
+    # The run's decryption keyring (see Decryption above). Non-empty AND the
+    # profile admits sealed decryption (>= recipient-sealed) ⇒ the run is a
+    # RECIPIENT verifier: the structural validator runs in the
+    # `recipient_or_strict` role and sealed decryption is attempted. A lower
+    # profile never decrypts, so it keeps the public reading even when
+    # credentials were supplied.
     decryption: tuple[Decryption, ...] | None = None
-    # Out-of-band ciphertext. Keyed by item index; local bytes take
-    # precedence over `item.uris[]` when both are supplied.
+    # Out-of-band ciphertext bytes, keyed by item index. Caller-supplied bytes
+    # are attributable by definition and take precedence over `item.uris[]`.
     ciphertext_bytes: Mapping[int, bytes] | None = None
-    # Out-of-band Merkle leaves-list (CBOR is the normative wire form).
-    # Keyed by `merkle[i]` index. JSON projections trigger
-    # MERKLE_LEAVES_INFORMATIVE_FORM info-severity.
+    # Out-of-band Merkle leaves-list bytes (the normative CBOR container),
+    # keyed by `merkle[i]` index. Likewise attributable by definition.
     merkle_leaves: Mapping[int, bytes] | None = None
+    # Master content-fetch switch. When False, every outbound content fetch —
+    # item URIs, Merkle leaves-lists, and ciphertext alike — is suppressed and
+    # the record renders offline from indexed CBOR alone, with every content
+    # claim reported `not_checked`. Caller-supplied out-of-band bytes are
+    # still processed (they require no fetch).
+    fetch_content: bool = True
+    # Per-URI fetch ceiling, enforced incrementally during streaming. A fetch
+    # that reaches it aborts with CONTENT_FETCH_LIMIT_EXCEEDED — a statement
+    # about the verifier's policy, never about the record. None → the
+    # transport default (DEFAULT_OUTBOUND_MAX_BYTES).
+    max_fetch_bytes: int | None = None
     fetch_outbound: FetchOutbound | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
+class VerifyTxInput(VerifyRecordInput):
+    tx_hash: str = ""
+    cardano_gateway_chain: tuple[str, ...] | None = None
+    blockfrost_project_id: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class BlockInfo:
+    """Explorer-asserted chain facts for the record-bytes entry point: the
+    caller resolved the transaction itself (e.g. a server-rendered viewer with
+    indexed data) and supplies what the chain-resolve step would have
+    established. ``confirmation_depth`` is counted in blocks — tip - block + 1,
+    so a transaction in a block has depth at least 1 by definition; a smaller
+    value contradicts the caller's own tuple and is a caller-input error
+    (``ValueError``), never a verification outcome."""
+
+    confirmation_depth: int
+    block_time: int
+    block_slot: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.confirmation_depth < 1:
+            raise ValueError(
+                "confirmation_depth must be >= 1 (a transaction in the tip "
+                f"block has depth exactly 1); got {self.confirmation_depth}"
+            )
+
+
+# -----------------------------------------------------------------------------
+# Report
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, kw_only=True)
 class HttpCallRecord:
+    """One recorded outbound network call, captured by the single recording
+    egress wrapper for every call — success, failure, and retry. `status` is
+    the HTTP status when a response was received and None when none was
+    (refused call, transport failure)."""
+
     url: str
     method: Method
-    status: int
+    status: int | None
     bytes: int
     duration_ms: int
     purpose: Purpose
@@ -247,55 +228,48 @@ class VerifyRecordSignature:
 
 
 @dataclass(frozen=True, kw_only=True)
-class VerifyItemDecryption:
-    item_index: int
-    verdict: DecryptionVerdict
-    # True iff every content-hash entry in `items[i].hashes` recomputes to the
-    # recovered plaintext. Always a concrete boolean on `verdict == 'decrypted'`.
+class DecryptionOutcome:
+    """The recipient-verifier outcome for one `enc`-bearing item after every
+    applicable keyring credential was attempted independently."""
+
+    decrypted: bool
+    # The post-decryption recheck: every digest in the item's `hashes` map
+    # recomputed over the recovered plaintext. A concrete boolean whenever
+    # decryption ran to completion; False raises URI_INTEGRITY_MISMATCH and
+    # forces the record's verdict to `failed`.
     plaintext_hash_ok: bool | None = None
-    reason: str | None = None
+    # The typed code describing why decryption did not succeed; the same code
+    # also appears in the issue list.
+    code: str | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
-class VerifyUriCheck:
-    item_index: int
-    uri: str
-    ok: bool
-    reason: str | None = None
+class VerifyItemEntry:
+    """Per-item report entry, positionally aligned with the record's
+    `items[]`."""
+
+    content_check: ContentCheck
+    decryption: DecryptionOutcome | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
-class ItemHashCheck:
-    item_index: int
-    alg: str
-    ok: bool
+class VerifyMerkleEntry:
+    """Per-commitment report entry, positionally aligned with the record's
+    `merkle[]`."""
 
-
-@dataclass(frozen=True, kw_only=True)
-class VerifyMerkleCheck:
-    merkle_index: int
-    alg: str
-    verdict: MerkleVerdict
-    root_recomputed: bytes | None = None
-    reason: str | None = None
-
-
-@dataclass(frozen=True, kw_only=True)
-class SupersedesResolved:
-    tx: str
-    exists: bool
+    content_check: ContentCheck
 
 
 # -----------------------------------------------------------------------------
-# Transaction-level description — DISTINCT from record-level authorship.
+# Transaction-level description — distinct from record-level authorship.
 # -----------------------------------------------------------------------------
 #
 # These surfaces describe the Cardano transaction that carried the PoE: which
-# wallet vkey(s) authorised/paid for it, the fee, and the outputs. This is the
-# "who submitted and paid for this anchoring" view — orthogonal to
-# `record_signatures`, which is the optional Label 309 record-level authorship
-# claim. A failed `signature_valid` here is INFORMATIONAL: it never changes the
-# verifier's verdict (the content claim does not depend on who paid the fee).
+# wallet vkey(s) authorised/paid for it, the fee, and the outputs — orthogonal
+# to `signatures`, the optional record-level authorship claim. Purely
+# informational: a failed `signature_valid` here never changes the verdict.
+# Field names are the wire form already (the JSON projection emits them
+# verbatim, snake_case).
 @dataclass(frozen=True, kw_only=True)
 class VerifyTxWitness:
     type: Literal["vkey"]
@@ -324,64 +298,142 @@ class VerifyTxSummary:
     network_id: int | None = None
 
 
-# Three issue sinks per severity, mirroring the validator's `info` /
-# `warnings` / `issues` triad. `valid` is a pure structural-pass claim;
-# `pending` and `failed` carry their respective code under `issues`.
-@dataclass(frozen=True, kw_only=True)
-class ValidationSummary:
-    valid: bool
-    issues: tuple[VerifierIssue, ...] = ()
-    warnings: tuple[VerifierIssue, ...] = ()
-    info: tuple[VerifierIssue, ...] = ()
-
-
 @dataclass(frozen=True, kw_only=True)
 class VerifyReport:
-    tx_hash: str
+    """The structured report of one verification run.
+
+    The JSON projection (`verify_report_to_dict`) emits the schema-pinned key
+    names: dataclass field names are camelized except the spec-pinned
+    `block_time` / `block_slot` and the transaction-description sub-objects,
+    whose fields are wire-form already. Required-by-schema fields: verdict,
+    exitCode, issues, items, merkle, auditTrail."""
+
     verdict: Verdict
     exit_code: ExitCode
-    profile: Profile
+    # The structural-validation issue list plus every verifier-layer code
+    # raised by the run, sorted segment-wise by path with the error-code
+    # registry order as the tie-break.
+    issues: tuple[VerifierIssue, ...]
+    # One entry per record `items[]` / `merkle[]` element, positionally
+    # aligned; empty exactly when the record carries no such array.
+    items: tuple[VerifyItemEntry, ...]
+    merkle: tuple[VerifyMerkleEntry, ...]
+    audit_trail: tuple[HttpCallRecord, ...]
     network: NetworkId
-    confirmation_depth_threshold: int
-    validation: ValidationSummary
-    http_calls: tuple[HttpCallRecord, ...]
-    metadata_present: bool = False
-    num_confirmations: int = 0
+    profile: Profile
+    tx_hash: str | None = None
+    confirmation_depth: int | None = None
+    confirmation_threshold: int | None = None
     block_time: int | None = None
     block_slot: int | None = None
     record: PoeRecord | None = None
-    record_signatures: tuple[VerifyRecordSignature, ...] | None = None
-    # Transaction-level description (present only when raw tx CBOR is available
-    # to the pipeline). `tx_witnesses` is `()` on placeholder-body records and
-    # populated when the body carries vkey witnesses; `tx_summary` is present
-    # only when the body decodes to a summarisable shape; `metadata_labels` is
-    # the ascending-sorted list of every aux metadata label key (`[309]` for a
-    # bare PoE tx).
+    signatures: tuple[VerifyRecordSignature, ...] | None = None
     tx_witnesses: tuple[VerifyTxWitness, ...] | None = None
     tx_summary: VerifyTxSummary | None = None
     metadata_labels: tuple[int, ...] | None = None
-    item_hash_checks: tuple[ItemHashCheck, ...] | None = None
-    item_decryptions: tuple[VerifyItemDecryption, ...] | None = None
-    uri_checks: tuple[VerifyUriCheck, ...] | None = None
-    merkle_checks: tuple[VerifyMerkleCheck, ...] | None = None
-    supersedes_resolved: SupersedesResolved | None = None
+
+
+# Verdict → exit-code projection (the schema's allOf branches).
+_EXIT_CODE_FOR_VERDICT: dict[Verdict, ExitCode] = {
+    "valid": 0,
+    "failed": 1,
+    "unverifiable": 2,
+    "pending": 3,
+}
+
+
+def exit_code_for_verdict(verdict: Verdict) -> ExitCode:
+    return _EXIT_CODE_FOR_VERDICT[verdict]
+
+
+# Error-severity codes that are NOT record-attributable: network, policy, and
+# provider-integrity outcomes. They block a `valid` verdict but can never
+# condemn the record — the verdict they produce is `unverifiable`. Every other
+# error-severity code is record-attributable and produces `failed`.
+# MERKLE_LEAVES_UNAVAILABLE joins the set only when escalated to error by the
+# commitment floor — its warning reading never reaches the verdict
+# computation.
+NETWORK_CLASS_CODES: frozenset[str] = frozenset(
+    {
+        "TX_NOT_FOUND",
+        "PROVIDER_UNAVAILABLE",
+        "TX_INTEGRITY_MISMATCH",
+        "CONTENT_UNAVAILABLE",
+        "CONTENT_FETCH_LIMIT_EXCEEDED",
+        "CIPHERTEXT_UNAVAILABLE",
+        "MERKLE_LEAVES_UNAVAILABLE",
+        "URI_TARGET_FORBIDDEN",
+    }
+)
+
+
+def _registry_severity(code: str) -> Severity:
+    try:
+        return severity_of(code)  # type: ignore[arg-type]
+    except Exception:
+        return "error"
+
+
+@dataclass
+class IssueSink:
+    """Mutable accumulator the pipeline steps append typed issues to; the
+    report assembly sorts it once at emission. ``add`` applies the error-code
+    registry's default severity; pass ``severity`` only to apply a
+    context-promoted reading (dual-severity codes) — no code may ever be
+    softened below its registry severity."""
+
+    issues: list[VerifierIssue] = field(default_factory=list)
+
+    def add(
+        self,
+        code: str,
+        path: tuple[str | int, ...],
+        message: str,
+        severity: Severity | None = None,
+    ) -> None:
+        self.issues.append(
+            VerifierIssue(
+                code=code,
+                path=path,
+                message=message,
+                severity=severity if severity is not None else _registry_severity(code),
+            )
+        )
+
+    def add_once(
+        self,
+        code: str,
+        path: tuple[str | int, ...],
+        message: str,
+        severity: Severity | None = None,
+    ) -> None:
+        """Idempotent ``add``: a no-op when the sink already holds an issue
+        with the same code, path, and effective severity. Used where two
+        pipeline layers can legitimately conclude the same fact about the same
+        location (e.g. the structural validator and the signature pass both
+        finding a signature entry unsupported) and the report must carry it
+        exactly once."""
+        effective = severity if severity is not None else _registry_severity(code)
+        for existing in self.issues:
+            if existing.code == code and existing.path == path and existing.severity == effective:
+                return
+        self.issues.append(VerifierIssue(code=code, path=path, message=message, severity=effective))
 
 
 __all__ = [
-    "VERIFIER_ONLY_ERROR_CODES",
+    "NETWORK_CLASS_CODES",
+    "BlockInfo",
+    "ContentCheck",
     "Decryption",
-    "DecryptionFailureReason",
+    "DecryptionOutcome",
     "DecryptionPassphrase",
     "DecryptionRecipient",
-    "DecryptionVerdict",
     "ExitCode",
     "FetchOutbound",
     "FetchOutboundOptions",
     "FetchOutboundResult",
     "HttpCallRecord",
-    "ItemHashCheck",
-    "MerkleCheckReason",
-    "MerkleVerdict",
+    "IssueSink",
     "Method",
     "NetworkId",
     "Profile",
@@ -389,19 +441,17 @@ __all__ = [
     "SigFailureReason",
     "SignatureVerdict",
     "SignerType",
-    "SupersedesResolved",
-    "UriFailureReason",
-    "ValidationSummary",
     "Verdict",
     "VerifierIssue",
     "VerifierIssueCode",
-    "VerifyItemDecryption",
-    "VerifyMerkleCheck",
+    "VerifyItemEntry",
+    "VerifyMerkleEntry",
+    "VerifyRecordInput",
     "VerifyRecordSignature",
     "VerifyReport",
     "VerifyTxInput",
     "VerifyTxOutput",
     "VerifyTxSummary",
     "VerifyTxWitness",
-    "VerifyUriCheck",
+    "exit_code_for_verdict",
 ]

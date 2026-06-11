@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cardanowall-sdk"
-version = "0.3.0"
+version = "0.4.0"
 description = "Python SDK for the CardanoWall protocol — parity twin of @cardanowall/sdk-ts. Implements the Label 309 cryptographic primitives byte-identically with the TypeScript reference."
 readme = "README.md"
 license = "Apache-2.0"
@@ -45,6 +45,8 @@ dev = [
   "pytest-json-report>=1.5.0,<2.0.0",
   "mypy>=2.0.0,<3",
   "ruff>=0.15.0,<0.16",
+  "jsonschema>=4.23.0,<5",
+  "types-jsonschema>=4.23.0,<5",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -93,7 +95,8 @@ select = ["E", "F", "W", "I", "B", "TID", "RUF", "UP", "S"]
 "cryptography.hazmat.primitives.asymmetric.ed25519".msg = "cryptography's Ed25519 is cofactored (non-conformant for Label 309 strict ZIP215=false) — use nacl.signing from PyNaCl."
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101"]
+# S105/S106/S107: conformance tests pin literal passphrases by design.
+"tests/**/*.py" = ["S101", "S105", "S106", "S107"]
 
 [tool.ruff.format]
 quote-style = "double"

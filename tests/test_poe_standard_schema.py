@@ -6,6 +6,7 @@ from cardanowall.poe_standard import (
     PassphraseKdf,
     PoeRecord,
     Slot,
+    is_extension_key,
 )
 
 
@@ -31,7 +32,7 @@ def test_envelope_with_slots_and_kem() -> None:
     slot: Slot = {"epk": b"\x00" * 32, "wrap": b"\x00" * 48}
     enc: EncryptionEnvelope = {
         "scheme": 1,
-        "aead": "xchacha20-poly1305",
+        "aead": "chacha20-poly1305-stream64k",
         "kem": "x25519",
         "nonce": b"\x00" * 24,
         "slots": [slot],
@@ -43,19 +44,19 @@ def test_envelope_with_slots_and_kem() -> None:
 
 def test_envelope_with_hybrid_kem_ct_slots() -> None:
     # The permissive Slot type admits the hybrid (mlkem768x25519) shape:
-    # `{ kem_ct: [ bstr, ... ], wrap: bstr(48) }` — no per-slot `epk`.
-    kem_ct = [b"\x11" * 64] * 17 + [b"\x11" * 32]  # 1120-byte X-Wing enc, chunked
-    slot: Slot = {"kem_ct": kem_ct, "wrap": b"\x02" * 48}
+    # `{ kem_ct: bstr(1120), wrap: bstr(48) }` — a SINGLE byte string, no
+    # per-slot `epk`.
+    slot: Slot = {"kem_ct": b"\x11" * 1120, "wrap": b"\x02" * 48}
     enc: EncryptionEnvelope = {
         "scheme": 1,
-        "aead": "xchacha20-poly1305",
+        "aead": "chacha20-poly1305-stream64k",
         "kem": "mlkem768x25519",
         "nonce": b"\x00" * 24,
         "slots": [slot],
         "slots_mac": b"\x07" * 32,
     }
     assert enc["kem"] == "mlkem768x25519"
-    assert b"".join(enc["slots"][0]["kem_ct"]) == b"\x11" * 1120
+    assert enc["slots"][0]["kem_ct"] == b"\x11" * 1120
     assert "epk" not in enc["slots"][0]
 
 
@@ -67,7 +68,7 @@ def test_envelope_with_passphrase() -> None:
     }
     enc: EncryptionEnvelope = {
         "scheme": 1,
-        "aead": "xchacha20-poly1305",
+        "aead": "chacha20-poly1305-stream64k",
         "nonce": b"\x00" * 24,
         "passphrase": pp,
     }
@@ -75,9 +76,21 @@ def test_envelope_with_passphrase() -> None:
     assert enc["passphrase"]["params"]["m"] == 65536
 
 
-def test_item_with_uris_chunked() -> None:
+def test_item_with_plain_uri_strings() -> None:
     item: Item = {
         "hashes": {"sha2-256": b"\xaa" * 32},
-        "uris": [["ar://", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+        "uris": ["ar://" + "a" * 43],
     }
-    assert item["uris"][0] == ["ar://", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    assert item["uris"] == ["ar://" + "a" * 43]
+
+
+def test_extension_key_namespaces() -> None:
+    assert is_extension_key("x-note")
+    assert is_extension_key("cip100-body") is False  # digits break `[a-z]+-`
+    assert is_extension_key("companion-claim")
+    assert not is_extension_key("bogus")
+    assert not is_extension_key("X-note")
+    # Control characters are rejected anywhere, including a trailing newline
+    # that a `$`-anchored pattern would tolerate.
+    assert not is_extension_key("x-note\n")
+    assert not is_extension_key("x-a\nb")

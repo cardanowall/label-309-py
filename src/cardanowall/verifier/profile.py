@@ -46,21 +46,18 @@ def out_of_profile_issues(record: PoeRecord, profile: Profile) -> tuple[Verifier
       - `recipient-sealed`: reads the full surface; no skips.
 
     `merkle[]` is structurally read in every profile (the `core + merkle`
-    add-on is a profile-level capability, not a separate top-level profile), so
-    it never produces an OUT_OF_PROFILE_SKIPPED entry here.
-    `merkle.MERKLE_UNSUPPORTED` is emitted by the merkle subsystem itself when
-    the verifier does not implement Merkle-fold verification.
+    add-on is a profile-level capability, not a separate top-level profile),
+    so it never produces an OUT_OF_PROFILE_SKIPPED entry here — this verifier
+    implements Merkle-fold, so the per-commitment check always runs.
     """
     out: list[VerifierIssue] = []
-    if not profile_at_least(profile, "signed") and record.get("sigs"):
+    if not profile_at_least(profile, "signed") and "sigs" in record:
         out.append(
             VerifierIssue(
                 code="OUT_OF_PROFILE_SKIPPED",
                 path=("sigs",),
-                message=(
-                    f"record carries sigs[] but verifier profile {profile!r} "
-                    "does not read record-level signatures (signed+ profile required)"
-                ),
+                message=f"sigs[] requires profile >= 'signed'; active profile is '{profile}'",
+                severity="info",
             )
         )
     if not profile_at_least(profile, "sealed"):
@@ -71,9 +68,10 @@ def out_of_profile_issues(record: PoeRecord, profile: Profile) -> tuple[Verifier
                         code="OUT_OF_PROFILE_SKIPPED",
                         path=("items", i, "enc"),
                         message=(
-                            f"item carries enc envelope but verifier profile {profile!r} "
-                            "does not read sealed envelopes (sealed+ profile required)"
+                            f"items[{i}].enc requires profile >= 'sealed'; "
+                            f"active profile is '{profile}'"
                         ),
+                        severity="info",
                     )
                 )
     return tuple(out)

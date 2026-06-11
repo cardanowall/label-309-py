@@ -19,9 +19,7 @@ class PartialUploadError(Exception):
     failed: tuple[UploadFailureEntry, ...]
 
     def __init__(self, response: UploadsResponse) -> None:
-        failed: list[UploadFailureEntry] = [
-            u for u in response["uploads"] if u["ok"] is False
-        ]
+        failed: list[UploadFailureEntry] = [u for u in response["uploads"] if u["ok"] is False]
         detail = "; ".join(
             f"[{f['idx']}] {f['error']['code']} — {f['error']['detail']}" for f in failed
         )

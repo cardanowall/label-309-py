@@ -1,27 +1,26 @@
-"""Regression (parity twin of crypto-core unwrap.low-order-epk.regression.test.ts):
+"""Regression: a structurally valid sealed envelope carrying a small-order
+(low-order) Montgomery ``epk`` in one of its slots must NOT crash
+trial-decrypt.
 
-A structurally valid sealed envelope carrying a small-order (low-order)
-Montgomery ``epk`` in one of its slots must NOT crash trial-decrypt.
-
-Bug: the per-slot X25519 ECDH ran OUTSIDE the AEAD try/except. PyCA
-``cryptography`` rejects a small-order peer public key (the shared secret is
-all-zero, RFC 7748 §6.1 contributory check) by raising ``ValueError``, which
-escaped ``ecies_sealed_poe_unwrap`` / ``ecies_sealed_poe_trial_decrypt`` — an
-attacker-supplied on-chain envelope could turn an inbox scan into an uncaught
-exception. A wrong-LENGTH epk is blocked upstream by the structure check, so the
-low-order point is the only runtime-reachable raise inside the loop.
-
-Fix: a low-order epk slot is a non-match (no conformant wrap for this recipient
-could have produced it) and is skipped exactly like an AEAD-tag failure.
+PyCA ``cryptography`` rejects a small-order peer public key (the shared secret
+is all-zero, RFC 7748 §6.1 contributory check) by raising; an attacker-supplied
+on-chain envelope must never turn a feed scan into an uncaught exception. The
+loop folds the rejection into per-slot acceptance: ``kem_ok = false`` selects a
+dummy KEK (same per-slot work) and the slot can never be accepted, exactly like
+an AEAD-tag failure. A wrong-LENGTH epk is blocked upstream by the structure
+check, so the low-order point is the only runtime-reachable raise inside the
+loop.
 """
 
 from __future__ import annotations
+
+import hashlib
 
 import pytest
 
 from cardanowall._crypto.kem import X25519LowOrderPointError, x25519_ecdh, x25519_public_key
 from cardanowall._crypto.sealed_poe import (
-    TRIAL_DECRYPT_KIND_NO_AEAD_PASS,
+    TRIAL_DECRYPT_KIND_NO_MATCH,
     SealedEnvelope,
     SealedSlot,
     ecies_sealed_poe_trial_decrypt,
@@ -48,6 +47,10 @@ def _det_priv(seed: int) -> bytes:
     return bytes([(seed + j) & 0xFF for j in range(32)])
 
 
+def _hashes_for(plaintext: bytes) -> dict[str, bytes]:
+    return {"sha2-256": hashlib.sha256(plaintext).digest()}
+
+
 # A second, distinct low-order u-coordinate (RFC 7748 §6.1, p+1 reduces to 0).
 # Used to clobber a sibling slot with a low-order point that is NOT byte-equal to
 # the one under test, so the envelope still violates no per-slot KEK-uniqueness
@@ -56,6 +59,11 @@ _SECOND_LOW_ORDER_EPK: bytes = bytes.fromhex(
     "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
 )
 
+_ALL_LOW_ORDER_PLAINTEXT = b"all-low-order"
+_ALL_LOW_ORDER_HASHES = _hashes_for(_ALL_LOW_ORDER_PLAINTEXT)
+_SIBLING_PLAINTEXT = b"low-order-epk-regression"
+_SIBLING_HASHES = _hashes_for(_SIBLING_PLAINTEXT)
+
 
 def _all_low_order_envelope(low_order_epk: bytes) -> tuple[SealedEnvelope, bytes]:
     recipient_public_keys = [
@@ -63,14 +71,15 @@ def _all_low_order_envelope(low_order_epk: bytes) -> tuple[SealedEnvelope, bytes
         x25519_public_key(_det_priv(0x55)),
     ]
     out = ecies_sealed_poe_wrap(
-        plaintext=b"all-low-order",
+        plaintext=_ALL_LOW_ORDER_PLAINTEXT,
         recipient_public_keys=recipient_public_keys,
+        hashes=_ALL_LOW_ORDER_HASHES,
         skip_shuffle=True,
     )
     # Clobber both slots with low-order points so every slot's shared secret is
     # all-zero, but give each a DISTINCT epk: an envelope with duplicate per-slot
     # KEM material is rejected up front (per-slot KEK uniqueness), which is a
-    # different defence than the all-zero shared-secret skip this test exercises.
+    # different defence than the all-zero shared-secret fold this test exercises.
     second = (
         _SECOND_LOW_ORDER_EPK
         if low_order_epk != _SECOND_LOW_ORDER_EPK
@@ -95,11 +104,12 @@ def _envelope_with_low_order_slot(low_order_epk: bytes) -> tuple[SealedEnvelope,
     recipient_priv = _det_priv(0x20)
     other_priv = _det_priv(0x60)
     out = ecies_sealed_poe_wrap(
-        plaintext=b"low-order-epk-regression",
+        plaintext=_SIBLING_PLAINTEXT,
         recipient_public_keys=[
             x25519_public_key(recipient_priv),
             x25519_public_key(other_priv),
         ],
+        hashes=_SIBLING_HASHES,
         skip_shuffle=True,
     )
     # Clobber slot 1's epk with the low-order point. Slot 0 is still a real wrap
@@ -133,6 +143,7 @@ def test_unwrap_single_priv_no_throw_no_match(name: str) -> None:
     res = ecies_sealed_poe_unwrap(
         envelope=env,
         ciphertext=ciphertext,
+        hashes=_ALL_LOW_ORDER_HASHES,
         recipient_secret_key=_det_priv(0x99),
     )
     assert res.matched is False
@@ -144,19 +155,21 @@ def test_unwrap_multi_priv_no_throw_no_match(name: str) -> None:
     res = ecies_sealed_poe_unwrap(
         envelope=env,
         ciphertext=ciphertext,
+        hashes=_ALL_LOW_ORDER_HASHES,
         recipient_secret_keys=[_det_priv(0x99), _det_priv(0xCD)],
     )
     assert res.matched is False
 
 
 @pytest.mark.parametrize("name", list(LOW_ORDER_EPKS))
-def test_trial_decrypt_no_throw_reports_no_aead_pass(name: str) -> None:
+def test_trial_decrypt_no_throw_reports_no_match(name: str) -> None:
     env, _ = _all_low_order_envelope(LOW_ORDER_EPKS[name])
     res = ecies_sealed_poe_trial_decrypt(
         envelope=env,
+        hashes=_ALL_LOW_ORDER_HASHES,
         recipient_secret_keys=[_det_priv(0x99)],
     )
-    assert res.kind == TRIAL_DECRYPT_KIND_NO_AEAD_PASS
+    assert res.kind == TRIAL_DECRYPT_KIND_NO_MATCH
 
 
 @pytest.mark.parametrize("name", list(LOW_ORDER_EPKS))
@@ -166,6 +179,7 @@ def test_legit_slot_opens_with_low_order_sibling(name: str) -> None:
     res = ecies_sealed_poe_unwrap(
         envelope=env,
         ciphertext=ciphertext,
+        hashes=_SIBLING_HASHES,
         recipient_secret_key=matching_priv,
     )
     assert res.matched is False
@@ -173,15 +187,16 @@ def test_legit_slot_opens_with_low_order_sibling(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", list(LOW_ORDER_EPKS))
-def test_constant_time_n_enters_all_slots_with_trailing_low_order(name: str) -> None:
+def test_loop_enters_all_slots_with_trailing_low_order(name: str) -> None:
     env, ciphertext, matching_priv = _envelope_with_low_order_slot(LOW_ORDER_EPKS[name])
     slots_attempted: list[int] = []
     res = ecies_sealed_poe_unwrap(
         envelope=env,
         ciphertext=ciphertext,
+        hashes=_SIBLING_HASHES,
         recipient_secret_key=matching_priv,
         _slots_attempted_out=slots_attempted,
     )
-    # No raise, and the constant-time-N loop entered every slot.
+    # No raise, and the constant-time loop entered every slot.
     assert res.matched is False
     assert slots_attempted and slots_attempted[0] == len(env.slots)

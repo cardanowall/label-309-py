@@ -93,9 +93,7 @@ class RecordsNamespace:
     def __init__(self, config: _ResolvedConfig) -> None:
         self._config = config
 
-    async def list(
-        self, input: RecordsListInput | None = None
-    ) -> RecordsListResponse:
+    async def list(self, input: RecordsListInput | None = None) -> RecordsListResponse:
         """List records as a paginated :class:`RecordsListResponse` whose
         ``data[]`` entries are the same :class:`RecordResource` projection
         :meth:`get` returns.
@@ -148,9 +146,7 @@ class RecordsNamespace:
         _raise_for_status(response)
         return response.json()  # type: ignore[no-any-return]
 
-    async def verify(
-        self, tx_hash: str, input: PoeVerifyInput | None = None
-    ) -> dict[str, Any]:
+    async def verify(self, tx_hash: str, input: PoeVerifyInput | None = None) -> dict[str, Any]:
         """Run the canonical Label 309 verifier against the record at ``tx_hash``.
 
         Returns the same ``VerifyReport`` JSON shape the standalone verifier

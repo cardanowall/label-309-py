@@ -69,12 +69,15 @@ def test_parse_args_help_and_version() -> None:
 
 def test_run_exits_0_on_valid() -> None:
     io = _CapturedIO()
-    with patch(
-        "cardanowall.conformance.__main__.verify_tx",
-        new=AsyncMock(return_value=_fake_report(verdict="valid", exit_code=0)),
-    ), patch(
-        "cardanowall.conformance.__main__.verify_report_to_dict",
-        return_value={"verdict": "valid", "exit_code": 0},
+    with (
+        patch(
+            "cardanowall.conformance.__main__.verify_tx",
+            new=AsyncMock(return_value=_fake_report(verdict="valid", exit_code=0)),
+        ),
+        patch(
+            "cardanowall.conformance.__main__.verify_report_to_dict",
+            return_value={"verdict": "valid", "exit_code": 0},
+        ),
     ):
         code = run([_VALID_TX], io)
     assert code == 0
@@ -83,36 +86,45 @@ def test_run_exits_0_on_valid() -> None:
 
 def test_run_exits_1_on_integrity_failure() -> None:
     io = _CapturedIO()
-    with patch(
-        "cardanowall.conformance.__main__.verify_tx",
-        new=AsyncMock(return_value=_fake_report(verdict="failed", exit_code=1)),
-    ), patch(
-        "cardanowall.conformance.__main__.verify_report_to_dict",
-        return_value={"verdict": "failed", "exit_code": 1},
+    with (
+        patch(
+            "cardanowall.conformance.__main__.verify_tx",
+            new=AsyncMock(return_value=_fake_report(verdict="failed", exit_code=1)),
+        ),
+        patch(
+            "cardanowall.conformance.__main__.verify_report_to_dict",
+            return_value={"verdict": "failed", "exit_code": 1},
+        ),
     ):
         assert run([_VALID_TX], io) == 1
 
 
 def test_run_exits_2_on_network_failure() -> None:
     io = _CapturedIO()
-    with patch(
-        "cardanowall.conformance.__main__.verify_tx",
-        new=AsyncMock(return_value=_fake_report(verdict="failed", exit_code=2)),
-    ), patch(
-        "cardanowall.conformance.__main__.verify_report_to_dict",
-        return_value={"verdict": "failed", "exit_code": 2},
+    with (
+        patch(
+            "cardanowall.conformance.__main__.verify_tx",
+            new=AsyncMock(return_value=_fake_report(verdict="failed", exit_code=2)),
+        ),
+        patch(
+            "cardanowall.conformance.__main__.verify_report_to_dict",
+            return_value={"verdict": "failed", "exit_code": 2},
+        ),
     ):
         assert run([_VALID_TX], io) == 2
 
 
 def test_run_exits_3_on_pending() -> None:
     io = _CapturedIO()
-    with patch(
-        "cardanowall.conformance.__main__.verify_tx",
-        new=AsyncMock(return_value=_fake_report(verdict="pending", exit_code=3)),
-    ), patch(
-        "cardanowall.conformance.__main__.verify_report_to_dict",
-        return_value={"verdict": "pending", "exit_code": 3},
+    with (
+        patch(
+            "cardanowall.conformance.__main__.verify_tx",
+            new=AsyncMock(return_value=_fake_report(verdict="pending", exit_code=3)),
+        ),
+        patch(
+            "cardanowall.conformance.__main__.verify_report_to_dict",
+            return_value={"verdict": "pending", "exit_code": 3},
+        ),
     ):
         assert run([_VALID_TX], io) == 3
 

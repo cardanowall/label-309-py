@@ -1,74 +1,108 @@
+"""Label 309 v1 structural validator (the Part A structural-validation role).
+
+Pure function over the reassembled CBOR record body — performs no I/O, opens
+no socket, verifies no signature cryptographically, decodes no ciphertext.
+Chain resolution, URI fetching, decryption, and confirmation-depth checks are
+the verifier's concern (the Part B role). The transport chunk array is
+reassembled BEFORE this function runs; the carriage codes (``CHUNK_TOO_LARGE``,
+the transport ``MALFORMED_CBOR`` reuse) are emitted by that step, not here.
+
+Pipeline:
+
+- **Step 1** Canonical CBOR decode — every malformed / non-canonical /
+  duplicate-key / indefinite-length input surfaces as the single
+  ``MALFORMED_CBOR`` code.
+- **Step 2** Schema parse — the closed per-field shape gate; each violation
+  lifts to its canonical structural code. A failed parse forecloses the
+  domain pass (there is no typed record to walk).
+- **Step 3** Domain checks — cross-field rules, registry membership, URI
+  shape (the offline CID profile), the encryption-envelope union (typed
+  scheme-1 vs the degrade-to-opaque reading), ``sigs[i]`` COSE_Sign1
+  structural decode, ``crit[]`` shape, exact-integer range enforcement.
+- **Step 4** Result emission — every collected issue is sorted (path
+  segment-wise, registry-order tie-break) and the record is valid iff no
+  error-severity issue is present.
+
+The validator NEVER raises — failure paths route through the discriminated
+``ValidateResult`` union so callers handle errors as data, and its output is
+deterministic for any given ``(bytes, options)`` pair.
+"""
+
 from __future__ import annotations
 
 import re
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import Final, Literal, cast
 
-import cbor2
-
 from cardanowall._crypto.cbor import (
-    CanonicalCborError,
+    CanonicalCborValue,
     decode_canonical_cbor,
+    encode_canonical_cbor,
 )
 from cardanowall._crypto.cose_sign1 import CoseVerifyError, decode_cose_sign1
 
 # The verifier resource bounds the sealed-PoE unwrap layer enforces. Importing
-# the same constants here, rather than re-declaring them, makes the structural
-# validator and the unwrap layer trip the identical thresholds: a divergence is
-# impossible because there is one definition. Both are deployment-pinned
-# reference values, not wire fields.
-from cardanowall._crypto.sealed_poe import (
-    MAX_DECODED_ENVELOPE_BYTES,
-    MAX_SLOTS,
+# the same constants, rather than re-declaring them, makes the structural
+# validator and the unwrap layer default to identical thresholds. Both are
+# deployment-pinned reference values, not wire fields — the validate() options
+# override them per deployment.
+from cardanowall._crypto.sealed_poe import MAX_DECODED_ENVELOPE_BYTES, MAX_SLOTS
+
+from .cid_profile import is_valid_cid
+from .error_codes import SEVERITY, ErrorCode, Severity, error_code_registry_index
+from .schema import (
+    TOP_LEVEL_BASE_KEYS,
+    Argon2Params,
+    PoeRecord,
+    is_extension_key,
 )
 
-from .chunked import bytes_chunk_array_concat, reconstruct_chunked_uri
-from .cid_profile import is_valid_cid
-from .error_codes import SEVERITY, ErrorCode, Severity
-from .schema import PoeRecord
+# =============================================================================
+# Registries (closed catalogue of this implementation)
+# =============================================================================
 
-# Algorithm registries — single source of truth for the closed-catalogue
-# constants enforced by the structural validator.
-
-# Signature-algorithm baseline. `-8` (EdDSA, curve-agnostic; pinned to Ed25519
-# by the record signature construction) is the mandatory baseline; `-19`
-# (Ed25519, fully-specified per RFC 9864) is optional and verified identically
-# under the Ed25519 primitive when accepted. The reference validator accepts
-# both; anything else surfaces as `SIGNATURE_UNSUPPORTED` (info-severity).
-KNOWN_SIG_ALG_IDS: Final[frozenset[int]] = frozenset({-8, -19})
-
-# Content-hash registry. Both v1 algorithms are 32-byte digests.
-HASH_ALGS: Final[dict[str, int]] = {
+# Content-hash algorithm registry. Map value = digest length.
+HASH_ALG_LENGTHS: Final[dict[str, int]] = {
     "sha2-256": 32,
     "blake2b-256": 32,
 }
-CONTENT_HASH_ALGS: Final[frozenset[str]] = frozenset(HASH_ALGS)
 
-# List-commitment registry; disjoint from the content-hash registry.
-MERKLE_COMMIT_ALGS: Final[dict[str, int]] = {"rfc9162-sha256": 32}
+# Merkle list-commitment algorithm registry. Map value = root length.
+MERKLE_COMMIT_ALG_LENGTHS: Final[dict[str, int]] = {"rfc9162-sha256": 32}
 
-# AEAD registry; the closed nonce-length map IS the registry-membership check
-# (membership ↔ key presence).
-AEAD_NONCE_LENGTHS: Final[dict[str, int]] = {"xchacha20-poly1305": 24}
+# Content-format (AEAD) registry. Value = the registered `enc.nonce` length.
+AEAD_NONCE_LENGTHS: Final[dict[str, int]] = {"chacha20-poly1305-stream64k": 24}
 
-# KEM registry, expressed as a per-KEM slot DESCRIPTOR.
-#
-# Each registered KEM pins the exact recipient-slot shape:
+# Unauthenticated-cipher family. An `enc.aead` naming any of these is rejected
+# with `UNAUTHENTICATED_CIPHER_FORBIDDEN` in EVERY role — a forbidden
+# primitive is a recognised hazard, not an unknown identifier, so it never
+# takes the degrade-to-opaque reading. Two arms:
+#   - block-cipher modes with no integrity (`cbc`, `ctr`, `ecb`, `cfb`,
+#     `ofb`) appearing as a delimited token, matching every key-size spelling
+#     (`aes-cbc`, `aes-256-cbc`, `des-ede3-cbc`, …);
+#   - legacy stream/block ciphers as a leading token (`rc4`, `des`, `3des`).
+# The token delimiters keep authenticated AEADs (`aes-256-gcm`,
+# `chacha20-poly1305-stream64k`) from matching.
+UNAUTHENTICATED_CIPHER_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|[-_])(?:cbc|ctr|ecb|cfb|ofb)(?:[-_]|$)|^(?:rc4|des|3des)(?:[-_]|$)",
+    re.IGNORECASE,
+)
+
+# KEM registry, expressed as a per-KEM slot DESCRIPTOR. Each registered KEM
+# pins the exact recipient-slot shape:
 #
 #   - x25519:         `{ epk: bstr(32), wrap: bstr(48) }` — classical
-#     ephemeral-static X25519. The per-slot `epk` is the 32-byte ephemeral
-#     public key.
-#   - mlkem768x25519: `{ kem_ct: <1120-byte X-Wing enc>, wrap: bstr(48) }` —
-#     the X-Wing hybrid (ML-KEM-768 + X25519). The ciphertext is carried as a
-#     chunked byte-string array (`kem_ct`) that MUST reassemble to exactly
-#     1120 bytes; there is NO per-slot `epk` on the hybrid path.
+#     ephemeral-static X25519.
+#   - mlkem768x25519: `{ kem_ct: bstr(1120), wrap: bstr(48) }` — the X-Wing
+#     hybrid; the encapsulation is a SINGLE 1120-byte byte string and there
+#     is NO per-slot `epk` (the X25519 ephemeral is the trailing 32 bytes of
+#     `kem_ct`).
 #
-# A descriptor declares the slot's ciphertext-bearing field (`epk` for a
-# classical KEM, `kem_ct` for a hybrid), its expected reassembled byte length,
-# and the `wrap` length (48 bytes for every KEM — 32-byte CEK + 16-byte AEAD
-# tag). The validator branches on the descriptor's `field` to know which field
-# MUST be present and which MUST be absent, so adding a future KEM is a
-# one-line registry edit, not a new code path.
+# A descriptor declares the slot's ciphertext-bearing field and its exact
+# byte length; `wrap` is 48 bytes for every KEM (32-byte CEK + 16-byte AEAD
+# tag). The validator branches on the descriptor so adding a future KEM is a
+# registry edit, not a new code path.
 
 KemSlotField = Literal["epk", "kem_ct"]
 
@@ -87,69 +121,69 @@ KEM_SLOT_DESCRIPTORS: Final[dict[str, KemSlotDescriptor]] = {
     "mlkem768x25519": KemSlotDescriptor(field="kem_ct", field_length=1120, wrap_length=48),
 }
 
-# The length-mismatch code emitted when a slot's ciphertext-bearing field has
-# the wrong (reassembled) length, keyed by the descriptor's `field`.
 KEM_FIELD_LENGTH_CODE: Final[dict[KemSlotField, ErrorCode]] = {
     "epk": "KEM_EPK_LENGTH_MISMATCH",
     "kem_ct": "KEM_CT_LENGTH_MISMATCH",
 }
 
-# Fixed envelope-field lengths used by the decoded-envelope byte backstop. The
-# nonce is the XChaCha20-Poly1305 nonce (also the AEAD registry value) and
-# `slots_mac` is a SHA-256 MAC; both are pinned by the construction, so the
-# backstop measures the same aggregate the unwrap layer does.
-_NONCE_LENGTH: Final[int] = 24
-_SLOTS_MAC_LENGTH: Final[int] = 32
+# A slot is a closed 2-key map; the universe of keys a slot may ever carry.
+SLOT_KEY_UNIVERSE: Final[frozenset[str]] = frozenset({"epk", "kem_ct", "wrap"})
 
-# Passphrase-KDF registry; pbkdf2-sha-256 is NOT registered (argon2id only).
-PASSPHRASE_ALGS: Final[frozenset[str]] = frozenset({"argon2id"})
+# Passphrase KDF registry.
+PASSPHRASE_KDF_ALGS: Final[frozenset[str]] = frozenset({"argon2id"})
 
-# IANA-registered COSE_Key private-key-material labels (RFC 9052 §7.1). Listed
-# as a set so future labels can be added without touching call sites. `-4` is
-# the private scalar `d` for OKP / EC2 keys; a private key on the public ledger
-# is forbidden, so its presence is a hard structural error.
-COSE_KEY_PRIVATE_MATERIAL_LABELS: Final[frozenset[int]] = frozenset({-4})
+# Signature-algorithm registry: COSE `alg` labels. `-8` (EdDSA, pinned to
+# Ed25519) is the mandatory baseline; `-19` (Ed25519 fully-specified) is
+# verified identically when accepted. Anything else is tagged
+# `SIGNATURE_UNSUPPORTED` (info-severity) — signatures are optional, so an
+# unrecognised algorithm never fails the record by itself.
+KNOWN_SIG_ALG_IDS: Final[frozenset[int]] = frozenset({-8, -19})
 
-# Closed v1 base key sets — the exact set of keys each map may carry.
-REGISTERED_RECORD_KEYS: Final[frozenset[str]] = frozenset(
-    {"v", "items", "merkle", "supersedes", "sigs", "crit"}
-)
-REGISTERED_ITEM_KEYS: Final[frozenset[str]] = frozenset({"hashes", "uris", "enc"})
-REGISTERED_ENC_KEYS: Final[frozenset[str]] = frozenset(
+# Every numeric wire field is a CBOR unsigned integer pinned to this range
+# and handled as an EXACT integer (Python integers are arbitrary precision,
+# so no value is ever rounded through a float before the range check).
+_UINT32_MAX: Final[int] = 0xFFFF_FFFF
+
+# The closed typed-envelope key set and the closed argon2id params key set.
+_ENC_SCHEME1_KEYS: Final[frozenset[str]] = frozenset(
     {"scheme", "aead", "kem", "nonce", "slots", "slots_mac", "passphrase"}
 )
-REGISTERED_PASSPHRASE_KEYS: Final[frozenset[str]] = frozenset({"alg", "salt", "params"})
-REGISTERED_SLOT_KEYS: Final[frozenset[str]] = frozenset({"epk", "kem_ct", "wrap"})
-REGISTERED_SIG_ENTRY_KEYS: Final[frozenset[str]] = frozenset({"cose_sign1", "cose_key"})
-REGISTERED_MERKLE_COMMIT_KEYS: Final[frozenset[str]] = frozenset(
-    {"alg", "root", "leaf_count", "uris"}
-)
+_PASSPHRASE_KEYS: Final[frozenset[str]] = frozenset({"alg", "salt", "params"})
+_ARGON2_PARAM_NAMES: Final[tuple[Literal["m", "t", "p"], ...]] = ("m", "t", "p")
+_ARGON2_FLOORS: Final[dict[str, int]] = {"m": 65_536, "t": 3, "p": 1}
 
-# Extension-key namespace — vendor (`x-…`) and companion-CIP
-# (`<cip>-…`) namespaces are tolerated on the top-level record; the base
-# verifier ships an empty implemented-extensions set so any `crit[]` entry
-# in a well-formed extension namespace surfaces as
-# EXTENSION_UNSUPPORTED_CRITICAL.
-EXTENSION_KEY_REGEX: Final[re.Pattern[str]] = re.compile(r"^(x-.+|[a-z]+-.+)$")
-IMPLEMENTED_EXTENSIONS: Final[frozenset[str]] = frozenset()
+# =============================================================================
+# Options
+# =============================================================================
 
-# Unauthenticated-cipher family. An `enc.aead` naming any of these is rejected
-# with UNAUTHENTICATED_CIPHER_FORBIDDEN (not the generic UNSUPPORTED_AEAD_ALG)
-# so the failure names the integrity hazard. Two arms: block-cipher modes with
-# no integrity (`cbc`, `ctr`, `ecb`, `cfb`, `ofb`) as a delimited token —
-# matching every key-size spelling (`aes-cbc`, `aes-256-cbc`, `des-ede3-cbc`, …)
-# — plus the legacy stream/block ciphers as a leading token (`rc4`, `des`,
-# `3des`). The delimiters keep authenticated AEADs (`aes-256-gcm`,
-# `chacha20-poly1305`, `xchacha20-poly1305`) from matching.
-_UNAUTHENTICATED_CIPHER_REGEX: Final[re.Pattern[str]] = re.compile(
-    r"(^|[-_])(cbc|ctr|ecb|cfb|ofb)([-_]|$)|^(rc4|des|3des)([-_]|$)", re.IGNORECASE
-)
+ValidatorRole = Literal["public", "recipient_or_strict"]
 
-# Closed fetch set — only `ar://` and `ipfs://` are retrievable schemes.
-_ABSOLUTE_URI_REGEX: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.IGNORECASE)
-_PERMITTED_SCHEME_REGEX: Final[re.Pattern[str]] = re.compile(r"^(ar|ipfs)://", re.IGNORECASE)
-_ARWEAVE_TXID_REGEX: Final[re.Pattern[str]] = re.compile(r"^ar://[A-Za-z0-9_-]{43}$")
+# The reference deployment ceiling on Argon2id work factors — a verifier-side
+# denial-of-service backstop (a 64 GiB `m` must not be able to stall a
+# decrypt-on-paste consumer), enforced by default and distinct from the
+# normative floors. Ceilings are deployment policy, not a wire rule: override
+# per deployment, or pass `passphrase_params_ceiling=None` to disable.
+DEFAULT_PASSPHRASE_PARAMS_CEILING: Final[Argon2Params] = {
+    "m": 2_097_152,  # KiB = 2 GiB
+    "t": 16,
+    "p": 8,
+}
 
+_EMPTY_EXTENSION_SET: Final[frozenset[str]] = frozenset()
+
+
+@dataclass(frozen=True)
+class _ResolvedOptions:
+    supported_critical_extensions: frozenset[str]
+    role: ValidatorRole
+    max_slots: int
+    max_enc_envelope_bytes: int
+    passphrase_params_ceiling: Argon2Params | None
+
+
+# =============================================================================
+# Result types
+# =============================================================================
 
 _PathSeg = str | int
 _Path = tuple[_PathSeg, ...]
@@ -157,9 +191,13 @@ _Path = tuple[_PathSeg, ...]
 
 @dataclass(frozen=True)
 class ValidationIssue:
-    """One entry in the validator's result. `severity` defaults to 'error';
-    warnings and info entries appear under the corresponding sequences of
-    `ValidateOk`."""
+    """One entry in the validator's result.
+
+    ``path`` holds segments from the record root: text map keys and integer
+    array indices (e.g. ``("items", 0, "hashes", "sha2-256")``). A dotted
+    string is a display rendering only — the segment tuple is the API form,
+    so map keys containing ``.`` need no escaping.
+    """
 
     code: ErrorCode
     path: _Path
@@ -169,8 +207,8 @@ class ValidationIssue:
 
 @dataclass(frozen=True)
 class ValidateOk:
-    """Returned when zero error-severity issues fired. `warnings` and
-    `info` may still be non-empty (e.g. `SIGNATURE_UNSUPPORTED`)."""
+    """Returned when zero error-severity issues fired. ``warnings`` and
+    ``info`` may still be non-empty (e.g. ``SIGNATURE_UNSUPPORTED``)."""
 
     ok: Literal[True]
     record: PoeRecord
@@ -189,141 +227,149 @@ class ValidateFail:
 ValidateResult = ValidateOk | ValidateFail
 
 
-def validate(cbor_bytes: bytes) -> ValidateResult:
-    """Structural validator. Pure function; performs no I/O.
+# =============================================================================
+# Public entry point
+# =============================================================================
 
-    The validator MUST NOT raise — every failure mode is mapped to an error
-    code in the issue list.
+
+def validate(
+    cbor_bytes: bytes,
+    *,
+    supported_critical_extensions: AbstractSet[str] | None = None,
+    role: ValidatorRole = "public",
+    max_slots: int = MAX_SLOTS,
+    max_enc_envelope_bytes: int = MAX_DECODED_ENVELOPE_BYTES,
+    passphrase_params_ceiling: Argon2Params | None = DEFAULT_PASSPHRASE_PARAMS_CEILING,
+) -> ValidateResult:
+    """Structurally validate one Label 309 record body.
+
+    Options:
+
+    - ``supported_critical_extensions`` — names of the critical extensions
+      this validator implements. Default: the empty set, so a
+      default-configured validator fails every ``crit``-bearing record with
+      ``EXTENSION_UNSUPPORTED_CRITICAL`` — by design.
+    - ``role`` — the validation reading for dual-severity envelope
+      dispositions. ``"public"`` (default): an envelope under an unsupported
+      ``scheme`` / ``kem`` / ``aead`` degrades to opaque and
+      ``ENC_UNSUPPORTED`` is informational. ``"recipient_or_strict"`` (the
+      recipient verifier and strict sealed-crypto mode): the same condition
+      is a hard reject — ``ENC_UNSUPPORTED`` escalates to error and co-fires
+      with the identifier-specific ``UNSUPPORTED_*`` code.
+    - ``max_slots`` — slot-count resource bound (reference bound 1024).
+    - ``max_enc_envelope_bytes`` — decoded-envelope byte resource bound
+      (reference bound 65536), measured by canonically re-encoding the
+      decoded ``enc`` subtree.
+    - ``passphrase_params_ceiling`` — upper policy ceiling on Argon2id
+      parameters (``ENC_PASSPHRASE_PARAMS_EXCEED_POLICY``). Defaults to
+      :data:`DEFAULT_PASSPHRASE_PARAMS_CEILING`; ``None`` disables it.
     """
-    # Step 2 — canonical CBOR decode. Every decode failure — malformed bytes,
-    # indefinite-length encodings, non-canonical (unsorted) map-key ordering,
-    # duplicate map keys, non-minimal ints, invalid UTF-8 — surfaces as the
-    # single MALFORMED_CBOR code per the Label 309 taxonomy (no separate code).
+    opts = _ResolvedOptions(
+        supported_critical_extensions=(
+            frozenset(supported_critical_extensions)
+            if supported_critical_extensions is not None
+            else _EMPTY_EXTENSION_SET
+        ),
+        role=role,
+        max_slots=max_slots,
+        max_enc_envelope_bytes=max_enc_envelope_bytes,
+        passphrase_params_ceiling=passphrase_params_ceiling,
+    )
+
+    # Step 1 — canonical CBOR decode. Every decode failure surfaces as the
+    # single MALFORMED_CBOR code: malformed/truncated bytes, indefinite-length
+    # (streaming) encodings, non-canonical map-key ordering, duplicate map
+    # keys, floats/simple values, and invalid UTF-8. There is no separate
+    # duplicate-key code — canonical-decode rejection covers it.
     try:
         decoded = decode_canonical_cbor(cbor_bytes)
-    except CanonicalCborError as cause:
+    except Exception as cause:
         return ValidateFail(
             ok=False,
-            issues=(_issue((), "MALFORMED_CBOR", f"cbor decode failed: {cause}"),),
-        )
-    except Exception as cause:  # pragma: no cover — defensive
-        return ValidateFail(
-            ok=False,
-            issues=(_issue((), "MALFORMED_CBOR", f"cbor decode failed: {cause}"),),
+            issues=(_issue("MALFORMED_CBOR", (), f"cbor decode failed: {cause}"),),
         )
 
+    # Step 2 pre-guard — non-text map keys. Every map at a typed grammar
+    # position is text-keyed; a map carrying any non-text key cannot be read
+    # by the field schema at all, so the violation is detected here and
+    # attributed at the containing map as SCHEMA_TYPE_MISMATCH, foreclosing
+    # the parse the same way any other unparseable shape does.
+    non_text_key_issues = _collect_non_text_key_map_issues(decoded)
+    if non_text_key_issues:
+        return ValidateFail(ok=False, issues=tuple(_sort_issues(non_text_key_issues)))
+
+    # Step 2 — schema parse. A failed parse forecloses the domain pass (there
+    # is no typed record to walk); its issues are emitted sorted.
+    schema_issues = _schema_parse(decoded)
+    if schema_issues:
+        return ValidateFail(ok=False, issues=tuple(_sort_issues(schema_issues)))
+
+    # Step 3 — domain checks. Issues of every severity are collected together;
+    # no error-severity issue stops the walk.
+    record_map = cast("dict[str, object]", decoded)
     issues: list[ValidationIssue] = []
-    warnings: list[ValidationIssue] = []
-    info: list[ValidationIssue] = []
 
-    if not isinstance(decoded, dict):
-        return ValidateFail(
-            ok=False,
-            issues=(_issue((), "SCHEMA_TYPE_MISMATCH", "top-level value must be a CBOR map"),),
-        )
+    _check_content_commitment_presence(record_map, issues)
 
-    record_map = cast(dict[object, object], decoded)
+    # `crit[]` shape rules run before the per-entry support check.
+    _check_crit(record_map, opts.supported_critical_extensions, issues)
 
-    # Step 3 — top-level key gate (closed base + extension-key tolerance).
-    extensions = _check_record_top_level_keys(record_map, issues, info)
-    del extensions  # currently informational only
+    # Unknown top-level fields: keys outside the base set that match neither
+    # extension-key namespace (typos, control-character keys).
+    for key in record_map:
+        if key in TOP_LEVEL_BASE_KEYS or is_extension_key(key):
+            continue
+        issues.append(_issue("SCHEMA_UNKNOWN_FIELD", (key,), f"unknown top-level field: {key}"))
 
-    # Step 3 / 4 — required `v` literal.
-    if "v" not in record_map:
-        issues.append(_issue(("v",), "SCHEMA_MISSING_REQUIRED", "missing required field 'v'"))
-    else:
-        v_val = record_map["v"]
-        # `v` MUST be the unsigned integer 1. Reject CBOR floats explicitly:
-        # Python's `1.0 == 1` would otherwise silently accept a malformed
-        # major-type-7 float record.
-        if not isinstance(v_val, int) or isinstance(v_val, bool) or v_val != 1:
+    items = record_map.get("items")
+    if isinstance(items, list):
+        for i, item in enumerate(items):
+            item_map = cast("dict[str, object]", item)
+            _check_item_hashes(item_map, i, issues)
+            uris = item_map.get("uris")
+            if uris is not None:
+                _check_uris(cast("list[object]", uris), ("items", i, "uris"), issues)
+            if "enc" in item_map:
+                _check_item_enc(item_map, i, opts, issues)
+
+    merkle = record_map.get("merkle")
+    if isinstance(merkle, list):
+        for i, commit in enumerate(merkle):
+            _check_merkle_commit(cast("dict[str, object]", commit), i, issues)
+
+    sigs = record_map.get("sigs")
+    if isinstance(sigs, list):
+        if len(sigs) == 0:
             issues.append(
-                _issue(
-                    ("v",),
-                    "SCHEMA_INVALID_LITERAL",
-                    "v must be the unsigned integer 1",
-                )
+                _issue("SCHEMA_TYPE_MISMATCH", ("sigs",), "sigs[] must be non-empty when present")
             )
+        for i, entry in enumerate(sigs):
+            _check_sig_entry(cast("dict[str, object]", entry), i, issues)
 
-    has_items_key = "items" in record_map
-    has_merkle_key = "merkle" in record_map
-    items_non_empty = False
-    merkle_non_empty = False
-
-    if has_items_key:
-        items_raw = record_map["items"]
-        if not isinstance(items_raw, list):
-            issues.append(_issue(("items",), "SCHEMA_TYPE_MISMATCH", "items must be an array"))
-        elif len(items_raw) == 0:
-            # An empty `items` field without a non-empty `merkle` violates the
-            # content-commitment rule; surface as SCHEMA_EMPTY_RECORD when
-            # there is also no merkle, otherwise SCHEMA_TYPE_MISMATCH (the
-            # array is present but unusable). Combined with the post-loop
-            # check below, the net effect matches the spec: a record with
-            # zero content commitments fails with SCHEMA_EMPTY_RECORD.
-            pass
-        else:
-            items_non_empty = True
-            for i, item in enumerate(items_raw):
-                _validate_item_entry(item, ("items", i), issues)
-
-    if has_merkle_key:
-        merkle_raw = record_map["merkle"]
-        if not isinstance(merkle_raw, list):
-            issues.append(_issue(("merkle",), "SCHEMA_TYPE_MISMATCH", "merkle must be an array"))
-        elif len(merkle_raw) == 0:
-            pass
-        else:
-            merkle_non_empty = True
-            for i, commit in enumerate(merkle_raw):
-                _validate_merkle_commit(commit, ("merkle", i), issues)
-
-    # Content-commitment rule: a record MUST commit to content via at least one
-    # non-empty `items[]` or `merkle[]` — an empty record proves nothing.
-    if not items_non_empty and not merkle_non_empty:
-        issues.append(
-            _issue(
-                (),
-                "SCHEMA_EMPTY_RECORD",
-                "record carries neither `items` (>=1 entry) nor `merkle` (>=1 entry); "
-                "at least one MUST be present",
-            )
-        )
-
-    # Step 4h — supersedes length.
-    if "supersedes" in record_map:
-        _validate_supersedes(record_map["supersedes"], ("supersedes",), issues)
-
-    # Step 4j — crit[] shape rules.
-    if "crit" in record_map:
-        _validate_crit(record_map, issues)
-
-    # Step 4f / 4g — sig-entry shape + COSE_Sign1 structural decode.
-    if "sigs" in record_map:
-        _validate_sigs(record_map["sigs"], issues, info)
-
-    # Step 5 — result emission.
-    if issues:
-        issues.sort(key=_path_key)
-        return ValidateFail(ok=False, issues=tuple(issues))
-
-    record = cast(PoeRecord, record_map)
-    info.sort(key=_path_key)
-    warnings.sort(key=_path_key)
+    # Step 4 — result emission. The full issue list is sorted once (path
+    # segment-wise, registry-order tie-break); the record is valid iff no
+    # error-severity issue is present, and warnings / info never fail it.
+    sorted_issues = _sort_issues(issues)
+    if any(issue.severity == "error" for issue in sorted_issues):
+        return ValidateFail(ok=False, issues=tuple(sorted_issues))
+    warnings = tuple(issue for issue in sorted_issues if issue.severity == "warning")
+    info = tuple(issue for issue in sorted_issues if issue.severity == "info")
     return ValidateOk(
         ok=True,
-        record=record,
-        info=tuple(info),
-        warnings=tuple(warnings),
+        record=cast("PoeRecord", record_map),
+        info=info,
+        warnings=warnings,
     )
 
 
-# --- Internal helpers ------------------------------------------------------
+# =============================================================================
+# Issue construction and deterministic ordering
+# =============================================================================
 
 
 def _issue(
-    path: _Path,
     code: ErrorCode,
+    path: _Path,
     message: str,
     severity: Severity | None = None,
 ) -> ValidationIssue:
@@ -335,1249 +381,1389 @@ def _issue(
     )
 
 
-def _path_key(issue: ValidationIssue) -> str:
-    return ".".join(str(s) for s in issue.path)
+def _segment_sort_key(seg: _PathSeg) -> tuple[int, int, bytes]:
+    # Integer segments order before text segments where the kinds differ;
+    # integers compare numerically; text compares by UTF-8 bytes — the only
+    # collation that is byte-stable across runs and across language
+    # implementations (no locale tables, no UTF-16 code-unit artefacts).
+    if isinstance(seg, int):
+        return (0, seg, b"")
+    return (1, 0, seg.encode("utf-8"))
 
 
-def _check_unknown_keys(
-    obj: dict[object, object],
-    allowed: frozenset[str],
-    path: _Path,
-    issues: list[ValidationIssue],
-    label: str,
-) -> None:
-    for k in obj:
-        if not isinstance(k, str) or k not in allowed:
+def _issue_sort_key(
+    issue: ValidationIssue,
+) -> tuple[tuple[tuple[int, int, bytes], ...], int]:
+    # Segment-wise path order with a strict prefix ordering before its
+    # extensions (tuple comparison gives prefix-first for free), then the
+    # registry-position tie-break for issues on an identical path.
+    return (
+        tuple(_segment_sort_key(seg) for seg in issue.path),
+        error_code_registry_index(issue.code),
+    )
+
+
+def _sort_issues(issues: list[ValidationIssue]) -> list[ValidationIssue]:
+    return sorted(issues, key=_issue_sort_key)
+
+
+# =============================================================================
+# Step 2 pre-guard — non-text map keys at the typed grammar positions
+# =============================================================================
+#
+# Walks the positions reachable from the record root: the root map, each
+# `items[i]` / `merkle[i]` / `sigs[i]` entry, and the `hashes` / `enc` maps
+# inside an item. Positions inside extension values are deliberately NOT
+# walked — extension values admit any CBOR value the canonical profile
+# allows, integer-keyed maps included. The interior of a supported `enc`
+# envelope is scanned by the envelope dispatch itself (the opaque reading
+# likewise admits arbitrary extension values).
+
+_NON_TEXT_KEY_MESSAGE: Final[str] = (
+    "CBOR map carries a non-text key where a text-keyed map is required"
+)
+
+
+def _has_non_text_key(value: object) -> bool:
+    return isinstance(value, dict) and any(
+        not isinstance(k, str) for k in cast("dict[object, object]", value)
+    )
+
+
+def _collect_non_text_key_map_issues(decoded: object) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+
+    def flag(path: _Path) -> None:
+        issues.append(_issue("SCHEMA_TYPE_MISMATCH", path, _NON_TEXT_KEY_MESSAGE))
+
+    if _has_non_text_key(decoded):
+        flag(())
+        return issues
+    if not isinstance(decoded, dict):
+        return issues
+    record = cast("dict[str, object]", decoded)
+    for field in ("items", "merkle", "sigs"):
+        entries = record.get(field)
+        if not isinstance(entries, list):
+            continue
+        for i, entry in enumerate(entries):
+            if _has_non_text_key(entry):
+                flag((field, i))
+                continue
+            if field != "items" or not isinstance(entry, dict):
+                continue
+            item = cast("dict[str, object]", entry)
+            if _has_non_text_key(item.get("hashes")):
+                flag((field, i, "hashes"))
+            if _has_non_text_key(item.get("enc")):
+                flag((field, i, "enc"))
+    return issues
+
+
+# =============================================================================
+# Step 2 — schema parse (the closed per-field shape gate)
+# =============================================================================
+#
+# Enforces per-field CBOR types, the fixed byte lengths a field can assert in
+# isolation (32-byte `supersedes`, 32-byte `slots_mac`, the 16..64-byte
+# passphrase salt), closed-map invariants (`items[i]`, `merkle[i]`,
+# `sigs[i]`), and the `v == 1` literal. Cross-field rules (content-hash
+# binding under `enc`, slots/passphrase exclusivity, `crit[]` shape, registry
+# membership of algorithm identifiers, COSE_Sign1 structural decode, URI
+# shape, non-empty-array rules, integer ranges) fire in the domain pass so
+# each violation emits its precise canonical code rather than a generic
+# schema mismatch. `enc` is NOT parsed here — the envelope is a union whose
+# disposition (typed scheme-1 vs opaque) depends on identifier support, so
+# the domain pass dispatches it.
+
+
+def _is_uint(value: object) -> bool:
+    # A CBOR unsigned integer as the canonical decoder surfaces it. A `bool`
+    # is a distinct CBOR major type and is never a uint; a negative value is
+    # a different major type as well.
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _schema_parse(decoded: object) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    if not isinstance(decoded, dict):
+        issues.append(_issue("SCHEMA_TYPE_MISMATCH", (), "top-level value must be a CBOR map"))
+        return issues
+    record = cast("dict[str, object]", decoded)
+
+    if "v" not in record:
+        issues.append(_issue("SCHEMA_MISSING_REQUIRED", ("v",), "missing required field 'v'"))
+    else:
+        v = record["v"]
+        if not (isinstance(v, int) and not isinstance(v, bool) and v == 1):
             issues.append(
-                _issue(
-                    (*path, str(k)),
-                    "SCHEMA_UNKNOWN_FIELD",
-                    f"unknown {label} field: {k!r}",
-                )
+                _issue("SCHEMA_INVALID_LITERAL", ("v",), "v must be the unsigned integer 1")
             )
 
+    items = record.get("items")
+    if items is not None:
+        if not isinstance(items, list):
+            issues.append(_issue("SCHEMA_TYPE_MISMATCH", ("items",), "items must be an array"))
+        else:
+            for i, item in enumerate(items):
+                _schema_parse_item(item, ("items", i), issues)
 
-def _check_record_top_level_keys(
-    record: dict[object, object],
-    issues: list[ValidationIssue],
-    info: list[ValidationIssue],
-) -> list[str]:
-    """Validate the top-level keys: a closed base set plus tolerated extension
-    namespaces. Returns the list of recognised extension-key names so the caller
-    can drive crit enforcement.
-    """
-    extensions: list[str] = []
-    for k in record:
-        if not isinstance(k, str):
+    merkle = record.get("merkle")
+    if merkle is not None:
+        if not isinstance(merkle, list):
+            issues.append(_issue("SCHEMA_TYPE_MISMATCH", ("merkle",), "merkle must be an array"))
+        else:
+            for i, commit in enumerate(merkle):
+                _schema_parse_merkle_commit(commit, ("merkle", i), issues)
+
+    supersedes = record.get("supersedes")
+    if supersedes is not None:
+        if not isinstance(supersedes, bytes):
             issues.append(
                 _issue(
-                    (str(k),),
                     "SCHEMA_TYPE_MISMATCH",
-                    f"top-level key {k!r} must be a text string",
+                    ("supersedes",),
+                    "supersedes must be a CBOR byte string (32-byte transaction hash)",
                 )
             )
-            continue
-        if k in REGISTERED_RECORD_KEYS:
-            continue
-        if EXTENSION_KEY_REGEX.match(k):
-            extensions.append(k)
-            info.append(
+        elif len(supersedes) != 32:
+            issues.append(
                 _issue(
-                    (k,),
-                    "OUT_OF_PROFILE_SKIPPED",
-                    f"top-level extension key {k!r} preserved but not interpreted by base verifier",
-                    severity="info",
+                    "SUPERSEDES_TX_INVALID_LENGTH",
+                    ("supersedes",),
+                    f"supersedes length {len(supersedes)} != 32",
                 )
+            )
+
+    sigs = record.get("sigs")
+    if sigs is not None:
+        if not isinstance(sigs, list):
+            issues.append(_issue("SCHEMA_TYPE_MISMATCH", ("sigs",), "sigs must be an array"))
+        else:
+            for i, entry in enumerate(sigs):
+                _schema_parse_sig_entry(entry, ("sigs", i), issues)
+
+    crit = record.get("crit")
+    if crit is not None:
+        if not isinstance(crit, list):
+            issues.append(_issue("SCHEMA_TYPE_MISMATCH", ("crit",), "crit must be an array"))
+        else:
+            for i, name in enumerate(crit):
+                if not isinstance(name, str):
+                    issues.append(
+                        _issue(
+                            "SCHEMA_TYPE_MISMATCH",
+                            ("crit", i),
+                            "crit[] entries must be text strings",
+                        )
+                    )
+
+    return issues
+
+
+def _schema_parse_item(item: object, path: _Path, issues: list[ValidationIssue]) -> None:
+    if not isinstance(item, dict):
+        issues.append(_issue("SCHEMA_TYPE_MISMATCH", path, "item entry must be a CBOR map"))
+        return
+    item_map = cast("dict[str, object]", item)
+
+    # items[i] is a CLOSED map {hashes, ? uris, ? enc}.
+    for key in item_map:
+        if key not in ("hashes", "uris", "enc"):
+            issues.append(
+                _issue(
+                    "SCHEMA_UNKNOWN_FIELD",
+                    (*path, key),
+                    f"unrecognized key '{key}' in a closed map",
+                )
+            )
+
+    if "hashes" not in item_map:
+        issues.append(
+            _issue("SCHEMA_MISSING_REQUIRED", (*path, "hashes"), "item.hashes is required")
+        )
+    else:
+        hashes = item_map["hashes"]
+        if not isinstance(hashes, dict):
+            issues.append(
+                _issue("SCHEMA_TYPE_MISMATCH", (*path, "hashes"), "hashes must be a CBOR map")
             )
         else:
+            for alg, digest in cast("dict[str, object]", hashes).items():
+                if not isinstance(digest, bytes):
+                    issues.append(
+                        _issue(
+                            "SCHEMA_TYPE_MISMATCH",
+                            (*path, "hashes", alg),
+                            f"hashes['{alg}'] must be a CBOR byte string",
+                        )
+                    )
+
+    uris = item_map.get("uris")
+    if uris is not None:
+        _schema_parse_uris(uris, (*path, "uris"), issues)
+
+    # `enc` is captured untyped: the envelope union is dispatched by the
+    # domain pass on identifier support, never by shape success here.
+
+
+def _schema_parse_uris(uris: object, path: _Path, issues: list[ValidationIssue]) -> None:
+    if not isinstance(uris, list):
+        issues.append(_issue("SCHEMA_TYPE_MISMATCH", path, "uris must be an array"))
+        return
+    for i, uri in enumerate(uris):
+        if not isinstance(uri, str):
             issues.append(
                 _issue(
-                    (k,),
-                    "SCHEMA_UNKNOWN_FIELD",
-                    f"unknown record field: {k!r}",
+                    "SCHEMA_TYPE_MISMATCH",
+                    (*path, i),
+                    "each URI is one absolute URI in a single text string",
                 )
             )
-    return extensions
 
 
-def _validate_item_entry(
-    item: object,
-    path: _Path,
-    issues: list[ValidationIssue],
-) -> None:
-    if not isinstance(item, dict):
-        issues.append(_issue(path, "SCHEMA_TYPE_MISMATCH", "item entry must be a map"))
+def _schema_parse_merkle_commit(commit: object, path: _Path, issues: list[ValidationIssue]) -> None:
+    if not isinstance(commit, dict):
+        issues.append(_issue("SCHEMA_TYPE_MISMATCH", path, "merkle entry must be a CBOR map"))
         return
-    item_map = cast(dict[object, object], item)
-    _check_unknown_keys(item_map, REGISTERED_ITEM_KEYS, path, issues, "item")
+    commit_map = cast("dict[str, object]", commit)
 
-    hashes_raw = item_map.get("hashes")
-    if not isinstance(hashes_raw, dict) or len(hashes_raw) == 0:
+    for key in commit_map:
+        if key not in ("alg", "root", "leaf_count", "uris"):
+            issues.append(
+                _issue(
+                    "SCHEMA_UNKNOWN_FIELD",
+                    (*path, key),
+                    f"unrecognized key '{key}' in a closed map",
+                )
+            )
+
+    if "alg" not in commit_map:
+        issues.append(
+            _issue("SCHEMA_MISSING_REQUIRED", (*path, "alg"), "merkle entry `alg` is required")
+        )
+    elif not isinstance(commit_map["alg"], str):
         issues.append(
             _issue(
-                (*path, "hashes"),
                 "SCHEMA_TYPE_MISMATCH",
+                (*path, "alg"),
+                "merkle entry `alg` must be a text string",
+            )
+        )
+
+    if "root" not in commit_map:
+        issues.append(
+            _issue("SCHEMA_MISSING_REQUIRED", (*path, "root"), "merkle entry `root` is required")
+        )
+    elif not isinstance(commit_map["root"], bytes):
+        issues.append(
+            _issue(
+                "SCHEMA_TYPE_MISMATCH",
+                (*path, "root"),
+                "merkle entry `root` must be a CBOR byte string",
+            )
+        )
+
+    if "leaf_count" not in commit_map:
+        issues.append(
+            _issue(
+                "SCHEMA_MISSING_REQUIRED",
+                (*path, "leaf_count"),
+                "merkle entry `leaf_count` is required",
+            )
+        )
+    elif isinstance(commit_map["leaf_count"], bool) or not isinstance(
+        commit_map["leaf_count"], int
+    ):
+        issues.append(
+            _issue(
+                "SCHEMA_TYPE_MISMATCH",
+                (*path, "leaf_count"),
+                "merkle entry `leaf_count` must be a CBOR integer",
+            )
+        )
+
+    uris = commit_map.get("uris")
+    if uris is not None:
+        _schema_parse_uris(uris, (*path, "uris"), issues)
+
+
+def _schema_parse_sig_entry(entry: object, path: _Path, issues: list[ValidationIssue]) -> None:
+    # The sig-entry closed-map rule owns every shape violation inside a
+    # `sigs[i]` entry: a non-map entry, a missing/`non-bstr` `cose_sign1`, a
+    # non-bstr `cose_key`, and any stray key all carry SIG_ENTRY_INVALID_SHAPE.
+    if not isinstance(entry, dict):
+        issues.append(
+            _issue(
+                "SIG_ENTRY_INVALID_SHAPE",
+                path,
+                "each sigs entry must be a CBOR map { cose_sign1, ? cose_key }",
+            )
+        )
+        return
+    entry_map = cast("dict[str, object]", entry)
+
+    for key in entry_map:
+        if key not in ("cose_sign1", "cose_key"):
+            issues.append(
+                _issue(
+                    "SIG_ENTRY_INVALID_SHAPE",
+                    (*path, key),
+                    f"unrecognized key '{key}' in a closed map",
+                )
+            )
+
+    if "cose_sign1" not in entry_map:
+        issues.append(
+            _issue(
+                "SIG_ENTRY_INVALID_SHAPE",
+                (*path, "cose_sign1"),
+                "sigs entry is missing required 'cose_sign1'",
+            )
+        )
+    elif not isinstance(entry_map["cose_sign1"], bytes):
+        issues.append(
+            _issue(
+                "SIG_ENTRY_INVALID_SHAPE",
+                (*path, "cose_sign1"),
+                "sigs[i].cose_sign1 must be a single CBOR byte string",
+            )
+        )
+
+    cose_key = entry_map.get("cose_key")
+    if cose_key is not None and not isinstance(cose_key, bytes):
+        issues.append(
+            _issue(
+                "SIG_ENTRY_INVALID_SHAPE",
+                (*path, "cose_key"),
+                "sigs[i].cose_key must be a single CBOR byte string",
+            )
+        )
+
+
+# =============================================================================
+# Step 3 helpers — domain checks
+# =============================================================================
+
+
+def _check_content_commitment_presence(
+    record: dict[str, object], issues: list[ValidationIssue]
+) -> None:
+    # Content-commitment rule: a record MUST carry at least one of `items[]`
+    # or `merkle[]` non-empty (SCHEMA_EMPTY_RECORD when both are empty or
+    # absent). When exactly one of them is present-but-empty beside a
+    # non-empty sibling, the empty array itself violates its `1*` cardinality.
+    items = record.get("items")
+    merkle = record.get("merkle")
+    items_len = len(items) if isinstance(items, list) else 0
+    merkle_len = len(merkle) if isinstance(merkle, list) else 0
+    if items_len == 0 and merkle_len == 0:
+        issues.append(
+            _issue(
+                "SCHEMA_EMPTY_RECORD",
+                (),
+                "record must carry at least one of items[] or merkle[] non-empty",
+            )
+        )
+        return
+    if isinstance(items, list) and items_len == 0:
+        issues.append(
+            _issue("SCHEMA_TYPE_MISMATCH", ("items",), "items[] must be non-empty when present")
+        )
+    if isinstance(merkle, list) and merkle_len == 0:
+        issues.append(
+            _issue("SCHEMA_TYPE_MISMATCH", ("merkle",), "merkle[] must be non-empty when present")
+        )
+
+
+def _check_item_hashes(item: dict[str, object], idx: int, issues: list[ValidationIssue]) -> None:
+    # Hash-map: non-empty, registry membership, per-algorithm digest length.
+    hashes = cast("dict[str, bytes]", item["hashes"])
+    if len(hashes) == 0:
+        issues.append(
+            _issue(
+                "SCHEMA_TYPE_MISMATCH",
+                ("items", idx, "hashes"),
                 "hashes must be a non-empty CBOR map of <alg-id> -> <digest>",
             )
         )
-    else:
-        hashes_map = cast(dict[object, object], hashes_raw)
-        for alg_key, digest in hashes_map.items():
-            _validate_hash_map_entry(alg_key, digest, (*path, "hashes", str(alg_key)), issues)
-
-    has_enc = "enc" in item_map
-
-    if "uris" in item_map:
-        _validate_item_uris(item_map["uris"], (*path, "uris"), issues)
-
-    if has_enc:
-        # Content-hash pre-check: every `enc`-bearing item's hashes map MUST
-        # carry at least one content-hash entry, otherwise a decrypted plaintext
-        # could not be bound to any claimed digest. Fires BEFORE inner enc-shape
-        # validation so the more fundamental defect is reported first.
-        if isinstance(hashes_raw, dict) and not any(
-            isinstance(k, str) and k in CONTENT_HASH_ALGS for k in hashes_raw
-        ):
+        return
+    for alg, digest in hashes.items():
+        if alg not in HASH_ALG_LENGTHS:
             issues.append(
                 _issue(
-                    (*path, "enc"),
-                    "ENC_REQUIRES_CONTENT_HASH",
-                    "item carries `enc` but `hashes` has no content-hash entry "
-                    "(sha2-256 or blake2b-256)",
+                    "UNSUPPORTED_HASH_ALG",
+                    ("items", idx, "hashes", alg),
+                    f"unknown hash alg: {alg}",
                 )
             )
-        else:
-            _validate_encryption(item_map["enc"], (*path, "enc"), issues)
-
-
-def _validate_hash_map_entry(
-    alg: object,
-    digest: object,
-    path: _Path,
-    issues: list[ValidationIssue],
-) -> None:
-    """Validate one (alg → digest) entry of the `hashes` CBOR map.
-
-    Duplicate algorithms are impossible by CBOR map-key uniqueness (RFC 8949
-    §3.1); canonical decode rejects duplicates as MALFORMED_CBOR upstream.
-    """
-    if not isinstance(alg, str) or alg not in HASH_ALGS:
-        issues.append(_issue(path, "UNSUPPORTED_HASH_ALG", f"unknown hash alg: {alg!r}"))
-        return
-    if not isinstance(digest, (bytes, bytearray)):
-        issues.append(
-            _issue(
-                path,
-                "SCHEMA_TYPE_MISMATCH",
-                f"hashes[{alg!r}] value must be CBOR bytes",
-            )
-        )
-        return
-    expected = HASH_ALGS[alg]
-    if len(digest) != expected:
-        issues.append(
-            _issue(
-                path,
-                "HASH_DIGEST_LENGTH_MISMATCH",
-                f"hashes[{alg!r}] digest length {len(digest)} != {expected}",
-            )
-        )
-
-
-def _validate_item_uris(raw: object, path: _Path, issues: list[ValidationIssue]) -> None:
-    if not isinstance(raw, list) or len(raw) == 0:
-        issues.append(
-            _issue(
-                path,
-                "SCHEMA_TYPE_MISMATCH",
-                "uris must be a non-empty array of chunked-tstr-arrays",
-            )
-        )
-        return
-    for ui, chunks in enumerate(raw):
-        _validate_one_uri(chunks, (*path, ui), issues)
-
-
-def _validate_one_uri(chunks: object, path: _Path, issues: list[ValidationIssue]) -> None:
-    if not isinstance(chunks, list) or len(chunks) == 0:
-        issues.append(
-            _issue(
-                path,
-                "SCHEMA_TYPE_MISMATCH",
-                "each URI must be a non-empty array of tstr chunks (<=64B each)",
-            )
-        )
-        return
-    typed_chunks: list[str] = []
-    type_ok = True
-    for ci, chunk in enumerate(chunks):
-        if not isinstance(chunk, str):
-            issues.append(
-                _issue(
-                    (*path, ci),
-                    "SCHEMA_TYPE_MISMATCH",
-                    "chunked-tstr element must be a text string",
-                )
-            )
-            type_ok = False
             continue
-        chunk_byte_len = len(chunk.encode("utf-8"))
-        if chunk_byte_len < 1 or chunk_byte_len > 64:
+        expected = HASH_ALG_LENGTHS[alg]
+        if len(digest) != expected:
             issues.append(
                 _issue(
-                    (*path, ci),
-                    "CHUNK_TOO_LARGE",
-                    f"chunk length {chunk_byte_len} not in [1, 64]",
+                    "HASH_DIGEST_LENGTH_MISMATCH",
+                    ("items", idx, "hashes", alg),
+                    f"hashes['{alg}'] digest length {len(digest)} != {expected}",
                 )
             )
-            type_ok = False
-            continue
-        typed_chunks.append(chunk)
-    if not type_ok:
-        return
-    ok, reconstructed, err_code = reconstruct_chunked_uri(typed_chunks)
-    if not ok or reconstructed is None:
+
+
+def _check_uris(uris: list[object], base_path: _Path, issues: list[ValidationIssue]) -> None:
+    # URI shape: each entry is one absolute URI in a single text string.
+    if len(uris) == 0:
         issues.append(
-            _issue(
-                path,
-                cast(ErrorCode, err_code if err_code is not None else "INVALID_URI"),
-                "URI chunk reconstruction failed",
-            )
+            _issue("SCHEMA_TYPE_MISMATCH", base_path, "uris[] must be non-empty when present")
         )
         return
-    if "#" in reconstructed:
+    for i, uri in enumerate(uris):
+        _check_one_uri(cast("str", uri), (*base_path, i), issues)
+
+
+_URI_SCHEME_RE: Final[re.Pattern[str]] = re.compile(r"\A[a-z][a-z0-9+.\-]*\Z", re.IGNORECASE)
+_ARWEAVE_TXID_BODY_RE: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9_-]{43}\Z")
+
+
+def _check_one_uri(uri: str, path: _Path, issues: list[ValidationIssue]) -> None:
+    # Absolute URI, no fragment, scheme in `{ar://, ipfs://}`.
+    if "#" in uri:
         issues.append(
             _issue(
-                path,
                 "INVALID_URI",
+                path,
                 "URI contains a fragment identifier ('#'), which is forbidden",
             )
         )
         return
-    if not _ABSOLUTE_URI_REGEX.match(reconstructed):
+    sep_idx = uri.find("://")
+    if sep_idx <= 0 or _URI_SCHEME_RE.match(uri[:sep_idx]) is None:
         issues.append(
-            _issue(
-                path,
-                "INVALID_URI",
-                "URI is not absolute (missing scheme://hierarchical-part)",
-            )
+            _issue("INVALID_URI", path, "URI is not absolute (missing scheme://hierarchical-part)")
         )
         return
-    scheme_match = _PERMITTED_SCHEME_REGEX.match(reconstructed)
-    if not scheme_match:
-        issues.append(
-            _issue(
-                path,
-                "INVALID_URI",
-                "unsupported URI scheme; v1 PoE URI set is {ar://, ipfs://}",
-            )
-        )
-        return
-    # RFC 3986 §3.1: the scheme is case-insensitive, the rest of the URI is not.
-    # Fold ONLY the scheme to lowercase so the body (txid / CID / host) is
-    # always shape-checked — never lowercase the txid or CID itself.
-    scheme = reconstructed[: scheme_match.end()].lower()
-    body = reconstructed[scheme_match.end() :]
-    if scheme == "ar://":
-        if not _ARWEAVE_TXID_REGEX.match(scheme + body):
+    # RFC 3986 §3.1: the scheme is case-insensitive, so case-fold the SCHEME
+    # ONLY, then ALWAYS validate the body. The body is matched verbatim — a
+    # base64url Arweave txid and a base58btc CID are case-significant.
+    scheme = uri[:sep_idx].lower()
+    rest = uri[sep_idx + len("://") :]
+    if scheme == "ar":
+        if _ARWEAVE_TXID_BODY_RE.match(rest) is None:
             issues.append(
                 _issue(
-                    path,
                     "INVALID_URI",
+                    path,
                     "ar:// URI does not match `^ar://[A-Za-z0-9_-]{43}$` "
                     "(43-char base64url txid, no path/query/fragment)",
                 )
             )
-    elif scheme == "ipfs://":
-        cid = body.split("/", 1)[0]
+        return
+    if scheme == "ipfs":
+        # Full offline CID parse (not a prefix heuristic).
+        cid = rest.split("/", 1)[0]
         if not is_valid_cid(cid):
             issues.append(
                 _issue(
-                    path,
                     "INVALID_URI",
+                    path,
                     "ipfs:// URI is not a valid CID under the Label 309 profile",
                 )
             )
-
-
-def _validate_encryption(enc: object, path: _Path, issues: list[ValidationIssue]) -> None:
-    if not isinstance(enc, dict):
-        issues.append(_issue(path, "SCHEMA_TYPE_MISMATCH", "enc must be a map"))
         return
-    enc_map = cast(dict[object, object], enc)
-    _check_unknown_keys(enc_map, REGISTERED_ENC_KEYS, path, issues, "enc")
+    issues.append(
+        _issue("INVALID_URI", path, "unsupported URI scheme; v1 PoE URI set is {ar://, ipfs://}")
+    )
 
-    # `scheme` is the envelope-level version and MUST be exactly the integer 1.
-    # Reject CBOR floats explicitly (1.0 == 1 in Python).
-    scheme = enc_map.get("scheme")
-    if not isinstance(scheme, int) or isinstance(scheme, bool) or scheme != 1:
+
+# =============================================================================
+# Encryption envelope — the typed-vs-opaque union
+# =============================================================================
+#
+# `enc = enc-scheme-1 / enc-opaque`. The disposition is decided by identifier
+# support, never by shape success:
+#
+#   - When `scheme`, `kem`, and `aead` are ALL supported identifiers, the
+#     envelope is held to the full scheme-1 shape and key-path rules; an
+#     envelope that fails them is rejected with its typed code, never
+#     reclassified as opaque.
+#   - When any of the three names an identifier this implementation does not
+#     support, the envelope becomes OPAQUE: no shape, length, or key-path
+#     rule is applied against an unknown identifier; the item is tagged
+#     ENC_UNSUPPORTED (info in the public reading; error co-firing with the
+#     identifier-specific UNSUPPORTED_* code in the recipient role / strict
+#     sealed-crypto mode).
+#   - Carve-out: an `aead` naming a forbidden unauthenticated cipher family
+#     is rejected UNAUTHENTICATED_CIPHER_FORBIDDEN in every role — a
+#     recognised hazard, not an unknown identifier.
+#
+# The content-hash binding (ENC_REQUIRES_CONTENT_HASH) inspects the item's
+# `hashes` map, not the envelope, so it applies even under an opaque
+# envelope.
+
+
+def _check_item_enc(
+    item: dict[str, object],
+    idx: int,
+    opts: _ResolvedOptions,
+    issues: list[ValidationIssue],
+) -> None:
+    enc_path: _Path = ("items", idx, "enc")
+
+    # Content-hash binding: an `enc`-bearing item MUST commit to at least one
+    # REGISTERED content hash — the ciphertext is otherwise bound to no
+    # plaintext digest. A presence check, not a non-empty check: `{md5: …}`
+    # fails it (and MAY co-fire with UNSUPPORTED_HASH_ALG on the same item).
+    hashes = cast("dict[str, object]", item["hashes"])
+    if not any(alg in HASH_ALG_LENGTHS for alg in hashes):
         issues.append(
             _issue(
-                (*path, "scheme"),
-                "UNSUPPORTED_ENVELOPE_SCHEME",
-                f"enc.scheme must be the unsigned integer 1; got {scheme!r}",
+                "ENC_REQUIRES_CONTENT_HASH",
+                enc_path,
+                "item carries `enc` but `hashes` has no registered content-hash entry "
+                "(sha2-256 or blake2b-256)",
             )
         )
 
-    aead = enc_map.get("aead")
-    if not isinstance(aead, str):
+    # The pre-guard has already rejected an `enc` map carrying non-text keys,
+    # so a well-typed envelope arrives here as a text-keyed map.
+    raw_enc = item["enc"]
+    if not isinstance(raw_enc, dict):
+        issues.append(_issue("SCHEMA_TYPE_MISMATCH", enc_path, "enc must be a CBOR map"))
+        return
+    enc = cast("dict[str, object]", raw_enc)
+
+    # Decoded-envelope byte resource bound — a generic decode limit that
+    # applies in every reading, opaque included. Canonical decode → canonical
+    # encode is byte-identical, so re-encoding the decoded envelope measures
+    # exactly the wire bytes of the `enc` subtree.
+    envelope_bytes = len(encode_canonical_cbor(cast("CanonicalCborValue", raw_enc)))
+    if envelope_bytes > opts.max_enc_envelope_bytes:
         issues.append(
             _issue(
-                (*path, "aead"),
-                "UNSUPPORTED_AEAD_ALG",
-                f"unknown aead alg: {aead!r}",
+                "ENC_ENVELOPE_TOO_LARGE",
+                enc_path,
+                f"decoded envelope is {envelope_bytes} bytes; "
+                f"the resource bound is {opts.max_enc_envelope_bytes}",
+            )
+        )
+
+    # `scheme` is structurally required in BOTH readings, as a CBOR unsigned
+    # integer (the opaque grammar admits any uint; the typed grammar pins 1).
+    if "scheme" not in enc:
+        issues.append(
+            _issue("SCHEMA_MISSING_REQUIRED", (*enc_path, "scheme"), "enc.scheme is required")
+        )
+        return
+    scheme = enc["scheme"]
+    if not _is_uint(scheme):
+        issues.append(
+            _issue(
+                "SCHEMA_TYPE_MISMATCH",
+                (*enc_path, "scheme"),
+                "enc.scheme must be a CBOR unsigned integer",
             )
         )
         return
-    if _UNAUTHENTICATED_CIPHER_REGEX.search(aead):
+
+    # Forbidden-cipher carve-out: rejected in every role, never opaque.
+    aead = enc.get("aead")
+    if isinstance(aead, str) and UNAUTHENTICATED_CIPHER_RE.search(aead) is not None:
         issues.append(
             _issue(
-                (*path, "aead"),
                 "UNAUTHENTICATED_CIPHER_FORBIDDEN",
-                f"{aead!r} is an unauthenticated cipher; "
+                (*enc_path, "aead"),
+                f"'{aead}' is an unauthenticated cipher; "
                 "Label 309 mandates an authenticated (AEAD) cipher",
             )
         )
         return
-    if aead not in AEAD_NONCE_LENGTHS:
-        issues.append(
-            _issue(
-                (*path, "aead"),
-                "UNSUPPORTED_AEAD_ALG",
-                f"unknown aead alg: {aead!r}",
-            )
+
+    # Unknown-envelope rule: collect every identifier outside the implemented
+    # set. A non-text `kem` / `aead` is not an identifier at all — it is a
+    # type violation of whichever reading applies, handled by the typed pass
+    # below.
+    kem = enc.get("kem")
+    unsupported: list[tuple[str, ErrorCode, str]] = []
+    if scheme != 1:
+        unsupported.append(("scheme", "UNSUPPORTED_ENVELOPE_SCHEME", str(scheme)))
+    if isinstance(kem, str) and kem not in KEM_SLOT_DESCRIPTORS:
+        unsupported.append(("kem", "UNSUPPORTED_KEM_ALG", kem))
+    if isinstance(aead, str) and aead not in AEAD_NONCE_LENGTHS:
+        unsupported.append(("aead", "UNSUPPORTED_AEAD_ALG", aead))
+    if unsupported:
+        # Degrade to opaque: the envelope is bounded metadata only. No shape,
+        # length, nonce, slot, or key-path rule may be applied against an
+        # unknown identifier.
+        named = ", ".join(f"{field}={identifier}" for field, _, identifier in unsupported)
+        message = (
+            f"envelope uses identifiers this implementation does not support ({named}); "
+            "the envelope is opaque and only the content-hash claim is validated"
         )
+        if opts.role == "recipient_or_strict":
+            issues.append(_issue("ENC_UNSUPPORTED", enc_path, message, severity="error"))
+            for field, code, identifier in unsupported:
+                issues.append(
+                    _issue(
+                        code,
+                        (*enc_path, field),
+                        f"enc.{field} '{identifier}' is not supported",
+                    )
+                )
+        else:
+            issues.append(_issue("ENC_UNSUPPORTED", enc_path, message, severity="info"))
         return
 
-    has_kem = "kem" in enc_map
-    # `kem_resolved` is the kem string ONLY when it names a registered KEM; it
-    # selects the per-slot descriptor that drives the KEM-aware slot-shape pass.
-    kem_resolved: str | None = None
-    if has_kem:
-        kem = enc_map["kem"]
-        if not isinstance(kem, str) or kem not in KEM_SLOT_DESCRIPTORS:
+    # Fully supported identifiers → the typed scheme-1 pass is mandatory.
+    # Non-text-key maps inside the typed envelope (a slot, the passphrase
+    # block, its params) are rejected first, at the containing map — the same
+    # pre-guard rule the record level applies, scoped here because only the
+    # typed reading constrains the envelope interior.
+    internal_map_issues = _enc_internal_non_text_key_issues(enc, enc_path)
+    if internal_map_issues:
+        issues.extend(internal_map_issues)
+        return
+    typed_issues = _enc_scheme1_schema_issues(enc, enc_path)
+    if typed_issues:
+        issues.extend(typed_issues)
+        return
+    _check_scheme1_envelope(enc, enc_path, opts, issues)
+
+
+def _enc_internal_non_text_key_issues(
+    enc: dict[str, object], enc_path: _Path
+) -> list[ValidationIssue]:
+    # Non-text-key maps at the typed envelope's interior positions: each
+    # slot, the passphrase block, and its `params` map.
+    issues: list[ValidationIssue] = []
+
+    def flag(path: _Path) -> None:
+        issues.append(_issue("SCHEMA_TYPE_MISMATCH", path, _NON_TEXT_KEY_MESSAGE))
+
+    slots = enc.get("slots")
+    if isinstance(slots, list):
+        for i, slot in enumerate(slots):
+            if _has_non_text_key(slot):
+                flag((*enc_path, "slots", i))
+    passphrase = enc.get("passphrase")
+    if _has_non_text_key(passphrase):
+        flag((*enc_path, "passphrase"))
+    elif isinstance(passphrase, dict):
+        params = cast("dict[str, object]", passphrase).get("params")
+        if _has_non_text_key(params):
+            flag((*enc_path, "passphrase", "params"))
+    return issues
+
+
+def _enc_scheme1_schema_issues(enc: dict[str, object], enc_path: _Path) -> list[ValidationIssue]:
+    # The typed scheme-1 shape gate. Applied only when `scheme` / `kem` /
+    # `aead` are all supported identifiers; the map is CLOSED — an unknown
+    # key in a supported envelope is SCHEMA_UNKNOWN_FIELD, never a reason to
+    # fall back to the opaque reading. Field lengths a value can assert in
+    # isolation (`slots_mac` 32 bytes, the 16..64-byte salt) fire here with
+    # their dedicated codes; if ANY issue fires, the cross-field and per-slot
+    # domain rules below are foreclosed (there is no typed envelope to walk).
+    issues: list[ValidationIssue] = []
+
+    for key in enc:
+        if key not in _ENC_SCHEME1_KEYS:
             issues.append(
                 _issue(
-                    (*path, "kem"),
-                    "UNSUPPORTED_KEM_ALG",
-                    f"unknown kem alg: {kem!r}",
+                    "SCHEMA_UNKNOWN_FIELD",
+                    (*enc_path, key),
+                    f"unrecognized key '{key}' in a closed map",
                 )
             )
-        else:
-            kem_resolved = kem
 
-    nonce = enc_map.get("nonce")
-    if not isinstance(nonce, (bytes, bytearray)):
+    # `aead` reaches this gate unsupported-checked only when it IS a
+    # registered string; a missing or non-text `aead` falls through the
+    # identifier dispatch and is a shape violation of the typed reading.
+    if "aead" not in enc:
+        issues.append(
+            _issue("SCHEMA_MISSING_REQUIRED", (*enc_path, "aead"), "enc.aead is required")
+        )
+    elif not isinstance(enc["aead"], str):
+        issues.append(
+            _issue("SCHEMA_TYPE_MISMATCH", (*enc_path, "aead"), "enc.aead must be a text string")
+        )
+
+    if "nonce" not in enc:
+        issues.append(
+            _issue("SCHEMA_MISSING_REQUIRED", (*enc_path, "nonce"), "enc.nonce is required")
+        )
+    elif not isinstance(enc["nonce"], bytes):
         issues.append(
             _issue(
-                (*path, "nonce"),
                 "SCHEMA_TYPE_MISMATCH",
-                "nonce must be bytes",
+                (*enc_path, "nonce"),
+                "enc.nonce must be a CBOR byte string",
             )
         )
-    elif len(nonce) != AEAD_NONCE_LENGTHS[aead]:
+
+    kem = enc.get("kem")
+    if kem is not None and not isinstance(kem, str):
         issues.append(
-            _issue(
-                (*path, "nonce"),
-                "NONCE_LENGTH_MISMATCH",
-                f"nonce length {len(nonce)} != {AEAD_NONCE_LENGTHS[aead]} for {aead}",
-            )
+            _issue("SCHEMA_TYPE_MISMATCH", (*enc_path, "kem"), "enc.kem must be a text string")
         )
 
-    has_slots = "slots" in enc_map
-    has_slots_mac = "slots_mac" in enc_map
-    has_passphrase = "passphrase" in enc_map
-
-    if has_slots:
-        slots = enc_map["slots"]
+    slots = enc.get("slots")
+    if slots is not None:
         if not isinstance(slots, list):
             issues.append(
-                _issue(
-                    (*path, "slots"),
-                    "SCHEMA_TYPE_MISMATCH",
-                    "slots must be an array",
-                )
-            )
-        elif len(slots) < 1:
-            issues.append(
-                _issue(
-                    (*path, "slots"),
-                    "ENC_SLOTS_EMPTY",
-                    "slots must be a non-empty array",
-                )
-            )
-        elif len(slots) > MAX_SLOTS:
-            # Slot-count resource bound — reject an over-large slot array before
-            # walking every slot. This is the slot-count half of the
-            # partitioning-oracle resource guard; the unwrap layer trips the
-            # identical threshold first, so the two layers agree. Skip the
-            # per-slot, duplicate, and byte-size passes — the array is rejected
-            # outright.
-            issues.append(
-                _issue(
-                    (*path, "slots"),
-                    "ENC_SLOTS_TOO_MANY",
-                    f"slots length {len(slots)} exceeds MAX_SLOTS={MAX_SLOTS}",
-                )
+                _issue("SCHEMA_TYPE_MISMATCH", (*enc_path, "slots"), "enc.slots must be an array")
             )
         else:
-            # Only validate slot shape when the KEM resolves to a known
-            # descriptor; an unknown / absent KEM already emits its own code
-            # above, and we cannot pick a descriptor to branch on.
-            if kem_resolved is not None:
-                descriptor = KEM_SLOT_DESCRIPTORS[kem_resolved]
-                # Per-slot KEK uniqueness: the zero-nonce per-slot wrap is safe
-                # only because each slot draws fresh KEM randomness, so two slots
-                # sharing the same encapsulation material derive the same KEK and
-                # repeat a (KEK, zero-nonce) pair. The material that fixes the KEK
-                # is the `epk` (x25519) or the reassembled `kem_ct` (hybrid); a
-                # repeat of either across slots is rejected here, before any
-                # KEM/AEAD primitive — the same check the unwrap layer runs.
-                seen_kem_material: set[bytes] = set()
-                for i, slot in enumerate(slots):
-                    _validate_slot(slot, kem_resolved, (*path, "slots", i), issues)
-                    material = _slot_kem_material(slot, descriptor)
-                    if material is not None:
-                        if material in seen_kem_material:
-                            issues.append(
-                                _issue(
-                                    (*path, "slots", i, descriptor.field),
-                                    "ENC_SLOTS_DUPLICATE_KEM_MATERIAL",
-                                    f"slot {i} {descriptor.field} duplicates an earlier slot "
-                                    "— per-slot KEK uniqueness is violated",
-                                )
-                            )
-                        else:
-                            seen_kem_material.add(material)
-
-                # Decoded-envelope byte backstop. Every per-slot field is
-                # fixed-length (the descriptor pins them; a wrong length already
-                # emitted its own code), so the decoded envelope's aggregate size
-                # is determined by the slot count: nonce + slots_mac + count *
-                # (ct-field + wrap). This is the identical measure the unwrap
-                # layer computes, so the two layers trip ENC_ENVELOPE_TOO_LARGE on
-                # the same envelopes. A tighter cap than MAX_SLOTS for honest
-                # records.
-                per_slot_bytes = descriptor.field_length + descriptor.wrap_length
-                decoded_envelope_bytes = (
-                    _NONCE_LENGTH + _SLOTS_MAC_LENGTH + len(slots) * per_slot_bytes
-                )
-                if decoded_envelope_bytes > MAX_DECODED_ENVELOPE_BYTES:
+            for i, slot in enumerate(slots):
+                slot_path: _Path = (*enc_path, "slots", i)
+                if not isinstance(slot, dict):
                     issues.append(
-                        _issue(
-                            (*path, "slots"),
-                            "ENC_ENVELOPE_TOO_LARGE",
-                            f"decoded envelope size {decoded_envelope_bytes} exceeds "
-                            f"MAX_DECODED_ENVELOPE_BYTES={MAX_DECODED_ENVELOPE_BYTES}",
-                        )
+                        _issue("ENC_SLOT_INVALID_SHAPE", slot_path, "a slot must be a CBOR map")
                     )
+                    continue
+                for field in ("epk", "kem_ct", "wrap"):
+                    value = cast("dict[str, object]", slot).get(field)
+                    if value is not None and not isinstance(value, bytes):
+                        issues.append(
+                            _issue(
+                                "ENC_SLOT_INVALID_SHAPE",
+                                (*slot_path, field),
+                                f"slot.{field} must be a single CBOR byte string",
+                            )
+                        )
 
-    if has_slots_mac:
-        slots_mac = enc_map["slots_mac"]
-        if not isinstance(slots_mac, (bytes, bytearray)):
+    slots_mac = enc.get("slots_mac")
+    if slots_mac is not None:
+        if not isinstance(slots_mac, bytes):
             issues.append(
                 _issue(
-                    (*path, "slots_mac"),
                     "SCHEMA_TYPE_MISMATCH",
-                    "slots_mac must be bytes",
+                    (*enc_path, "slots_mac"),
+                    "enc.slots_mac must be a CBOR byte string",
                 )
             )
         elif len(slots_mac) != 32:
             issues.append(
                 _issue(
-                    (*path, "slots_mac"),
                     "ENC_SLOTS_MAC_INVALID_LENGTH",
+                    (*enc_path, "slots_mac"),
                     f"slots_mac length {len(slots_mac)} != 32",
                 )
             )
 
-    if has_slots and has_passphrase:
+    passphrase = enc.get("passphrase")
+    if passphrase is not None:
+        pp_path: _Path = (*enc_path, "passphrase")
+        if not isinstance(passphrase, dict):
+            issues.append(
+                _issue("SCHEMA_TYPE_MISMATCH", pp_path, "enc.passphrase must be a CBOR map")
+            )
+        else:
+            pp = cast("dict[str, object]", passphrase)
+            for key in pp:
+                if key not in _PASSPHRASE_KEYS:
+                    issues.append(
+                        _issue(
+                            "SCHEMA_UNKNOWN_FIELD",
+                            (*pp_path, key),
+                            f"unrecognized key '{key}' in a closed map",
+                        )
+                    )
+            if "alg" not in pp:
+                issues.append(
+                    _issue(
+                        "SCHEMA_MISSING_REQUIRED", (*pp_path, "alg"), "passphrase.alg is required"
+                    )
+                )
+            elif not isinstance(pp["alg"], str):
+                issues.append(
+                    _issue(
+                        "SCHEMA_TYPE_MISMATCH",
+                        (*pp_path, "alg"),
+                        "passphrase.alg must be a text string",
+                    )
+                )
+            if "salt" not in pp:
+                # An absent salt maps to the same code as a wrong-typed one —
+                # the reference schema layer expresses the salt as a byte
+                # string carrying its own length refinements, so its absence
+                # surfaces as the type violation of that shape.
+                issues.append(
+                    _issue(
+                        "SCHEMA_TYPE_MISMATCH",
+                        (*pp_path, "salt"),
+                        "passphrase.salt must be a CBOR byte string of 16..64 bytes",
+                    )
+                )
+            elif not isinstance(pp["salt"], bytes):
+                issues.append(
+                    _issue(
+                        "SCHEMA_TYPE_MISMATCH",
+                        (*pp_path, "salt"),
+                        "passphrase.salt must be a CBOR byte string",
+                    )
+                )
+            elif len(pp["salt"]) < 16:
+                issues.append(
+                    _issue(
+                        "ENC_PASSPHRASE_SALT_TOO_SHORT",
+                        (*pp_path, "salt"),
+                        f"passphrase.salt length {len(pp['salt'])} < 16",
+                    )
+                )
+            elif len(pp["salt"]) > 64:
+                issues.append(
+                    _issue(
+                        "ENC_PASSPHRASE_SALT_TOO_LONG",
+                        (*pp_path, "salt"),
+                        f"passphrase.salt length {len(pp['salt'])} > 64",
+                    )
+                )
+            if "params" not in pp:
+                issues.append(
+                    _issue(
+                        "SCHEMA_MISSING_REQUIRED",
+                        (*pp_path, "params"),
+                        "passphrase.params is required",
+                    )
+                )
+            elif not isinstance(pp["params"], dict):
+                issues.append(
+                    _issue(
+                        "SCHEMA_TYPE_MISMATCH",
+                        (*pp_path, "params"),
+                        "passphrase.params must be a CBOR map",
+                    )
+                )
+
+    return issues
+
+
+def _check_scheme1_envelope(
+    enc: dict[str, object],
+    enc_path: _Path,
+    opts: _ResolvedOptions,
+    issues: list[ValidationIssue],
+) -> None:
+    # Nonce length is registered per content format (24 bytes for
+    # chacha20-poly1305-stream64k). Checked only under a supported `aead` —
+    # which is guaranteed on this path.
+    aead = cast("str", enc["aead"])
+    nonce = cast("bytes", enc["nonce"])
+    expected_nonce_len = AEAD_NONCE_LENGTHS[aead]
+    if len(nonce) != expected_nonce_len:
         issues.append(
             _issue(
-                path,
+                "NONCE_LENGTH_MISMATCH",
+                (*enc_path, "nonce"),
+                f"nonce length {len(nonce)} != {expected_nonce_len} for {aead}",
+            )
+        )
+
+    # Key-path cross-field rules. Exactly one of `slots` / `passphrase` is
+    # present; `passphrase` forbids `kem`, `slots`, and `slots_mac`; `slots`
+    # requires both `kem` and `slots_mac`; `slots_mac` binds nothing without
+    # `slots`. Each independent rule emits its own code — they co-fire where
+    # several apply.
+    has_slots = "slots" in enc
+    has_slots_mac = "slots_mac" in enc
+    has_passphrase = "passphrase" in enc
+    has_kem = "kem" in enc
+
+    if has_passphrase and (has_slots or has_slots_mac or has_kem):
+        issues.append(
+            _issue(
                 "ENC_EXCLUSIVITY_VIOLATION",
-                "enc combines slots with passphrase; exactly one MUST be present",
+                enc_path,
+                "enc.passphrase is mutually exclusive with kem / slots / slots_mac; "
+                "exactly one key path is allowed",
             )
         )
     if has_slots and not has_slots_mac:
         issues.append(
-            _issue(
-                path,
-                "ENC_SLOTS_MAC_REQUIRED",
-                "enc.slots present but enc.slots_mac absent",
-            )
+            _issue("ENC_SLOTS_MAC_REQUIRED", enc_path, "enc.slots present but enc.slots_mac absent")
         )
     if has_slots_mac and not has_slots:
         issues.append(
-            _issue(
-                path,
-                "ENC_SLOTS_REQUIRED",
-                "enc.slots_mac present but enc.slots absent",
-            )
+            _issue("ENC_SLOTS_REQUIRED", enc_path, "enc.slots_mac present but enc.slots absent")
         )
     if has_slots and not has_kem:
-        issues.append(
-            _issue(
-                path,
-                "ENC_KEM_REQUIRED",
-                "enc.slots present but enc.kem absent",
-            )
-        )
+        issues.append(_issue("ENC_KEM_REQUIRED", enc_path, "enc.slots present but enc.kem absent"))
     if not has_slots and not has_passphrase:
         issues.append(
             _issue(
-                path,
                 "ENC_NO_KEY_PATH",
+                enc_path,
                 "enc requires either slots or passphrase — no on-chain key path otherwise",
             )
         )
 
-    if has_passphrase:
-        _validate_passphrase(enc_map["passphrase"], (*path, "passphrase"), issues)
-
-
-def _validate_slot(slot: object, kem: str, path: _Path, issues: list[ValidationIssue]) -> None:
-    """KEM-driven per-slot shape gate (pure). `kem` is a resolved member of
-    `KEM_SLOT_DESCRIPTORS`. The descriptor pins which ciphertext-bearing field
-    this KEM uses (`epk` for x25519, `kem_ct` for mlkem768x25519) and its
-    expected length:
-
-      - The descriptor's ciphertext field MUST be present at the expected
-        (reassembled) length.
-      - The OTHER KEM's ciphertext field MUST be absent — its presence is
-        cross-KEM contamination and surfaces as `ENC_SLOT_INVALID_SHAPE`.
-      - `wrap` MUST be present at 48 bytes.
-
-    `kem_ct` reassembly uses byte concatenation only (`bytes_chunk_array_concat`)
-    — no crypto, no I/O — so the validator stays a pure function over CBOR bytes.
-    """
-    if not isinstance(slot, dict):
-        issues.append(_issue(path, "ENC_SLOT_INVALID_SHAPE", "recipient slot must be a map"))
-        return
-    slot_map = cast(dict[object, object], slot)
-    descriptor = KEM_SLOT_DESCRIPTORS[kem]
-
-    # The ciphertext field that does NOT belong to this KEM. Its presence is a
-    # shape violation regardless of length.
-    foreign_field: KemSlotField = "kem_ct" if descriptor.field == "epk" else "epk"
-    if foreign_field in slot_map:
-        issues.append(
-            _issue(
-                (*path, foreign_field),
-                "ENC_SLOT_INVALID_SHAPE",
-                f"slot carries {foreign_field!r} but kem={kem!r} expects {descriptor.field!r}",
-            )
-        )
-
-    # Any key outside {<ct field>, wrap} for this KEM is a closed-map violation.
-    for k in slot_map:
-        if not isinstance(k, str) or k not in REGISTERED_SLOT_KEYS:
+    if has_slots:
+        slots = cast("list[dict[str, object]]", enc["slots"])
+        if len(slots) < 1:
             issues.append(
                 _issue(
-                    (*path, str(k)),
+                    "ENC_SLOTS_EMPTY",
+                    (*enc_path, "slots"),
+                    "slots[] must carry at least one slot",
+                )
+            )
+        elif len(slots) > opts.max_slots:
+            # Slot-count resource bound: reject before walking any slot, so a
+            # hostile record cannot drive unbounded per-slot work.
+            issues.append(
+                _issue(
+                    "ENC_SLOTS_TOO_MANY",
+                    (*enc_path, "slots"),
+                    f"slots length {len(slots)} exceeds the slot-count bound {opts.max_slots}",
+                )
+            )
+        elif has_kem:
+            # The descriptor exists — `kem` is registered on this path.
+            descriptor = KEM_SLOT_DESCRIPTORS[cast("str", enc["kem"])]
+            # Per-slot KEK uniqueness: the zero-nonce per-slot wrap is safe
+            # only because each slot draws fresh KEM randomness; two slots
+            # sharing the same encapsulation material would derive the same
+            # KEK. Reject the repeat before any cryptographic layer would.
+            seen_kem_material: set[bytes] = set()
+            for i, slot in enumerate(slots):
+                slot_path: _Path = (*enc_path, "slots", i)
+                _check_slot_shape(slot, descriptor, cast("str", enc["kem"]), slot_path, issues)
+                material = slot.get(descriptor.field)
+                if isinstance(material, bytes):
+                    if material in seen_kem_material:
+                        issues.append(
+                            _issue(
+                                "ENC_SLOTS_DUPLICATE_KEM_MATERIAL",
+                                (*slot_path, descriptor.field),
+                                f"slot {i} {descriptor.field} duplicates an earlier slot — "
+                                "per-slot KEK uniqueness is violated",
+                            )
+                        )
+                    else:
+                        seen_kem_material.add(material)
+
+    if has_passphrase:
+        _check_passphrase_block(
+            cast("dict[str, object]", enc["passphrase"]),
+            (*enc_path, "passphrase"),
+            opts,
+            issues,
+        )
+
+
+def _check_slot_shape(
+    slot: dict[str, object],
+    descriptor: KemSlotDescriptor,
+    kem: str,
+    slot_path: _Path,
+    issues: list[ValidationIssue],
+) -> None:
+    # KEM-driven per-slot shape gate. The descriptor for the declared
+    # envelope `kem` pins which ciphertext-bearing field MUST be present at
+    # what exact length, and forbids everything else: the other KEM's field,
+    # any stray key (a slot is a CLOSED 2-key map), and a missing required
+    # field all surface as ENC_SLOT_INVALID_SHAPE.
+    foreign_field: KemSlotField = "kem_ct" if descriptor.field == "epk" else "epk"
+    if foreign_field in slot:
+        issues.append(
+            _issue(
+                "ENC_SLOT_INVALID_SHAPE",
+                (*slot_path, foreign_field),
+                f"slot carries '{foreign_field}' but kem='{kem}' expects '{descriptor.field}'",
+            )
+        )
+    for key in slot:
+        if key not in SLOT_KEY_UNIVERSE:
+            issues.append(
+                _issue(
                     "ENC_SLOT_INVALID_SHAPE",
-                    f"slot carries unexpected key {k!r}; "
+                    (*slot_path, key),
+                    f"slot carries unexpected key '{key}'; "
                     f"a slot is a 2-key map {{{descriptor.field}, wrap}}",
                 )
             )
 
-    # The required ciphertext-bearing field MUST be present at the expected
-    # (reassembled) length.
-    if descriptor.field == "epk":
-        epk = slot_map.get("epk")
-        if epk is None:
-            issues.append(
-                _issue(
-                    (*path, "epk"),
-                    "ENC_SLOT_INVALID_SHAPE",
-                    f"slot for kem={kem!r} is missing required 'epk'",
-                )
+    ct_field = slot.get(descriptor.field)
+    if ct_field is None:
+        issues.append(
+            _issue(
+                "ENC_SLOT_INVALID_SHAPE",
+                (*slot_path, descriptor.field),
+                f"slot for kem='{kem}' is missing required '{descriptor.field}'",
             )
-        elif not isinstance(epk, (bytes, bytearray)):
-            issues.append(
-                _issue((*path, "epk"), "ENC_SLOT_INVALID_SHAPE", "slot epk must be bytes")
+        )
+    elif len(cast("bytes", ct_field)) != descriptor.field_length:
+        issues.append(
+            _issue(
+                KEM_FIELD_LENGTH_CODE[descriptor.field],
+                (*slot_path, descriptor.field),
+                f"slot.{descriptor.field} length {len(cast('bytes', ct_field))} "
+                f"!= {descriptor.field_length} for {kem}",
             )
-        elif len(epk) != descriptor.field_length:
-            issues.append(
-                _issue(
-                    (*path, "epk"),
-                    KEM_FIELD_LENGTH_CODE["epk"],
-                    f"epk length {len(epk)} != {descriptor.field_length} for {kem}",
-                )
-            )
-    else:
-        reassembled = _reassemble_kem_ct(slot_map.get("kem_ct"), (*path, "kem_ct"), issues)
-        if reassembled is not None and reassembled != descriptor.field_length:
-            issues.append(
-                _issue(
-                    (*path, "kem_ct"),
-                    KEM_FIELD_LENGTH_CODE["kem_ct"],
-                    f"kem_ct reassembles to {reassembled} bytes "
-                    f"!= {descriptor.field_length} for {kem}",
-                )
-            )
+        )
 
-    # `wrap` is 48 bytes for every KEM.
-    wrap = slot_map.get("wrap")
+    wrap = slot.get("wrap")
     if wrap is None:
         issues.append(
             _issue(
-                (*path, "wrap"),
                 "ENC_SLOT_INVALID_SHAPE",
-                f"slot for kem={kem!r} is missing required 'wrap'",
+                (*slot_path, "wrap"),
+                f"slot for kem='{kem}' is missing required 'wrap'",
             )
         )
-    elif not isinstance(wrap, (bytes, bytearray)):
-        issues.append(_issue((*path, "wrap"), "ENC_SLOT_INVALID_SHAPE", "slot wrap must be bytes"))
-    elif len(wrap) != descriptor.wrap_length:
+    elif len(cast("bytes", wrap)) != descriptor.wrap_length:
         issues.append(
             _issue(
-                (*path, "wrap"),
                 "WRAP_LENGTH_MISMATCH",
-                f"wrap length {len(wrap)} != {descriptor.wrap_length}",
+                (*slot_path, "wrap"),
+                f"slot.wrap length {len(cast('bytes', wrap))} != {descriptor.wrap_length}",
             )
         )
 
 
-def _slot_kem_material(slot: object, descriptor: KemSlotDescriptor) -> bytes | None:
-    """The encapsulation material that fixes a slot's per-slot KEK, used for the
-    within-record duplicate check: the `epk` (x25519) or the reassembled
-    `kem_ct` (hybrid). Returns ``None`` when the required field is absent or the
-    wrong type — the shape defect already emitted `ENC_SLOT_INVALID_SHAPE`, so
-    the duplicate pass simply skips that slot.
-    """
-    if not isinstance(slot, dict):
-        return None
-    slot_map = cast(dict[object, object], slot)
-    if descriptor.field == "epk":
-        epk = slot_map.get("epk")
-        return bytes(epk) if isinstance(epk, (bytes, bytearray)) else None
-    raw = slot_map.get("kem_ct")
-    if not isinstance(raw, list) or len(raw) == 0:
-        return None
-    chunks: list[bytes] = []
-    for chunk in raw:
-        if not isinstance(chunk, (bytes, bytearray)):
-            return None
-        chunks.append(bytes(chunk))
-    return bytes_chunk_array_concat(chunks)
-
-
-def _reassemble_kem_ct(
-    raw: object,
-    path: _Path,
+def _check_passphrase_block(
+    pp: dict[str, object],
+    pp_path: _Path,
+    opts: _ResolvedOptions,
     issues: list[ValidationIssue],
-) -> int | None:
-    """Validate the chunked-bytes shape of `kem_ct` and return its reassembled
-    byte length, or ``None`` when the field is missing / malformed (in which
-    case the appropriate issue has already been appended).
-
-    The chunked-bytes-array contract mirrors `sigs[i].cose_sign1`: a non-empty
-    list of `bstr .size (1..64)` chunks. A missing field is ENC_SLOT_INVALID_SHAPE
-    (the hybrid slot is missing its required ciphertext); a chunk outside [1,64]
-    is CHUNK_TOO_LARGE (the same code the schema layer assigns on the TS twin).
-    """
-    if raw is None:
-        issues.append(
-            _issue(
-                path,
-                "ENC_SLOT_INVALID_SHAPE",
-                "hybrid slot is missing required 'kem_ct'",
-            )
-        )
-        return None
-    if not isinstance(raw, list) or len(raw) == 0:
-        issues.append(
-            _issue(
-                path,
-                "ENC_SLOT_INVALID_SHAPE",
-                "kem_ct must be a non-empty array of byte chunks (<=64B each)",
-            )
-        )
-        return None
-    typed_chunks: list[bytes] = []
-    shape_ok = True
-    for ci, chunk in enumerate(raw):
-        if not isinstance(chunk, (bytes, bytearray)):
-            issues.append(
-                _issue(
-                    (*path, ci),
-                    "ENC_SLOT_INVALID_SHAPE",
-                    "kem_ct chunk must be a byte string",
-                )
-            )
-            shape_ok = False
-            continue
-        if len(chunk) < 1 or len(chunk) > 64:
-            issues.append(
-                _issue(
-                    (*path, ci),
-                    "CHUNK_TOO_LARGE",
-                    f"chunk length {len(chunk)} not in [1, 64]",
-                )
-            )
-            shape_ok = False
-            continue
-        typed_chunks.append(bytes(chunk))
-    if not shape_ok:
-        return None
-    return len(bytes_chunk_array_concat(typed_chunks))
-
-
-def _validate_passphrase(passphrase: object, path: _Path, issues: list[ValidationIssue]) -> None:
-    if not isinstance(passphrase, dict):
-        issues.append(_issue(path, "SCHEMA_TYPE_MISMATCH", "passphrase must be a map"))
-        return
-    pp = cast(dict[object, object], passphrase)
-    _check_unknown_keys(pp, REGISTERED_PASSPHRASE_KEYS, path, issues, "passphrase")
-
-    alg = pp.get("alg")
-    if not isinstance(alg, str) or alg not in PASSPHRASE_ALGS:
-        issues.append(
-            _issue(
-                (*path, "alg"),
-                "ENC_PASSPHRASE_ALG_UNSUPPORTED",
-                f"unknown passphrase alg: {alg!r}",
-            )
-        )
-
-    salt = pp.get("salt")
-    if not isinstance(salt, (bytes, bytearray)):
-        issues.append(_issue((*path, "salt"), "SCHEMA_TYPE_MISMATCH", "salt must be bytes"))
-    elif len(salt) < 16:
-        issues.append(
-            _issue(
-                (*path, "salt"),
-                "ENC_PASSPHRASE_SALT_TOO_SHORT",
-                f"passphrase.salt length {len(salt)} < 16",
-            )
-        )
-    elif len(salt) > 64:
-        issues.append(
-            _issue(
-                (*path, "salt"),
-                "ENC_PASSPHRASE_SALT_TOO_LONG",
-                f"passphrase.salt length {len(salt)} > 64",
-            )
-        )
-
-    params = pp.get("params")
-    if not isinstance(params, dict):
-        issues.append(_issue((*path, "params"), "SCHEMA_TYPE_MISMATCH", "params must be a map"))
-        return
-
-    if alg == "argon2id":
-        _validate_argon2_params(cast(dict[object, object], params), (*path, "params"), issues)
-
-
-def _validate_argon2_params(
-    params: dict[object, object], path: _Path, issues: list[ValidationIssue]
 ) -> None:
-    allowed = {"m", "t", "p"}
-    for k in params:
-        if not isinstance(k, str) or k not in allowed:
+    # Passphrase block: KDF registry membership, then the registered
+    # algorithm's CLOSED parameter map with exact-integer range, floors, and
+    # the deployment ceiling. Salt bounds fired in the shape gate already.
+    alg = cast("str", pp["alg"])
+    if alg not in PASSPHRASE_KDF_ALGS:
+        issues.append(
+            _issue(
+                "ENC_PASSPHRASE_ALG_UNSUPPORTED",
+                (*pp_path, "alg"),
+                f"unknown passphrase kdf alg: {alg}",
+            )
+        )
+        return  # no algorithm-specific params rule can apply
+
+    # argon2id: `params` is the CLOSED map of exactly {m, t, p}.
+    params_path: _Path = (*pp_path, "params")
+    params = cast("dict[str, object]", pp["params"])
+    for key in params:
+        if key not in ("m", "t", "p"):
             issues.append(
                 _issue(
-                    (*path, str(k)),
                     "SCHEMA_UNKNOWN_FIELD",
-                    f"unknown argon2id params field: {k!r}",
+                    (*params_path, key),
+                    f"unknown argon2id params field: {key}",
                 )
             )
 
-    def _int_or_none(val: object, name: str) -> int | None:
-        if not isinstance(val, int) or isinstance(val, bool):
+    ceiling = opts.passphrase_params_ceiling
+    for name in _ARGON2_PARAM_NAMES:
+        if name not in params:
             issues.append(
                 _issue(
-                    (*path, name),
+                    "SCHEMA_MISSING_REQUIRED",
+                    (*params_path, name),
+                    f"argon2id params.{name} is required",
+                )
+            )
+            continue
+        value = params[name]
+        # Exact-integer discipline: Python integers are arbitrary precision,
+        # so an out-of-range value is rejected without precision loss.
+        if not _is_uint(value):
+            issues.append(
+                _issue(
                     "SCHEMA_TYPE_MISMATCH",
+                    (*params_path, name),
                     f"argon2id params.{name} must be a CBOR unsigned integer",
                 )
             )
-            return None
-        return val
-
-    m = _int_or_none(params.get("m"), "m")
-    t = _int_or_none(params.get("t"), "t")
-    p = _int_or_none(params.get("p"), "p")
-    if m is not None and m < 65_536:
-        issues.append(
-            _issue(
-                (*path, "m"),
-                "ENC_PASSPHRASE_ARGON2_PARAMS_TOO_LOW",
-                "argon2id requires m >= 65536 KiB",
-            )
-        )
-    if t is not None and t < 3:
-        issues.append(
-            _issue(
-                (*path, "t"),
-                "ENC_PASSPHRASE_ARGON2_PARAMS_TOO_LOW",
-                "argon2id requires t >= 3",
-            )
-        )
-    if p is not None and p < 1:
-        issues.append(
-            _issue(
-                (*path, "p"),
-                "ENC_PASSPHRASE_ARGON2_PARAMS_TOO_LOW",
-                "argon2id requires p >= 1",
-            )
-        )
-
-
-def _validate_merkle_commit(commit: object, path: _Path, issues: list[ValidationIssue]) -> None:
-    if not isinstance(commit, dict):
-        issues.append(_issue(path, "SCHEMA_TYPE_MISMATCH", "merkle entry must be a map"))
-        return
-    cm = cast(dict[object, object], commit)
-    _check_unknown_keys(cm, REGISTERED_MERKLE_COMMIT_KEYS, path, issues, "merkle entry")
-
-    alg_resolved: str | None = None
-    if "alg" not in cm:
-        issues.append(
-            _issue(
-                (*path, "alg"),
-                "SCHEMA_MISSING_REQUIRED",
-                "merkle entry missing required `alg`",
-            )
-        )
-    else:
-        alg = cm["alg"]
-        if not isinstance(alg, str):
+            continue
+        num = cast("int", value)
+        if num > _UINT32_MAX:
             issues.append(
                 _issue(
-                    (*path, "alg"),
                     "SCHEMA_TYPE_MISMATCH",
-                    "merkle entry `alg` must be a text string",
-                )
-            )
-        elif alg not in MERKLE_COMMIT_ALGS:
-            issues.append(
-                _issue(
-                    (*path, "alg"),
-                    "UNSUPPORTED_MERKLE_COMMIT_ALG",
-                    f"unknown merkle commitment alg: {alg!r}",
-                )
-            )
-        else:
-            alg_resolved = alg
-
-    if "root" not in cm:
-        issues.append(
-            _issue(
-                (*path, "root"),
-                "SCHEMA_MISSING_REQUIRED",
-                "merkle entry missing required `root`",
-            )
-        )
-    else:
-        root = cm["root"]
-        if not isinstance(root, (bytes, bytearray)):
-            issues.append(
-                _issue(
-                    (*path, "root"),
-                    "SCHEMA_TYPE_MISMATCH",
-                    "merkle entry `root` must be CBOR bytes",
-                )
-            )
-        elif alg_resolved is not None:
-            expected = MERKLE_COMMIT_ALGS[alg_resolved]
-            if len(root) != expected:
-                issues.append(
-                    _issue(
-                        (*path, "root"),
-                        "HASH_DIGEST_LENGTH_MISMATCH",
-                        f"merkle entry `root` length {len(root)} != {expected} for {alg_resolved}",
-                    )
-                )
-
-    if "leaf_count" not in cm:
-        issues.append(
-            _issue(
-                (*path, "leaf_count"),
-                "SCHEMA_MISSING_REQUIRED",
-                "merkle entry missing required `leaf_count`",
-            )
-        )
-    else:
-        leaf_count = cm["leaf_count"]
-        if not isinstance(leaf_count, int) or isinstance(leaf_count, bool) or leaf_count < 1:
-            issues.append(
-                _issue(
-                    (*path, "leaf_count"),
-                    "SCHEMA_TYPE_MISMATCH",
-                    "merkle entry `leaf_count` must be a CBOR unsigned integer >= 1",
-                )
-            )
-
-    if "uris" in cm:
-        u = cm["uris"]
-        if not isinstance(u, list) or len(u) == 0:
-            issues.append(
-                _issue(
-                    (*path, "uris"),
-                    "SCHEMA_TYPE_MISMATCH",
-                    "merkle entry `uris` must be a non-empty array of chunked-tstr-arrays",
-                )
-            )
-        else:
-            for ui, chunks in enumerate(u):
-                _validate_one_uri(chunks, (*path, "uris", ui), issues)
-
-
-def _validate_supersedes(value: object, path: _Path, issues: list[ValidationIssue]) -> None:
-    # A wrong-typed value is a schema defect distinct from a correctly-typed
-    # byte string of the wrong length; the two carry different codes.
-    if not isinstance(value, (bytes, bytearray)):
-        issues.append(
-            _issue(
-                path,
-                "SCHEMA_TYPE_MISMATCH",
-                "supersedes must be a 32-byte transaction hash (CBOR bytes)",
-            )
-        )
-    elif len(value) != 32:
-        issues.append(
-            _issue(
-                path,
-                "SUPERSEDES_TX_INVALID_LENGTH",
-                "supersedes must be a 32-byte transaction hash",
-            )
-        )
-
-
-def _validate_crit(record_map: dict[object, object], issues: list[ValidationIssue]) -> None:
-    crit_arr = record_map["crit"]
-    if not isinstance(crit_arr, list) or len(crit_arr) == 0:
-        issues.append(
-            _issue(
-                ("crit",),
-                "SCHEMA_TYPE_MISMATCH",
-                "crit must be a non-empty array of text strings",
-            )
-        )
-        return
-    seen: set[str] = set()
-    decoded_top_keys = {k for k in record_map if isinstance(k, str)}
-    for ci, name in enumerate(crit_arr):
-        if not isinstance(name, str):
-            issues.append(
-                _issue(
-                    ("crit", ci),
-                    "SCHEMA_TYPE_MISMATCH",
-                    f"crit[{ci}] must be a text string; got {type(name).__name__}",
+                    (*params_path, name),
+                    f"argon2id params.{name} exceeds the pinned wire range 0 .. 2^32 - 1",
                 )
             )
             continue
-        reason: str | None = None
-        if name in REGISTERED_RECORD_KEYS:
-            reason = f"{name!r} is a base key and MUST NOT appear in crit[]"
-        elif not EXTENSION_KEY_REGEX.match(name):
-            reason = f"{name!r} does not match the extension-key regex (^x-.+ or ^[a-z]+-.+)"
-        elif name not in decoded_top_keys:
-            reason = f"{name!r} is named in crit but absent from the record map"
-        elif name in seen:
-            reason = f"{name!r} appears more than once in crit[]"
-        seen.add(name)
-        if reason is not None:
-            issues.append(_issue(("crit", ci), "CRIT_SHAPE_INVALID", reason))
+        if num < _ARGON2_FLOORS[name]:
+            issues.append(
+                _issue(
+                    "ENC_PASSPHRASE_ARGON2_PARAMS_TOO_LOW",
+                    (*params_path, name),
+                    f"argon2id requires {name} >= {_ARGON2_FLOORS[name]}",
+                )
+            )
             continue
-        if name not in IMPLEMENTED_EXTENSIONS:
+        if ceiling is not None and num > ceiling[name]:
             issues.append(
                 _issue(
-                    ("crit", ci),
-                    "EXTENSION_UNSUPPORTED_CRITICAL",
-                    f"crit entry {name!r} names an extension this verifier does not implement",
+                    "ENC_PASSPHRASE_PARAMS_EXCEED_POLICY",
+                    (*params_path, name),
+                    f"argon2id params.{name} = {num} exceeds "
+                    f"the deployment ceiling {ceiling[name]}",
                 )
             )
 
 
-def _validate_sigs(
-    raw: object,
-    issues: list[ValidationIssue],
-    info: list[ValidationIssue],
+# =============================================================================
+# Merkle commitments
+# =============================================================================
+
+
+def _check_merkle_commit(
+    commit: dict[str, object], idx: int, issues: list[ValidationIssue]
 ) -> None:
-    if not isinstance(raw, list):
-        issues.append(_issue(("sigs",), "SCHEMA_TYPE_MISMATCH", "sigs must be an array"))
-        return
-    if len(raw) < 1:
+    base_path: _Path = ("merkle", idx)
+    alg = cast("str", commit["alg"])
+    if alg not in MERKLE_COMMIT_ALG_LENGTHS:
         issues.append(
             _issue(
-                ("sigs",),
-                "SCHEMA_TYPE_MISMATCH",
-                "sigs must be a non-empty array when present",
+                "UNSUPPORTED_MERKLE_COMMIT_ALG",
+                (*base_path, "alg"),
+                f"unknown merkle commitment alg: {alg}",
             )
         )
-        return
-    for i, entry in enumerate(raw):
-        _validate_sig_entry(entry, i, issues, info)
-
-
-def _validate_sig_entry(
-    entry: object,
-    i: int,
-    issues: list[ValidationIssue],
-    info: list[ValidationIssue],
-) -> None:
-    if not isinstance(entry, dict):
-        issues.append(
-            _issue(
-                ("sigs", i),
-                "SIG_ENTRY_INVALID_SHAPE",
-                "each sigs entry must be a CBOR map { cose_sign1, cose_key? }",
-            )
-        )
-        return
-    entry_map = cast(dict[object, object], entry)
-
-    cose_sign1_raw = entry_map.get("cose_sign1")
-    if cose_sign1_raw is None:
-        issues.append(
-            _issue(
-                ("sigs", i),
-                "SIG_ENTRY_INVALID_SHAPE",
-                "sigs entry missing required 'cose_sign1' field",
-            )
-        )
-        cose_sign1_chunks: list[bytes] | None = None
-    elif not _is_chunked_bytes_shape(cose_sign1_raw):
-        issues.append(
-            _issue(
-                ("sigs", i, "cose_sign1"),
-                "SIG_ENTRY_INVALID_SHAPE",
-                "sigs[i].cose_sign1 must be a non-empty list of byte chunks (<=64B each)",
-            )
-        )
-        cose_sign1_chunks = None
     else:
-        chunks_list = cast(list[bytes], cose_sign1_raw)
-        _validate_bytes_chunk_lengths(chunks_list, ("sigs", i, "cose_sign1"), issues)
-        cose_sign1_chunks = chunks_list
-
-    cose_key_chunks: list[bytes] | None = None
-    if "cose_key" in entry_map:
-        cose_key_raw = entry_map["cose_key"]
-        if not _is_chunked_bytes_shape(cose_key_raw):
+        expected = MERKLE_COMMIT_ALG_LENGTHS[alg]
+        root = cast("bytes", commit["root"])
+        if len(root) != expected:
             issues.append(
                 _issue(
-                    ("sigs", i, "cose_key"),
-                    "SIG_ENTRY_INVALID_SHAPE",
-                    "sigs[i].cose_key must be a non-empty list of byte chunks (<=64B each)",
-                )
-            )
-        else:
-            cose_key_chunks = cast(list[bytes], cose_key_raw)
-            _validate_bytes_chunk_lengths(cose_key_chunks, ("sigs", i, "cose_key"), issues)
-            _validate_cose_key_blob(cose_key_chunks, ("sigs", i, "cose_key"), issues)
-
-    # Closed sig-entry schema — no extension-key namespace at this layer. An
-    # unrecognized key is a malformed sig-entry shape, not a generic unknown
-    # field, so it carries SIG_ENTRY_INVALID_SHAPE at the offending key's path.
-    for k in entry_map:
-        if not isinstance(k, str) or k not in REGISTERED_SIG_ENTRY_KEYS:
-            issues.append(
-                _issue(
-                    ("sigs", i, str(k)),
-                    "SIG_ENTRY_INVALID_SHAPE",
-                    f"unknown sig-entry field: {k!r}",
+                    "HASH_DIGEST_LENGTH_MISMATCH",
+                    (*base_path, "root"),
+                    f"merkle entry root length {len(root)} != {expected} for {alg}",
                 )
             )
 
-    if cose_sign1_chunks is not None:
-        _check_cose_sign1(cose_sign1_chunks, ("sigs", i), entry_map, issues, info)
-
-
-def _is_chunked_bytes_shape(value: object) -> bool:
-    if not isinstance(value, list) or len(value) == 0:
-        return False
-    return all(isinstance(c, (bytes, bytearray)) for c in value)
-
-
-def _validate_bytes_chunk_lengths(
-    chunks: list[bytes], path: _Path, issues: list[ValidationIssue]
-) -> None:
-    for j, c in enumerate(chunks):
-        if len(c) < 1 or len(c) > 64:
-            issues.append(
-                _issue(
-                    (*path, j),
-                    "CHUNK_TOO_LARGE",
-                    f"chunk length {len(c)} not in [1, 64]",
-                )
+    # `leaf_count` is REQUIRED and pinned to `1 .. 2^32 - 1`, compared as an
+    # exact integer. A negative value is a CBOR type violation (nint where
+    # uint is required), distinct from an out-of-range unsigned value.
+    leaf_count = commit["leaf_count"]
+    if not _is_uint(leaf_count):
+        issues.append(
+            _issue(
+                "SCHEMA_TYPE_MISMATCH",
+                (*base_path, "leaf_count"),
+                "leaf_count must be a CBOR unsigned integer",
             )
+        )
+    elif not 1 <= cast("int", leaf_count) <= _UINT32_MAX:
+        issues.append(
+            _issue(
+                "SCHEMA_MERKLE_LEAF_COUNT_INVALID",
+                (*base_path, "leaf_count"),
+                f"leaf_count {leaf_count} is outside the pinned range 1 .. 2^32 - 1",
+            )
+        )
+
+    uris = commit.get("uris")
+    if uris is not None:
+        _check_uris(cast("list[object]", uris), (*base_path, "uris"), issues)
 
 
-def _validate_cose_key_blob(
-    chunks: list[bytes], path: _Path, issues: list[ValidationIssue]
-) -> None:
-    """Decode the chunked cose_key blob and apply the signer-key checks:
-    private-material guard FIRST, then positive Ed25519 OKP shape check.
-    """
-    joined = b"".join(chunks)
+# =============================================================================
+# Record-level signature entries
+# =============================================================================
+
+# IANA-registered COSE_Key private-key-material labels (RFC 9052 §7.1). `-4`
+# is the private scalar `d` for OKP / EC2 keys; a private key on the public
+# permanent ledger is forbidden, so its presence is a hard structural error.
+COSE_KEY_PRIVATE_MATERIAL_LABELS: Final[frozenset[int]] = frozenset({-4})
+
+
+def _check_sig_entry(entry: dict[str, object], idx: int, issues: list[ValidationIssue]) -> None:
+    # Path-2 `cose_key` private-material guard runs FIRST: a leaked private
+    # scalar must be named even when the COSE_Sign1 is also malformed.
+    cose_key = entry.get("cose_key")
+    if cose_key is not None:
+        key_issue = _inspect_cose_key(cast("bytes", cose_key), idx)
+        if key_issue is not None:
+            issues.append(key_issue)
+            return
+
     try:
-        decoded = cbor2.loads(joined)
-    except Exception as cause:
-        issues.append(
-            _issue(
-                path,
-                "MALFORMED_SIG_COSE_SIGN1",
-                f"cose_key failed to decode as cbor<COSE_Key>: {cause}",
-            )
-        )
-        return
-    if not isinstance(decoded, dict):
-        issues.append(
-            _issue(
-                path,
-                "MALFORMED_SIG_COSE_SIGN1",
-                f"cose_key did not decode to a CBOR map; got {type(decoded).__name__}",
-            )
-        )
-        return
-    cose_key_map = cast(dict[object, object], decoded)
-    forbidden = [
-        k
-        for k in cose_key_map
-        if isinstance(k, int) and not isinstance(k, bool) and k in COSE_KEY_PRIVATE_MATERIAL_LABELS
-    ]
-    if forbidden:
-        issues.append(
-            _issue(
-                path,
-                "SIG_PRIVATE_KEY_LEAKED",
-                "cose_key carries COSE_Key private-key material "
-                "(label -4, the OKP/EC2 private scalar d); "
-                "publishing a private key on the permanent ledger is forbidden",
-            )
-        )
-        return
-    # Positive-shape check (Ed25519 OKP path-2 sidecar).
-    kty = cose_key_map.get(1)
-    crv = cose_key_map.get(-1)
-    x_val = cose_key_map.get(-2)
-    if kty != 1:
-        issues.append(
-            _issue(
-                path,
-                "MALFORMED_SIG_COSE_SIGN1",
-                f"cose_key kty (label 1) must be 1 (OKP); got {kty!r}",
-            )
-        )
-        return
-    if crv != 6:
-        issues.append(
-            _issue(
-                path,
-                "MALFORMED_SIG_COSE_SIGN1",
-                f"cose_key crv (label -1) must be 6 (Ed25519); got {crv!r}",
-            )
-        )
-        return
-    if -2 not in cose_key_map:
-        issues.append(
-            _issue(
-                path,
-                "MALFORMED_SIG_COSE_SIGN1",
-                "cose_key missing label -2 (Ed25519 public-key bytes)",
-            )
-        )
-        return
-    if not isinstance(x_val, (bytes, bytearray)) or len(x_val) != 32:
-        got = (
-            f"{len(x_val)}-byte bstr"
-            if isinstance(x_val, (bytes, bytearray))
-            else type(x_val).__name__
-        )
-        issues.append(
-            _issue(
-                path,
-                "MALFORMED_SIG_COSE_SIGN1",
-                f"cose_key label -2 must be a 32-byte byte string (Ed25519 public key); got {got}",
-            )
-        )
-
-
-def _check_cose_sign1(
-    chunks: list[bytes],
-    path: _Path,
-    entry_map: dict[object, object],
-    issues: list[ValidationIssue],
-    info: list[ValidationIssue],
-) -> None:
-    """Step 4g — COSE_Sign1 structural decode + algorithm + path-1/path-2
-    mutual-exclusion check.
-    """
-    merged = b"".join(chunks)
-    try:
-        cose = decode_cose_sign1(merged)
+        cose = decode_cose_sign1(cast("bytes", entry["cose_sign1"]))
     except CoseVerifyError as cause:
-        issues.append(
-            _issue(
-                path,
-                "MALFORMED_SIG_COSE_SIGN1",
-                cause.args[0] if cause.args else "cose decode failed",
-            )
-        )
+        issues.append(_issue("MALFORMED_SIG_COSE_SIGN1", ("sigs", idx), str(cause)))
         return
+    except Exception as cause:  # pragma: no cover — the validator never raises
+        issues.append(_issue("MALFORMED_SIG_COSE_SIGN1", ("sigs", idx), str(cause)))
+        return
+
+    # Detached-only: the COSE_Sign1 payload MUST be CBOR null. An attached
+    # payload — even zero-length — is rejected; a producer chaining a CIP-30
+    # signData result must null the payload before embedding.
     if cose["payload"] is not None:
         issues.append(
             _issue(
-                path,
                 "MALFORMED_SIG_COSE_SIGN1",
+                ("sigs", idx),
                 "COSE_Sign1 payload must be null (detached); attached form forbidden",
             )
         )
         return
+
+    # Signature-algorithm registry check (info severity — signatures are
+    # optional, so an unrecognised algorithm never fails the record alone).
     protected_header = cose["protected_header"]
     alg = protected_header.get(1) if isinstance(protected_header, dict) else None
-    if not isinstance(alg, int) or isinstance(alg, bool) or alg not in KNOWN_SIG_ALG_IDS:
-        info.append(
+    if isinstance(alg, bool) or not isinstance(alg, int) or alg not in KNOWN_SIG_ALG_IDS:
+        issues.append(
             _issue(
-                path,
                 "SIGNATURE_UNSUPPORTED",
-                f"alg {alg!r} not in KNOWN_SIG_ALG_IDS = {set(KNOWN_SIG_ALG_IDS)}",
+                ("sigs", idx),
+                f"COSE_Sign1 protected alg {alg!r} not in {{-8, -19}}",
                 severity="info",
             )
         )
 
-    # Path-1 / path-2 mutual exclusion: a signature entry resolves its signer
-    # key by exactly one path, never both.
-    kid = protected_header.get(4) if isinstance(protected_header, dict) else None
-    if isinstance(kid, (bytes, bytearray)) and len(kid) == 32 and "cose_key" in entry_map:
+    # Path-1 (32-byte protected-header `kid`) and path-2 (`cose_key` sidecar)
+    # are mutually exclusive.
+    protected_kid = protected_header.get(4) if isinstance(protected_header, dict) else None
+    if isinstance(protected_kid, bytes) and len(protected_kid) == 32 and cose_key is not None:
         issues.append(
             _issue(
-                path,
                 "SIG_ENTRY_KID_COSE_KEY_CONFLICT",
-                "sigs[i] carries both a 32-byte protected `kid` (path 1) "
-                "and an inline `cose_key` (path 2); paths are mutually exclusive",
+                ("sigs", idx),
+                "sigs[i] carries both a 32-byte protected `kid` (path 1) and an inline "
+                "`cose_key` (path 2); paths are mutually exclusive",
             )
         )
 
 
+def _inspect_cose_key(key_bytes: bytes, i: int) -> ValidationIssue | None:
+    # COSE_Key inspector (path-2 `sigs[i].cose_key` blob). Two structural
+    # checks:
+    #   1. Private-material guard (FIRST). COSE_Key label `-4` (the private
+    #      scalar `d` for OKP / EC2 per RFC 9052 §7.1) → SIG_PRIVATE_KEY_LEAKED.
+    #      Publishing a private key on the permanent ledger is catastrophic
+    #      and irreversible, so this is a load-bearing producer-side preflight.
+    #   2. Positive-shape guard: `kty = 1` (OKP), `crv = 6` (Ed25519), and a
+    #      32-byte `-2` (x). Any failure → MALFORMED_SIG_COSE_SIGN1.
+    path: _Path = ("sigs", i, "cose_key")
+    try:
+        decoded = decode_canonical_cbor(key_bytes)
+    except Exception as cause:
+        return _issue(
+            "MALFORMED_SIG_COSE_SIGN1",
+            path,
+            f"sigs[{i}].cose_key failed to decode as cbor<COSE_Key>: {cause}",
+        )
+
+    key_map = cast("dict[object, object]", decoded) if isinstance(decoded, dict) else {}
+
+    if any(
+        isinstance(label, int)
+        and not isinstance(label, bool)
+        and label in COSE_KEY_PRIVATE_MATERIAL_LABELS
+        for label in key_map
+    ):
+        return _issue(
+            "SIG_PRIVATE_KEY_LEAKED",
+            path,
+            "cose_key carries COSE_Key private-key material (label -4, the OKP/EC2 private "
+            "scalar d); publishing a private key on the permanent ledger is forbidden",
+        )
+
+    kty = key_map.get(1)
+    if kty != 1 or isinstance(kty, bool):
+        return _issue(
+            "MALFORMED_SIG_COSE_SIGN1",
+            path,
+            f"sigs[{i}].cose_key COSE_Key kty (label 1) must be 1 (OKP); got {kty!r}",
+        )
+    crv = key_map.get(-1)
+    if crv != 6 or isinstance(crv, bool):
+        return _issue(
+            "MALFORMED_SIG_COSE_SIGN1",
+            path,
+            f"sigs[{i}].cose_key COSE_Key crv (label -1) must be 6 (Ed25519); got {crv!r}",
+        )
+    x = key_map.get(-2)
+    if not isinstance(x, bytes) or len(x) != 32:
+        got = f"{len(x)}-byte bstr" if isinstance(x, bytes) else type(x).__name__
+        return _issue(
+            "MALFORMED_SIG_COSE_SIGN1",
+            path,
+            f"sigs[{i}].cose_key COSE_Key label -2 must be a 32-byte byte string "
+            f"(Ed25519 public key); got {got}",
+        )
+    return None
+
+
+# =============================================================================
+# `crit[]` shape + critical-extension support
+# =============================================================================
+
+
+def _check_crit(
+    record: dict[str, object],
+    supported_critical_extensions: frozenset[str],
+    issues: list[ValidationIssue],
+) -> None:
+    crit = record.get("crit")
+    if not isinstance(crit, list):
+        return
+    # `crit` has `1*` cardinality: an empty array is a malformed shape.
+    if len(crit) == 0:
+        issues.append(
+            _issue(
+                "SCHEMA_TYPE_MISMATCH",
+                ("crit",),
+                "crit[] must carry at least one entry when present",
+            )
+        )
+        return
+    seen: set[str] = set()
+    for i, crit_name in enumerate(cast("list[str]", crit)):
+        reason: str | None = None
+        if crit_name in TOP_LEVEL_BASE_KEYS:
+            reason = f"'{crit_name}' is a base key and MUST NOT appear in crit[]"
+        elif not is_extension_key(crit_name):
+            reason = (
+                f"'{crit_name}' does not match the extension-key form "
+                "(^x-.+ or ^[a-z]+-.+, no control characters)"
+            )
+        elif crit_name not in record:
+            reason = f"'{crit_name}' is named in crit but absent from the record map"
+        elif crit_name in seen:
+            reason = f"'{crit_name}' appears more than once in crit[]"
+        seen.add(crit_name)
+        if reason is not None:
+            issues.append(_issue("CRIT_SHAPE_INVALID", ("crit", i), reason))
+            continue
+        # Shape-valid entry: accepted iff this validator implements the named
+        # extension. The default supported set is empty, so a
+        # default-configured validator fails every `crit`-bearing record — by
+        # design.
+        if crit_name not in supported_critical_extensions:
+            issues.append(
+                _issue(
+                    "EXTENSION_UNSUPPORTED_CRITICAL",
+                    ("crit", i),
+                    f"crit lists extension '{crit_name}' that this validator does not implement",
+                )
+            )
+
+
 __all__ = [
     "AEAD_NONCE_LENGTHS",
-    "CONTENT_HASH_ALGS",
     "COSE_KEY_PRIVATE_MATERIAL_LABELS",
-    "EXTENSION_KEY_REGEX",
-    "HASH_ALGS",
-    "IMPLEMENTED_EXTENSIONS",
+    "DEFAULT_PASSPHRASE_PARAMS_CEILING",
+    "HASH_ALG_LENGTHS",
     "KEM_FIELD_LENGTH_CODE",
     "KEM_SLOT_DESCRIPTORS",
     "KNOWN_SIG_ALG_IDS",
-    "MERKLE_COMMIT_ALGS",
-    "PASSPHRASE_ALGS",
-    "REGISTERED_ENC_KEYS",
-    "REGISTERED_ITEM_KEYS",
-    "REGISTERED_MERKLE_COMMIT_KEYS",
-    "REGISTERED_PASSPHRASE_KEYS",
-    "REGISTERED_RECORD_KEYS",
-    "REGISTERED_SIG_ENTRY_KEYS",
-    "REGISTERED_SLOT_KEYS",
+    "MERKLE_COMMIT_ALG_LENGTHS",
+    "PASSPHRASE_KDF_ALGS",
+    "SLOT_KEY_UNIVERSE",
+    "UNAUTHENTICATED_CIPHER_RE",
     "KemSlotDescriptor",
     "KemSlotField",
     "ValidateFail",
     "ValidateOk",
     "ValidateResult",
     "ValidationIssue",
+    "ValidatorRole",
     "validate",
 ]

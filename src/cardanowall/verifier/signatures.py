@@ -1,182 +1,193 @@
+"""Label 309 record-level signature verifier.
+
+One verification per ``record.sigs[i]``. v1 has NO per-item signature slot —
+the only signature surface is the record-level array. Two on-wire signer-key
+paths (mutually exclusive on the wire, enforced by the structural validator
+as ``SIG_ENTRY_KID_COSE_KEY_CONFLICT``):
+
+  Path 1 — protected-header ``kid`` is exactly 32 bytes (raw Ed25519 pubkey).
+  Path 2 — ``sigs[i].cose_key`` is a single ``cbor<COSE_Key>`` byte string
+           carrying the wallet's public key. The protected header carries a
+           29-byte CIP-19 stake address at label ``"address"``; the verifier
+           recomputes ``expected_network_header || Blake2b-224(pub)`` —
+           deriving the network byte from the CONTAINING TRANSACTION's
+           network, never echoing the byte found in the record — and rejects
+           on any of the 29 bytes (``WALLET_ADDRESS_MISMATCH``).
+
+The producer's protected-header bytes are used VERBATIM as
+``Sig_structure[1]`` — never re-encoded or re-canonicalised (RFC 9052 §4.4) —
+and the signing body is the canonical de-chunked record body with ``sigs``
+removed; both rules are enforced by ``cose_sign1_label309_verify`` in the
+crypto layer. Ed25519 verification is strict per RFC 8032 §5.1.7 (canonical
+R/S, low-order rejection, no cofactor multiplication).
+
+Record signatures are OPTIONAL: a public hash-only PoE remains valid even
+when every signature entry is unverifiable (``SIGNATURE_UNSUPPORTED``, info).
+Every ``unsupported`` per-signature verdict puts ``SIGNATURE_UNSUPPORTED``
+(info) at ``("sigs", i)`` EXACTLY ONCE: the structural validator contributes
+the same issue for UNREGISTERED algorithms, while a registered-but-
+unimplemented algorithm is only detected here, so this pass emits
+idempotently against the sink. Error-class failures (``SIGNATURE_INVALID``,
+``SIGNER_KEY_UNRESOLVED``, ``WALLET_ADDRESS_MISMATCH``,
+``MALFORMED_SIG_COSE_SIGN1``) raise issues into the run's sink and fail the
+record.
+"""
+
 from __future__ import annotations
 
 import hashlib
-import hmac
-from collections.abc import Sequence
-from typing import Final, cast
+from typing import Final
 
-from cardanowall._crypto.cbor import CanonicalCborValue, encode_canonical_cbor
+from cardanowall._crypto.compare_ct import compare_ct
 from cardanowall._crypto.cose_key import parse_cose_key_ed25519
 from cardanowall._crypto.cose_sign1 import (
+    CARDANO_POE_SIG_DOMAIN_PREFIX,
     CoseSign1Decoded,
     CoseVerifyError,
-    build_sig_structure,
+    cose_sign1_label309_verify,
     decode_cose_sign1,
 )
-from cardanowall._crypto.sig import verify_ed25519
-from cardanowall.poe_standard import PoeRecord, bytes_chunk_array_concat
+from cardanowall.poe_standard import PoeRecord, SigEntry, encode_record_body_for_signing
 
 from .types import (
+    IssueSink,
+    NetworkId,
     SigFailureReason,
-    SignatureVerdict,
     SignerType,
     VerifyRecordSignature,
-    VerifyTxInput,
 )
 
-# The 25-byte UTF-8 domain prefix MUST be prepended to the payload
-# (`Sig_structure[3] = to_sign`), NOT placed in `external_aad`. CIP-30
-# wallets sign with `external_aad = h''`; embedding the prefix in `to_sign`
-# preserves cross-protocol replay protection while keeping wallet-produced
-# signatures byte-identical to verifier-side recomputation.
-CARDANO_POE_SIG_DOMAIN_PREFIX: Final[bytes] = b"cardano-poe-record-sig-v1"
-
-if len(CARDANO_POE_SIG_DOMAIN_PREFIX) != 25:
-    raise RuntimeError("CARDANO_POE_SIG_DOMAIN_PREFIX byte-length invariant violated (expected 25)")
-
-# `Sig_structure[2]` (external_aad) is ALWAYS the empty byte string in
-# conformant v1 records.
-_EMPTY_EXTERNAL_AAD: Final[bytes] = b""
-
-# `sigs` is excluded from the signed payload — the to-be-signed bytes are
-# the record body MINUS the `sigs` field (a signature cannot cover itself).
-# `crit` IS included so a critical-extension downgrade does not slip past
-# the signer.
-_RECORD_SIG_STRIP_KEYS: Final[frozenset[str]] = frozenset({"sigs"})
-
-# Mainnet stake-address network header byte per CIP-19. v1 binds the
-# wallet path to stake addresses only; a 29-byte CIP-19 stake address is
-# `network_header_byte || Blake2b-224(stake_vkey)`.
-_CIP19_STAKE_NETWORK_HEADER_MAINNET: Final[int] = 0xE1
-_CIP19_STAKE_ADDRESS_LENGTH: Final[int] = 29
-_BLAKE2B_224_DIGEST_LENGTH: Final[int] = 28
+# v1 wallet-path constraint: stake (reward) addresses only. The 29-byte
+# CIP-19 layout is `network_header_byte || Blake2b-224(stake_vk)`; stake
+# network bytes: mainnet = 0xe1, testnet = 0xe0 (preprod and preview share
+# the testnet header). The expected byte is derived from the network of the
+# transaction CONTAINING the record — never echoed from the byte found in the
+# record — so a signature produced for one network and replayed under another
+# is rejected.
+_CARDANO_MAINNET_STAKE_NETWORK_BYTE: Final[int] = 0xE1
+_CARDANO_TESTNET_STAKE_NETWORK_BYTE: Final[int] = 0xE0
+_CARDANO_STAKE_ADDRESS_LENGTH: Final[int] = 29
+_ED25519_PUBLIC_KEY_LENGTH: Final[int] = 32
+_BLAKE2B_224_LENGTH: Final[int] = 28
 
 
-def _record_to_dict_minus_sigs(record: PoeRecord) -> dict[str, object]:
-    # `PoeRecord` is a TypedDict — at runtime it is a plain dict, so a shallow
-    # copy filtered by `_RECORD_SIG_STRIP_KEYS` is sufficient. We rely on
-    # producer-side construction to keep field values immutable; the nested
-    # `items` / `merkle` / `enc` shapes are passed through as-is into the
-    # canonical-CBOR encoder.
-    return {k: v for k, v in record.items() if k not in _RECORD_SIG_STRIP_KEYS}
-
-
-def _blake2b_224(data: bytes) -> bytes:
-    # Wallet stake-address binding uses Blake2b-224 (28-byte digest).
-    # hashlib.blake2b supports a configurable digest_size.
-    return hashlib.blake2b(data, digest_size=_BLAKE2B_224_DIGEST_LENGTH).digest()
-
-
-# Map each per-entry failure reason to its 4-state verdict, byte-identical to
-# the TypeScript twin: a public hash-only PoE stays `valid` on `unsupported`;
-# `unresolved` is its own verdict; every other failure collapses to `invalid`.
-def _verdict_for_reason(reason: SigFailureReason) -> SignatureVerdict:
-    if reason == "SIGNATURE_UNSUPPORTED":
-        return "unsupported"
-    if reason == "SIGNER_KEY_UNRESOLVED":
-        return "unresolved"
-    return "invalid"
-
-
-async def verify_record_signatures(
-    record: PoeRecord, input: VerifyTxInput
+def verify_record_signatures(
+    record: PoeRecord,
+    *,
+    network: NetworkId = "cardano:mainnet",
+    sink: IssueSink | None = None,
 ) -> tuple[VerifyRecordSignature, ...]:
-    # to_sign = domain_prefix || canonical_cbor(record_body_without_sigs).
-    record_body = encode_canonical_cbor(
-        cast(CanonicalCborValue, _record_to_dict_minus_sigs(record))
-    )
-    to_sign = CARDANO_POE_SIG_DOMAIN_PREFIX + record_body
+    """Verify every ``sigs[]`` entry against the canonical record body.
+
+    ``network`` names the network of the transaction CONTAINING the record
+    (as established by the verifier's explorer configuration). When ``sink``
+    is supplied, every ``invalid`` / ``unresolved`` entry also raises its
+    error-severity issue at ``("sigs", i)``.
+    """
+    # The signed payload is canonical-CBOR(record_body), where record_body =
+    # record minus `sigs`. The encoder helper keeps the wire shape and key
+    # sort in lockstep with producer-side signing.
+    record_body_cbor = encode_record_body_for_signing(record)
     out: list[VerifyRecordSignature] = []
-    sigs = record.get("sigs") or ()
-    for i, sig_entry in enumerate(sigs):
-        sig_chunks = sig_entry["cose_sign1"]
-        signer_key_chunks = sig_entry.get("cose_key")
-        out.append(
-            await _verify_one(
-                index=i,
-                sig_chunks=sig_chunks,
-                signer_key_chunks=signer_key_chunks,
-                to_sign=to_sign,
+    for i, entry in enumerate(record.get("sigs") or ()):
+        result = _verify_one_sig(i, entry, record_body_cbor, network)
+        out.append(result)
+        if sink is not None and result.verdict in ("invalid", "unresolved"):
+            sink.add(
+                result.reason or "SIGNATURE_INVALID",
+                ("sigs", i),
+                _signature_failure_message(result.reason),
             )
-        )
+        elif sink is not None and result.verdict == "unsupported":
+            # An unsupported entry MUST surface as exactly one
+            # SIGNATURE_UNSUPPORTED (info) at ("sigs", i). The idempotent add
+            # covers both ways an entry gets here: an UNREGISTERED algorithm
+            # (the structural validator already contributed the identical
+            # issue) and a registered algorithm this verifier does not
+            # implement (only this pass detects it).
+            sink.add_once(
+                "SIGNATURE_UNSUPPORTED",
+                ("sigs", i),
+                "the COSE_Sign1 signature algorithm is not implemented by this "
+                "verifier; the entry is unsupported, not invalid",
+            )
     return tuple(out)
 
 
-async def _verify_one(
-    *,
+def _signature_failure_message(reason: SigFailureReason | None) -> str:
+    if reason == "MALFORMED_SIG_COSE_SIGN1":
+        return "the cose_sign1 blob is not a verifiable detached COSE_Sign1"
+    if reason == "SIGNER_KEY_UNRESOLVED":
+        return "neither key-resolution path yielded a 32-byte Ed25519 public key"
+    if reason == "WALLET_ADDRESS_MISMATCH":
+        return (
+            "the wallet-path protected-header address does not equal the recomputed "
+            "network_header || Blake2b-224(pubkey)"
+        )
+    return "strict Ed25519 verification failed against the resolved public key"
+
+
+def _verify_one_sig(
     index: int,
-    sig_chunks: Sequence[bytes],
-    signer_key_chunks: Sequence[bytes] | None,
-    to_sign: bytes,
+    entry: SigEntry,
+    record_body_cbor: bytes,
+    network: NetworkId,
 ) -> VerifyRecordSignature:
+    cose_bytes = entry["cose_sign1"]
     try:
-        cose = decode_cose_sign1(bytes_chunk_array_concat(list(sig_chunks)))
+        cose = decode_cose_sign1(cose_bytes)
     except CoseVerifyError:
         return VerifyRecordSignature(
             index=index, verdict="invalid", reason="MALFORMED_SIG_COSE_SIGN1"
         )
-    # RFC 9052 §4.1: detached form MUST encode payload as nil; a zero-length
-    # byte string is NOT equivalent and MUST be rejected.
-    if cose["payload"] is not None:
-        return VerifyRecordSignature(
-            index=index, verdict="invalid", reason="MALFORMED_SIG_COSE_SIGN1"
-        )
-    alg = cose["protected_header"].get(1)
-    if not isinstance(alg, int) or isinstance(alg, bool) or alg != -8:
-        # SIGNATURE_UNSUPPORTED is info severity; the caller decides whether the
-        # per-entry failure escalates the verdict based on the record's role
-        # (public hash-only PoE remains 'valid').
-        return VerifyRecordSignature(
-            index=index, verdict="unsupported", reason="SIGNATURE_UNSUPPORTED"
-        )
-    resolved = _resolve_signer_key(cose, signer_key_chunks)
+
+    # Resolve the signer's 32-byte Ed25519 pubkey (path 1 vs path 2).
+    resolved = _resolve_signer_key(cose, entry)
     if resolved is None:
         return VerifyRecordSignature(
             index=index, verdict="unresolved", reason="SIGNER_KEY_UNRESOLVED"
         )
-    signer_pub, signer_type = resolved
-    if len(signer_pub) != 32:
-        return VerifyRecordSignature(
-            index=index, verdict="unresolved", reason="SIGNER_KEY_UNRESOLVED"
-        )
-    signer_pub_hex = signer_pub.hex()
+    pub, signer_type = resolved
+    signer_pub_hex = pub.hex()
 
-    # Sig_structure = ["Signature1", protected_bytes, h'', to_sign].
-    # CIP-8 `hashed = true` mode: when the unprotected header carries
-    # `"hashed": True`, substitute `Sig_structure[3]` with `Blake2b-224(to_sign)`
-    # (28-byte digest of the FULL `to_sign` payload including the domain prefix).
-    if cose["unprotected_header"].get("hashed") is True:
-        sig_payload = _blake2b_224(to_sign)
-    else:
-        sig_payload = to_sign
-    sig_struct = build_sig_structure(
-        context="Signature1",
-        body_protected_bytes=cose["protected_bytes"],
-        external_aad=_EMPTY_EXTERNAL_AAD,
-        payload=sig_payload,
+    # Strict Ed25519 verify; Sig_structure[1] is the producer's protected
+    # bytes verbatim, and the CIP-8 hashed mode is handled inside the helper.
+    verify_result = cose_sign1_label309_verify(
+        message=cose_bytes,
+        detached_record_body_cbor=record_body_cbor,
+        expected_signer_key=pub,
     )
-    if not verify_ed25519(signer_pub, sig_struct, cose["signature"]):
+    if not verify_result["ok"]:
+        reason = _map_verify_error(verify_result["error"]["code"])
+        if reason == "SIGNATURE_UNSUPPORTED":
+            return VerifyRecordSignature(
+                index=index,
+                verdict="unsupported",
+                signer_pub=signer_pub_hex,
+                signer_type=signer_type,
+                reason=reason,
+            )
         return VerifyRecordSignature(
             index=index,
             verdict="invalid",
             signer_pub=signer_pub_hex,
             signer_type=signer_type,
-            reason="SIGNATURE_INVALID",
+            reason=reason,
         )
 
-    # Path-2-only wallet address binding check. The Ed25519 signature proves
-    # only "this pubkey signed the record body"; the address claim is
-    # independently unverified.
-    if signer_type == "wallet-inline-key":
-        address_claim = cose["protected_header"].get("address")
-        if not _wallet_address_binds_pubkey(address_claim, signer_pub):
-            return VerifyRecordSignature(
-                index=index,
-                verdict="invalid",
-                signer_pub=signer_pub_hex,
-                signer_type=signer_type,
-                reason="WALLET_ADDRESS_MISMATCH",
-            )
+    # Path-2 wallet `address` ↔ `cose_key` binding. Path-1 entries skip this
+    # check entirely. The Ed25519 signature proves only "this pubkey signed
+    # the record body"; the address claim is independently verified, and it
+    # is REQUIRED on the wallet path — an address-less wallet signature gives
+    # the verifier nothing to bind and fails the same check.
+    if signer_type == "wallet-inline-key" and not _wallet_address_binds_pubkey(cose, pub, network):
+        return VerifyRecordSignature(
+            index=index,
+            verdict="invalid",
+            signer_pub=signer_pub_hex,
+            signer_type=signer_type,
+            reason="WALLET_ADDRESS_MISMATCH",
+        )
 
     return VerifyRecordSignature(
         index=index,
@@ -186,51 +197,65 @@ async def _verify_one(
     )
 
 
-def _wallet_address_binds_pubkey(address_claim: object, pubkey: bytes) -> bool:
-    """Wallet `address` ↔ `cose_key` binding.
+def _resolve_signer_key(cose: CoseSign1Decoded, entry: SigEntry) -> tuple[bytes, SignerType] | None:
+    """Returns ``(pub, signer_type)`` on success, ``None`` on failure.
 
-    Recompute `address_derived = 0xE1 || Blake2b-224(pubkey)` and compare
-    byte-equal under `hmac.compare_digest` against the protected-header
-    `address` claim. v1 binds to mainnet stake addresses only — a non-29-byte
-    `address` or a non-bytes value MUST fail this check.
-    """
-    if not isinstance(address_claim, bytes):
-        return False
-    if len(address_claim) != _CIP19_STAKE_ADDRESS_LENGTH:
-        return False
-    address_derived = bytes([_CIP19_STAKE_NETWORK_HEADER_MAINNET]) + _blake2b_224(pubkey)
-    return hmac.compare_digest(address_derived, address_claim)
+    Path 1 — protected-header label 4 (``kid``) as the 32-byte raw Ed25519
+    pubkey, taken only when no ``cose_key`` blob is present (the validator
+    rejects records carrying both). Unprotected-header ``kid`` values are
+    NEVER consulted: they sit outside the COSE integrity envelope and an
+    attacker could rewrite them.
 
-
-def _resolve_signer_key(
-    cose: CoseSign1Decoded,
-    signer_key_chunks: Sequence[bytes] | None,
-) -> tuple[bytes, SignerType] | None:
-    """Returns `(pub, signer_type)` on success, None on failure.
-
-    Path 1 / path 2 are mutually exclusive at the wire level; the structural
-    validator rejects records carrying both (`SIG_ENTRY_KID_COSE_KEY_CONFLICT`).
-    The resolution below is a one-of-N selection, not a tie-breaker:
-
-    1. Protected-header `kid` (label 4) if exactly 32 bytes AND no `cose_key`
-       blob is present → `in-signature-kid` (raw Ed25519 pubkey).
-    2. `sigs[i].cose_key` chunked-bytes COSE_Key blob → `wallet-inline-key`.
-
-    An unprotected-header `kid` is NEVER used as a raw key directly — it sits
-    outside the COSE integrity envelope, so an attacker could rewrite it.
+    Path 2 — a single ``cbor<COSE_Key>`` byte string carrying the wallet
+    pubkey.
     """
     protected_kid = cose["protected_header"].get(4)
+    signer_key_bytes = entry.get("cose_key")
     if (
         isinstance(protected_kid, bytes)
-        and len(protected_kid) == 32
-        and signer_key_chunks is None
+        and len(protected_kid) == _ED25519_PUBLIC_KEY_LENGTH
+        and signer_key_bytes is None
     ):
         return protected_kid, "in-signature-kid"
-    if signer_key_chunks is not None:
-        side_channel_pub = parse_cose_key_ed25519(bytes_chunk_array_concat(list(signer_key_chunks)))
-        if side_channel_pub is not None:
-            return side_channel_pub, "wallet-inline-key"
+    if signer_key_bytes is not None:
+        pub = parse_cose_key_ed25519(signer_key_bytes)
+        if pub is not None and len(pub) == _ED25519_PUBLIC_KEY_LENGTH:
+            return pub, "wallet-inline-key"
     return None
+
+
+def _map_verify_error(code: str) -> SigFailureReason:
+    if code in ("MALFORMED_SIG_COSE", "MALFORMED_SIG_COSE_SIGN1"):
+        return "MALFORMED_SIG_COSE_SIGN1"
+    if code == CoseVerifyError.UNSUPPORTED_SIG_ALG:
+        return "SIGNATURE_UNSUPPORTED"
+    if code == CoseVerifyError.KID_UNRESOLVED:
+        return "SIGNER_KEY_UNRESOLVED"
+    return "SIGNATURE_INVALID"
+
+
+def _blake2b_224(data: bytes) -> bytes:
+    return hashlib.blake2b(data, digest_size=_BLAKE2B_224_LENGTH).digest()
+
+
+# Recompute the 29-byte stake address from the resolved Ed25519 pubkey and
+# compare it byte-exact (constant-time) to the path-2 protected-header
+# `address` field. The wallet path binds to stake (reward) addresses only in
+# v1 — base/enterprise/pointer/payment addresses fail the equality check
+# against the recomputed 29-byte stake address.
+def _wallet_address_binds_pubkey(cose: CoseSign1Decoded, pub: bytes, network: NetworkId) -> bool:
+    network_byte = (
+        _CARDANO_MAINNET_STAKE_NETWORK_BYTE
+        if network == "cardano:mainnet"
+        else _CARDANO_TESTNET_STAKE_NETWORK_BYTE
+    )
+    raw_address = cose["protected_header"].get("address")
+    if not isinstance(raw_address, bytes):
+        return False
+    if len(raw_address) != _CARDANO_STAKE_ADDRESS_LENGTH:
+        return False
+    derived = bytes([network_byte]) + _blake2b_224(pub)
+    return compare_ct(derived, raw_address)
 
 
 __all__ = ["CARDANO_POE_SIG_DOMAIN_PREFIX", "verify_record_signatures"]

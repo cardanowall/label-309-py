@@ -72,8 +72,8 @@ def test_cross_service_interop_python_parity() -> None:
     recipient_priv = bytes.fromhex(fixture["inputs"]["recipient_x25519_secret_key_hex"])
     trial = ecies_sealed_poe_trial_decrypt(
         envelope=envelope,
+        hashes=dict(item["hashes"].items()),
         recipient_secret_keys=[recipient_priv],
-        constant_time_n=True,
     )
 
     expected = fixture["expected"]
@@ -101,11 +101,10 @@ def test_cross_service_interop_python_parity_hybrid() -> None:
     assert items is not None and len(items) == 1
     enc_any = cast(dict[str, Any], items[0]["enc"])
     assert enc_any["kem"] == "mlkem768x25519"
-    # Wire `kem_ct` is the chunked byte-string array; the in-memory SealedSlot
-    # holds the reassembled flat X-Wing enc (joined here).
+    # Wire `kem_ct` is the single 1120-byte X-Wing ciphertext byte string.
     slots = tuple(
         SealedSlot(
-            kem_ct=b"".join(cast(list[bytes], s["kem_ct"])),
+            kem_ct=cast(bytes, s["kem_ct"]),
             wrap=cast(bytes, s["wrap"]),
         )
         for s in cast(list[dict[str, Any]], enc_any["slots"])
@@ -122,8 +121,8 @@ def test_cross_service_interop_python_parity_hybrid() -> None:
     recipient_seed = bytes.fromhex(fixture["inputs"]["recipient_mlkem768x25519_secret_seed_hex"])
     trial = ecies_sealed_poe_trial_decrypt(
         envelope=envelope,
+        hashes=dict(items[0]["hashes"].items()),
         recipient_secret_keys=[recipient_seed],
-        constant_time_n=True,
     )
 
     expected = fixture["expected"]

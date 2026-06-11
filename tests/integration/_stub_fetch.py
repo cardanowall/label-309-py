@@ -10,7 +10,7 @@ The verifier derives confirmations as `max(0, tipHeight - txHeight + 1)`
 (blocks + 1) on both paths.
 
 JSON is serialised with compact separators so the byte counts surfaced in
-`http_calls[].bytes` match the TypeScript twin (`JSON.stringify`) byte-for-byte.
+`auditTrail[].bytes` match the TypeScript twin (`JSON.stringify`) byte-for-byte.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ def _json_response(value: Any) -> FetchOutboundResult:
 
 def stub_fetch_from_record(record: CorpusRecord) -> FetchOutbound:
     captures = record["captured_gateway_responses"]
-    arweave = captures.get("arweave_envelope_responses", {})
+    arweave = captures.get("arweave_responses", {})
 
     async def stub(url: str, opts: FetchOutboundOptions) -> FetchOutboundResult:
         # Koios confirmation path.
@@ -51,12 +51,10 @@ def stub_fetch_from_record(record: CorpusRecord) -> FetchOutbound:
             return _json_response(captures.get("blockfrost_tx_cbor", {}))
         if "/txs/" in url:
             return _json_response(captures.get("blockfrost_tx", {}))
-        # Sealed-item ciphertext (Arweave).
+        # Captured Arweave content (item bytes, leaves-lists, sealed ciphertext).
         for ar_tx_id, hex_str in arweave.items():
             if url == f"https://arweave.net/{ar_tx_id}":
-                return FetchOutboundResult(
-                    status=200, bytes=bytes.fromhex(hex_str), duration_ms=1
-                )
+                return FetchOutboundResult(status=200, bytes=bytes.fromhex(hex_str), duration_ms=1)
         raise RuntimeError(f"stub_fetch: no captured response for {opts.method} {url}")
 
     return stub

@@ -64,9 +64,7 @@ class _ResolvedConfig:
     http_client: httpx.AsyncClient
 
 
-def _build_json_headers(
-    api_key: str | None, idempotency_key: str | None = None
-) -> dict[str, str]:
+def _build_json_headers(api_key: str | None, idempotency_key: str | None = None) -> dict[str, str]:
     headers = {"content-type": "application/json", "accept": "application/json"}
     if api_key is not None:
         headers["authorization"] = f"Bearer {api_key}"

@@ -18,7 +18,6 @@ from cardanowall._crypto.cose_sign1 import (
     cose_sign1_verify,
 )
 from cardanowall._crypto.sig import sign_ed25519
-from cardanowall.poe_standard.chunked import chunk_bytes
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "cose"
 
@@ -248,13 +247,11 @@ def test_cose_sign1_label309_build_rejects_both_signer_and_seed() -> None:
 
 @pytest.mark.parametrize(
     "vector",
-    [v for v in LABEL309_VECTORS if "expected_cose_sign1_chunks_hex" in v],
+    [v for v in LABEL309_VECTORS if "expected_sigs_entry_cbor_hex" in v],
     ids=lambda v: cast(str, v["name"]),
 )
-def test_chunked_cose_sign1_matches_kat(vector: dict[str, Any]) -> None:
-    """≤64-byte chunk array is byte-pinned and MUST match the Python chunker."""
+def test_sigs_entry_cbor_matches_kat(vector: dict[str, Any]) -> None:
+    """The sigs[i] entry carries the COSE_Sign1 as a SINGLE byte string."""
     cose = bytes.fromhex(vector["expected_cose_sign1_hex"])
-    chunks = chunk_bytes(cose)
-    assert [c.hex() for c in chunks] == vector["expected_cose_sign1_chunks_hex"], vector["name"]
-    sigs_entry = encode_canonical_cbor(cast(Any, {"cose_sign1": [bytes(c) for c in chunks]}))
+    sigs_entry = encode_canonical_cbor(cast(Any, {"cose_sign1": cose}))
     assert sigs_entry.hex() == vector["expected_sigs_entry_cbor_hex"], vector["name"]

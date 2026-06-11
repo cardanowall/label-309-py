@@ -9,7 +9,8 @@ Wire-format invariants enforced by this module:
     - Path-1 `kid-as-public-key` convention: 32-byte raw Ed25519 pubkey in
       protected header label 4; path-1 / path-2 are mutually exclusive on
       the wire.
-    - chunked-bytes-array: per-chunk size in [1, 64].
+    - `sigs[i].cose_sign1` is a SINGLE CBOR byte string (the whole-body
+      transport chunking happens at the carriage layer, never per field).
 
 Use cases (the four integration shapes this surface is intended for):
     1. AWS KMS `Sign` over the returned Sig_structure bytes — wrap KMS as
@@ -54,7 +55,6 @@ from cardanowall._crypto.cose_sign1 import (
 from cardanowall.poe_standard import (
     PoeRecord,
     SigEntry,
-    chunk_bytes,
     encode_record_body_for_signing,
 )
 
@@ -130,10 +130,10 @@ def assemble_cose_sign1(
     signer_pubkey: bytes,
     signature: bytes,
 ) -> tuple[bytes, SigEntry]:
-    """Assemble the COSE_Sign1 and chunked `sigs[i]` entry.
+    """Assemble the COSE_Sign1 and the `sigs[i]` entry.
 
     Returns `(cose_sign1_bytes, sig_entry)`. `sig_entry` is `{"cose_sign1":
-    chunks}` (path-1 only — no `cose_key` sidecar).
+    <single byte string>}` (path-1 only — no `cose_key` sidecar).
     """
     if len(signer_pubkey) != _ED25519_PUBLIC_KEY_LENGTH:
         raise OffHostSignError(
@@ -152,8 +152,7 @@ def assemble_cose_sign1(
         payload=None,
         signature=signature,
     )
-    chunks = chunk_bytes(cose_sign1_bytes)
-    sig_entry: SigEntry = cast(SigEntry, {"cose_sign1": chunks})
+    sig_entry: SigEntry = cast(SigEntry, {"cose_sign1": cose_sign1_bytes})
     return cose_sign1_bytes, sig_entry
 
 
@@ -218,8 +217,7 @@ def assemble_cose_sign1_hashed(
         payload=None,
         signature=signature,
     )
-    chunks = chunk_bytes(cose_sign1_bytes)
-    sig_entry: SigEntry = cast(SigEntry, {"cose_sign1": chunks})
+    sig_entry: SigEntry = cast(SigEntry, {"cose_sign1": cose_sign1_bytes})
     return cose_sign1_bytes, sig_entry
 
 

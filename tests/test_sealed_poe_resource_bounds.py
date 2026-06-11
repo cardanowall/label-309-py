@@ -43,7 +43,7 @@ def _distinct_slots(count: int) -> tuple[SealedSlot, ...]:
 def _envelope(slots: tuple[SealedSlot, ...]) -> SealedEnvelope:
     return SealedEnvelope(
         scheme=1,
-        aead="xchacha20-poly1305",
+        aead="chacha20-poly1305-stream64k",
         kem="x25519",
         nonce=bytes(_NONCE_LENGTH),
         slots=slots,
@@ -55,6 +55,7 @@ def _unwrap(slots: tuple[SealedSlot, ...]) -> UnwrapResult:
     return ecies_sealed_poe_unwrap(
         envelope=_envelope(slots),
         ciphertext=bytes(16),
+        hashes={"sha2-256": bytes(32)},
         recipient_secret_key=bytes([0x11]) * 32,
     )
 

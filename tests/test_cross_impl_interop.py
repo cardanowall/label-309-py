@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-PASSPHRASE_RECIPIENT_LABEL = "recovery passphrase"  # noqa: S105 (label constant, not a credential)
+PASSPHRASE_RECIPIENT_LABEL = "recovery passphrase"
 ENVELOPE_PLAINTEXT_VERSION_V1 = 1
 
 

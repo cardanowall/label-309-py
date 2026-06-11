@@ -116,9 +116,7 @@ def test_list_sealed_true_targets_records_with_query_and_returns_page() -> None:
             return httpx.Response(200, json=page)
 
         async with _client_with_handler(handler) as client:
-            out = await client.records.list(
-                {"sealed": True, "cursor": "eyJjdXIiOjF9", "limit": 25}
-            )
+            out = await client.records.list({"sealed": True, "cursor": "eyJjdXIiOjF9", "limit": 25})
 
         # Page projects to the same RecordResource shape records.get returns.
         assert out["object"] == "list"
@@ -271,9 +269,7 @@ def test_get_404_raises_record_not_found() -> None:
     asyncio.run(run())
 
 
-def test_verify_posts_records_verify_with_json_body_and_returns_typed_verify_report() -> (
-    None
-):
+def test_verify_posts_records_verify_with_json_body_and_returns_typed_verify_report() -> None:
     async def run() -> None:
         captured: dict[str, object] = {}
 
@@ -360,10 +356,7 @@ def test_records_get_request_shape_matches_cross_sdk_parity_fixture() -> None:
             await client.records.get(TX_HASH)
 
         fixture_path = (
-            Path(__file__).parent
-            / "fixtures"
-            / "records-request"
-            / "records-get-request.json"
+            Path(__file__).parent / "fixtures" / "records-request" / "records-get-request.json"
         )
         fixture = json.loads(fixture_path.read_text("utf-8"))
 

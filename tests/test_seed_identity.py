@@ -13,6 +13,7 @@ Parity twin of the sdk-ts ``identity/seed-identity`` tests. Pins:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, cast
@@ -175,15 +176,17 @@ def test_decrypt_sealed_from_seed_hybrid_round_trip() -> None:
     xwing_pub = keys["mlkem768x25519"]["public_key"]
     plaintext = b"sealed hybrid payload for the all-zero seed identity"
 
+    hashes = {"sha2-256": hashlib.sha256(plaintext).digest()}
     sealed = ecies_sealed_poe_wrap(
         plaintext=plaintext,
         recipient_public_keys=[xwing_pub],
+        hashes=hashes,
         kem="mlkem768x25519",
     )
     assert sealed.envelope.kem == "mlkem768x25519"
 
     result = decrypt_sealed_from_seed(
-        seed=SEED_ZERO, envelope=sealed.envelope, ciphertext=sealed.ciphertext
+        seed=SEED_ZERO, envelope=sealed.envelope, ciphertext=sealed.ciphertext, hashes=hashes
     )
     assert result.matched is True
     assert result.plaintext == plaintext
@@ -193,14 +196,16 @@ def test_decrypt_sealed_from_seed_hybrid_round_trip() -> None:
 def test_decrypt_sealed_from_seed_hybrid_wrong_seed_does_not_match() -> None:
     keys = derive_keys_from_seed(SEED_ZERO)
     xwing_pub = keys["mlkem768x25519"]["public_key"]
+    hashes = {"sha2-256": hashlib.sha256(b"only the zero seed can open this").digest()}
     sealed = ecies_sealed_poe_wrap(
         plaintext=b"only the zero seed can open this",
         recipient_public_keys=[xwing_pub],
+        hashes=hashes,
         kem="mlkem768x25519",
     )
 
     result = decrypt_sealed_from_seed(
-        seed=SEED_FF, envelope=sealed.envelope, ciphertext=sealed.ciphertext
+        seed=SEED_FF, envelope=sealed.envelope, ciphertext=sealed.ciphertext, hashes=hashes
     )
     assert result.matched is False
     assert result.plaintext is None
@@ -214,15 +219,17 @@ def test_decrypt_sealed_from_seed_classical_x25519_round_trip() -> None:
     x_pub = keys["x25519"]["public_key"]
     plaintext = b"classical x25519 sealed payload"
 
+    hashes = {"sha2-256": hashlib.sha256(plaintext).digest()}
     sealed = ecies_sealed_poe_wrap(
         plaintext=plaintext,
         recipient_public_keys=[x_pub],
+        hashes=hashes,
         kem="x25519",
     )
     assert sealed.envelope.kem == "x25519"
 
     result = decrypt_sealed_from_seed(
-        seed=SEED_DEADBEEF, envelope=sealed.envelope, ciphertext=sealed.ciphertext
+        seed=SEED_DEADBEEF, envelope=sealed.envelope, ciphertext=sealed.ciphertext, hashes=hashes
     )
     assert result.matched is True
     assert result.plaintext == plaintext

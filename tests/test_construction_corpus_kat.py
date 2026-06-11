@@ -1,19 +1,18 @@
 """Fixture-consumption gates for the shared sealed-PoE conformance vectors that
 the inline construction tests exercise only as self-generated properties.
 
-Three pinned files, loaded from this package's ``tests/fixtures/sealed-poe``
-(the same bytes mirrored into the TypeScript and Rust twins):
+Pinned files, loaded from this package's ``tests/fixtures/sealed-poe`` (the
+same bytes mirrored into the TypeScript and Rust twins):
 
-* ``hybrid-kek-salt.json`` — the X-Wing per-slot KEK salt is
-  ``SHA-256("cardano-poe-xwing-kek-salt-v1" || kem_ct || pub_R)``. Re-derive
-  ``pub_R`` from the recorded seed via the X-Wing keygen, confirm it matches the
-  recorded public key, then assert the salt byte-for-byte.
-* ``construction-negative.json`` (``all_zero_shared_vectors``) — an all-zero
-  X25519 shared secret must mark the slot failed, not matched
-  (``WRONG_RECIPIENT_KEY``).
-* ``construction-negative.json`` (``hybrid_header_binding_vectors``) — a hybrid
-  envelope whose nonce was swapped after sealing recovers a candidate CEK but
-  fails the slots_mac header binding (``TAMPERED_HEADER``).
+* ``x25519-kek-salt.json`` / ``hybrid-kek-salt.json`` — the per-slot KEK HKDF
+  salt is ``SHA-256(label || enc.nonce || <slot KEM material> || pub_R)`` and
+  the KEK its HKDF leaf; both pins carry the envelope nonce in the input.
+* ``construction-negative.json`` — the all-zero X25519 shared-secret fold, the
+  hybrid header-binding nonce swap, hybrid per-slot KEK reuse, scheme / aead /
+  kem header flips, and the X-Wing invalid-recipient-key seal rejection.
+* ``transcript-bytes.json`` — the exact canonicalEncode bytes of
+  SLOTS_TRANSCRIPT (both KEMs) and PASSPHRASE_TRANSCRIPT plus the labelled
+  item-hashes digests they bind.
 """
 
 from __future__ import annotations
@@ -22,19 +21,28 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
-from cardanowall._crypto.mlkem768x25519 import xwing_keygen
+import pytest
+
+from cardanowall._crypto.kdf import hkdf_sha256
+from cardanowall._crypto.kem import x25519_ecdh, x25519_public_key
+from cardanowall._crypto.mlkem768x25519 import xwing_encapsulate, xwing_keygen
 from cardanowall._crypto.sealed_poe import (
-    UNWRAP_REASON_TAMPERED_HEADER,
-    UNWRAP_REASON_WRONG_RECIPIENT_KEY,
+    CARDANO_POE_HKDF_INFO_KEK,
+    CARDANO_POE_HKDF_INFO_KEK_MLKEM768X25519,
+    Argon2idParams,
+    EciesSealedPoeError,
     SealedEnvelope,
     SealedSlot,
-    _ad_content_slots,
+    _compute_pw_hash,
     _compute_slots_hash,
+    _passphrase_transcript,
     _slots_transcript,
+    _x25519_kek_salt,
     _xwing_kek_salt,
     ecies_sealed_poe_unwrap,
+    ecies_sealed_poe_wrap,
+    item_hashes_hash,
 )
-from cardanowall.verifier.decrypt import _ad_content_passphrase
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "sealed-poe"
 
@@ -43,91 +51,133 @@ def _load(filename: str) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads((FIXTURES_DIR / filename).read_text()))
 
 
+def _hashes_from_fixture(hashes_hex: dict[str, str]) -> dict[str, bytes]:
+    return {alg: bytes.fromhex(h) for alg, h in hashes_hex.items()}
+
+
+def _envelope_from_fixture(env: dict[str, Any]) -> SealedEnvelope:
+    slots: list[SealedSlot] = []
+    for s in env["slots"]:
+        if "epk_hex" in s:
+            slots.append(
+                SealedSlot(epk=bytes.fromhex(s["epk_hex"]), wrap=bytes.fromhex(s["wrap_hex"]))
+            )
+        else:
+            slots.append(
+                SealedSlot(kem_ct=bytes.fromhex(s["kem_ct_hex"]), wrap=bytes.fromhex(s["wrap_hex"]))
+            )
+    return SealedEnvelope(
+        scheme=int(env["scheme"]),
+        aead=str(env["aead"]),
+        kem=str(env["kem"]),
+        nonce=bytes.fromhex(str(env["nonce_hex"])),
+        slots=tuple(slots),
+        slots_mac=bytes.fromhex(str(env["slots_mac_hex"])),
+    )
+
+
+def test_x25519_kek_salt_matches_pinned_vector() -> None:
+    vector = _load("x25519-kek-salt.json")["vector"]
+    nonce = bytes.fromhex(str(vector["enc_nonce_hex"]))
+    priv = bytes.fromhex(str(vector["recipient_secret_hex"]))
+    eph = bytes.fromhex(str(vector["ephemeral_secret_hex"]))
+
+    pub = x25519_public_key(priv)
+    assert pub.hex() == vector["recipient_public_hex"]
+    epk = x25519_public_key(eph)
+    assert epk.hex() == vector["epk_hex"]
+
+    salt = _x25519_kek_salt(nonce, epk, pub)
+    assert salt.hex() == vector["expected_kek_salt_hex"]
+
+    shared = x25519_ecdh(eph, pub)
+    kek = hkdf_sha256(ikm=shared, salt=salt, info=CARDANO_POE_HKDF_INFO_KEK, length=32)
+    assert kek.hex() == vector["expected_kek_hex"]
+
+
 def test_hybrid_kek_salt_matches_pinned_vector() -> None:
     vector = _load("hybrid-kek-salt.json")["vector"]
+    nonce = bytes.fromhex(str(vector["enc_nonce_hex"]))
     seed = bytes.fromhex(str(vector["recipient_seed_hex"]))
-    kem_ct = bytes.fromhex(str(vector["kem_ct_hex"]))
+    eseed = bytes.fromhex(str(vector["eseed_hex"]))
 
     # pub_R is recomputed from the recipient seed, exactly as the unwrap path
     # does once per private key. xwing_keygen returns (public_key, secret_seed).
     public_key, _ = xwing_keygen(seed)
     assert public_key.hex() == vector["recipient_public_hex"]
     assert len(public_key) == 1216
+
+    kem_ct, shared = xwing_encapsulate(public_key, eseed)
+    assert kem_ct.hex() == vector["kem_ct_hex"]
     assert len(kem_ct) == 1120
 
-    salt = _xwing_kek_salt(kem_ct, public_key)
+    salt = _xwing_kek_salt(nonce, kem_ct, public_key)
     assert salt.hex() == vector["expected_kek_salt_hex"]
 
-
-def _x25519_envelope_from_hex(env: dict[str, Any]) -> SealedEnvelope:
-    slots = tuple(
-        SealedSlot(epk=bytes.fromhex(str(s["epk_hex"])), wrap=bytes.fromhex(str(s["wrap_hex"])))
-        for s in env["slots"]
+    kek = hkdf_sha256(
+        ikm=shared, salt=salt, info=CARDANO_POE_HKDF_INFO_KEK_MLKEM768X25519, length=32
     )
-    return SealedEnvelope(
-        scheme=int(env["scheme"]),
-        aead=str(env["aead"]),
-        kem=str(env["kem"]),
-        nonce=bytes.fromhex(str(env["nonce_hex"])),
-        slots=slots,
-        slots_mac=bytes.fromhex(str(env["slots_mac_hex"])),
-    )
-
-
-def _hybrid_envelope_from_hex(env: dict[str, Any]) -> SealedEnvelope:
-    # The on-wire chunks reassemble to the 1120-byte enc; the slot carries the
-    # flat reassembled bytes (the transcript re-chunks them canonically).
-    slots = tuple(
-        SealedSlot(
-            kem_ct=b"".join(bytes.fromhex(c) for c in s["kem_ct_chunks_hex"]),
-            wrap=bytes.fromhex(str(s["wrap_hex"])),
-        )
-        for s in env["slots"]
-    )
-    return SealedEnvelope(
-        scheme=int(env["scheme"]),
-        aead=str(env["aead"]),
-        kem=str(env["kem"]),
-        nonce=bytes.fromhex(str(env["nonce_hex"])),
-        slots=slots,
-        slots_mac=bytes.fromhex(str(env["slots_mac_hex"])),
-    )
+    assert kek.hex() == vector["expected_kek_hex"]
 
 
 def test_all_zero_x25519_shared_secret_is_a_failed_slot() -> None:
     corpus = _load("construction-negative.json")
     for vector in corpus["all_zero_shared_vectors"]:
-        envelope = _x25519_envelope_from_hex(vector["envelope"])
         result = ecies_sealed_poe_unwrap(
-            envelope=envelope,
+            envelope=_envelope_from_fixture(vector["envelope"]),
             ciphertext=bytes.fromhex(str(vector["ciphertext_hex"])),
+            hashes=_hashes_from_fixture(vector["hashes"]),
             recipient_secret_key=bytes.fromhex(str(vector["recipient_secret_hex"])),
         )
         assert result.matched is False, vector["name"]
         assert result.reason == vector["expected_reason"], vector["name"]
-        # The fixture pins WRONG_RECIPIENT_KEY for the all-zero shared case.
-        assert vector["expected_reason"] == UNWRAP_REASON_WRONG_RECIPIENT_KEY
 
 
 def test_hybrid_nonce_swap_breaks_header_binding() -> None:
     corpus = _load("construction-negative.json")
     for vector in corpus["hybrid_header_binding_vectors"]:
-        envelope = _hybrid_envelope_from_hex(vector["envelope"])
-        # The recipient seed re-derives the X-Wing key that wrapped the slot, so
-        # a candidate CEK is recovered — but the swapped nonce changes the slots
-        # transcript and the CEK-keyed slots_mac no longer matches.
         result = ecies_sealed_poe_unwrap(
-            envelope=envelope,
+            envelope=_envelope_from_fixture(vector["envelope"]),
             ciphertext=bytes.fromhex(str(vector["ciphertext_hex"])),
-            recipient_secret_key=bytes.fromhex(str(vector["recipient_seed_hex"])),
+            hashes=_hashes_from_fixture(vector["hashes"]),
+            recipient_secret_key=bytes.fromhex(str(vector["recipient_secret_hex"])),
         )
         assert result.matched is False, vector["name"]
         assert result.reason == vector["expected_reason"], vector["name"]
-        assert vector["expected_reason"] == UNWRAP_REASON_TAMPERED_HEADER
+
+
+def test_header_flips_and_hybrid_duplicates_raise_typed_codes() -> None:
+    corpus = _load("construction-negative.json")
+    for vector in corpus["header_flip_vectors"] + corpus["hybrid_duplicate_kem_ct_vectors"]:
+        with pytest.raises(EciesSealedPoeError) as exc:
+            ecies_sealed_poe_unwrap(
+                envelope=_envelope_from_fixture(vector["envelope"]),
+                ciphertext=bytes.fromhex(str(vector["ciphertext_hex"])),
+                hashes=_hashes_from_fixture(vector["hashes"]),
+                recipient_secret_key=bytes.fromhex(str(vector["recipient_secret_hex"])),
+            )
+        assert exc.value.code == vector["expected_error_code"], vector["name"]
+
+
+def test_xwing_invalid_recipient_pk_is_rejected_at_seal() -> None:
+    corpus = _load("construction-negative.json")
+    for vector in corpus["xwing_invalid_recipient_pk_vectors"]:
+        invalid_pub = bytes.fromhex(str(vector["recipient_public_hex"]))
+        assert len(invalid_pub) == 1216
+        with pytest.raises(EciesSealedPoeError) as exc:
+            ecies_sealed_poe_wrap(
+                plaintext=b"never sealed",
+                recipient_public_keys=[invalid_pub],
+                hashes={"sha2-256": bytes(32)},
+                kem="mlkem768x25519",
+                eseeds=[bytes.fromhex(str(vector["eseed_hex"]))],
+                skip_shuffle=True,
+            )
+        assert exc.value.code == vector["expected_error_code"], vector["name"]
 
 
 def _slots_from_wrap(filename: str, kem: str) -> tuple[bytes, tuple[SealedSlot, ...], bytes]:
-    """Load (nonce, slots, slots_mac) from a committed wrap fixture."""
+    """Load (nonce, slots, hashes_hash) inputs from a committed wrap fixture."""
     wrap = _load(filename)["vector"]
     if kem == "x25519":
         slots = tuple(
@@ -139,48 +189,51 @@ def _slots_from_wrap(filename: str, kem: str) -> tuple[bytes, tuple[SealedSlot, 
             SealedSlot(kem_ct=bytes.fromhex(s["kem_ct_hex"]), wrap=bytes.fromhex(s["wrap_hex"]))
             for s in wrap["expected_slots"]
         )
-    return (
-        bytes.fromhex(wrap["nonce_hex"]),
-        slots,
-        bytes.fromhex(wrap["expected_slots_mac_hex"]),
-    )
+    hashes_hash = item_hashes_hash(_hashes_from_fixture(wrap["hashes"]))
+    return bytes.fromhex(wrap["nonce_hex"]), slots, hashes_hash
 
 
-def test_transcript_and_aad_bytes_match_pinned_vectors() -> None:
-    # Pins the exact canonicalEncode output of SLOTS_TRANSCRIPT, AD_CONTENT_SLOTS,
-    # and AD_CONTENT_PASSPHRASE so a canonical-encoding divergence is caught
-    # directly, not only via a downstream slots_mac / AEAD-tag mismatch.
+def test_transcript_bytes_match_pinned_vectors() -> None:
+    # Pins the exact canonicalEncode output of SLOTS_TRANSCRIPT (both KEMs),
+    # PASSPHRASE_TRANSCRIPT, and the item-hashes digests, so a canonical-
+    # encoding divergence is caught directly, not only via a downstream
+    # slots_mac / commitment mismatch.
     corpus = _load("transcript-bytes.json")
-    saw_x25519 = saw_hybrid = saw_passphrase = False
+    saw_hashes = saw_x25519 = saw_hybrid = saw_passphrase = False
     for vector in corpus["vectors"]:
-        if "kem" in vector:
+        name = str(vector["name"])
+        if name.startswith("item-hashes-hash"):
+            hashes = _hashes_from_fixture(vector["hashes"])
+            assert item_hashes_hash(hashes).hex() == vector["expected_hashes_hash_hex"], name
+            saw_hashes = True
+        elif name.startswith("slots-transcript"):
             kem = str(vector["kem"])
-            source = (
-                "wrap-n3.json" if kem == "x25519" else "wrap-hybrid-n1.json"
-            )
-            nonce, slots, slots_mac = _slots_from_wrap(source, kem)
-            assert nonce.hex() == vector["nonce_hex"], vector["name"]
+            source = "wrap-n3.json" if kem == "x25519" else "wrap-hybrid-n1.json"
+            nonce, slots, hashes_hash = _slots_from_wrap(source, kem)
+            assert nonce.hex() == vector["nonce_hex"], name
+            assert hashes_hash.hex() == vector["expected_hashes_hash_hex"], name
 
-            transcript = _slots_transcript(nonce, slots, kem)
-            assert transcript.hex() == vector["expected_slots_transcript_canonical_hex"], (
-                vector["name"]
-            )
+            transcript = _slots_transcript(nonce, slots, kem, hashes_hash)
+            assert transcript.hex() == vector["expected_slots_transcript_canonical_hex"], name
 
-            slots_hash = _compute_slots_hash(nonce, slots, kem)
-            assert slots_hash.hex() == vector["expected_slots_hash_hex"], vector["name"]
-
-            ad = _ad_content_slots(nonce, kem, slots_hash, slots_mac)
-            assert ad.hex() == vector["expected_ad_content_slots_canonical_hex"], vector["name"]
+            slots_hash = _compute_slots_hash(nonce, slots, kem, hashes_hash)
+            assert slots_hash.hex() == vector["expected_slots_hash_hex"], name
             saw_x25519 = saw_x25519 or kem == "x25519"
             saw_hybrid = saw_hybrid or kem == "mlkem768x25519"
         else:
-            kdf = {
-                "alg": "argon2id",
-                "salt": bytes.fromhex(str(vector["salt_hex"])),
-                "params": vector["params"],
-            }
-            ad = _ad_content_passphrase(bytes.fromhex(str(vector["nonce_hex"])), kdf)  # type: ignore[arg-type]
-            expected = vector["expected_ad_content_passphrase_canonical_hex"]
-            assert ad.hex() == expected, vector["name"]
+            nonce = bytes.fromhex(str(vector["nonce_hex"]))
+            salt = bytes.fromhex(str(vector["salt_hex"]))
+            params = Argon2idParams(
+                m=int(vector["params"]["m"]),
+                t=int(vector["params"]["t"]),
+                p=int(vector["params"]["p"]),
+            )
+            hashes_hash = item_hashes_hash(_hashes_from_fixture(vector["hashes"]))
+            assert hashes_hash.hex() == vector["expected_hashes_hash_hex"], name
+
+            transcript = _passphrase_transcript(nonce, salt, params, hashes_hash)
+            assert transcript.hex() == vector["expected_passphrase_transcript_canonical_hex"], name
+            pw_hash = _compute_pw_hash(nonce, salt, params, hashes_hash)
+            assert pw_hash.hex() == vector["expected_pw_hash_hex"], name
             saw_passphrase = True
-    assert saw_x25519 and saw_hybrid and saw_passphrase
+    assert saw_hashes and saw_x25519 and saw_hybrid and saw_passphrase

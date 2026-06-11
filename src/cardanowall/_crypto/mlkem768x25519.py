@@ -72,9 +72,7 @@ def _x25519_ecdh(secret_scalar: bytes, peer_public_key: bytes) -> bytes:
 
 def _combine(ss_mlkem: bytes, ss_x25519: bytes, ct_x25519: bytes, pk_x25519: bytes) -> bytes:
     """X-Wing shared-secret combiner: SHA3-256(ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ label)."""
-    return hashlib.sha3_256(
-        ss_mlkem + ss_x25519 + ct_x25519 + pk_x25519 + _COMBINER_LABEL
-    ).digest()
+    return hashlib.sha3_256(ss_mlkem + ss_x25519 + ct_x25519 + pk_x25519 + _COMBINER_LABEL).digest()
 
 
 def xwing_keygen(seed: bytes) -> tuple[bytes, bytes]:

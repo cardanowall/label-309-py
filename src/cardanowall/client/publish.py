@@ -41,14 +41,12 @@ from cardanowall._crypto.sealed_poe import (
     SealedEnvelope as _SealedEnvelopeDataclass,
 )
 from cardanowall._crypto.sealed_poe import (
-    _chunk_kem_ct,
     ecies_sealed_poe_wrap,
 )
 from cardanowall.poe_standard import (
     EncryptionEnvelope,
     MerkleCommit,
     PoeRecord,
-    chunk_text,
     encode_poe_record,
 )
 
@@ -239,9 +237,7 @@ async def _invoke_signer(signer: Signer, sig_structure_bytes: bytes) -> bytes:
     else:
         sig = result
     if not isinstance(sig, (bytes, bytearray)) or len(sig) != _ED25519_SIGNATURE_LENGTH:
-        length_repr = (
-            str(len(sig)) if isinstance(sig, (bytes, bytearray)) else "unknown"
-        )
+        length_repr = str(len(sig)) if isinstance(sig, (bytes, bytearray)) else "unknown"
         raise PublishError(
             PublishError.INVALID_SIGNER_SIGNATURE,
             f"signer.sign() must return {_ED25519_SIGNATURE_LENGTH} bytes; got "
@@ -250,9 +246,7 @@ async def _invoke_signer(signer: Signer, sig_structure_bytes: bytes) -> bytes:
     return bytes(sig)
 
 
-def _build_json_headers(
-    api_key: str | None, idempotency_key: str | None = None
-) -> dict[str, str]:
+def _build_json_headers(api_key: str | None, idempotency_key: str | None = None) -> dict[str, str]:
     headers = {"content-type": "application/json", "accept": "application/json"}
     if api_key is not None:
         headers["authorization"] = f"Bearer {api_key}"
@@ -432,8 +426,7 @@ async def publish_prehashed(
         if len(digest_bytes) != expected:
             raise PublishError(
                 PublishError.INVALID_DIGEST,
-                f"hashes[{alg}] must be a {expected}-byte digest "
-                f"(got {len(digest_bytes)} bytes)",
+                f"hashes[{alg}] must be a {expected}-byte digest (got {len(digest_bytes)} bytes)",
             )
         decoded[alg] = digest_bytes
 
@@ -476,15 +469,10 @@ async def publish_sealed(
     # KEM-aware recipient-length guard: 32 B for the classical x25519 path,
     # 1216 B for the X-Wing hybrid. Mirrors the TS publishSealed guard.
     expected_recipient_length = (
-        _X25519_PUBLIC_KEY_LENGTH
-        if kem == "x25519"
-        else _MLKEM768X25519_PUBLIC_KEY_LENGTH
+        _X25519_PUBLIC_KEY_LENGTH if kem == "x25519" else _MLKEM768X25519_PUBLIC_KEY_LENGTH
     )
     for i, pub in enumerate(recipients):
-        if (
-            not isinstance(pub, (bytes, bytearray))
-            or len(pub) != expected_recipient_length
-        ):
+        if not isinstance(pub, (bytes, bytearray)) or len(pub) != expected_recipient_length:
             raise PublishError(
                 PublishError.INVALID_RECIPIENT,
                 f"recipients[{i}] must be a {expected_recipient_length}-byte "
@@ -497,6 +485,7 @@ async def publish_sealed(
     sealed = ecies_sealed_poe_wrap(
         plaintext=plaintext,
         recipient_public_keys=[bytes(p) for p in recipients],
+        hashes={hash_alg: plaintext_digest},
         kem=kem,
     )
 
@@ -513,7 +502,7 @@ async def publish_sealed(
         "items": [
             {
                 "hashes": {hash_alg: plaintext_digest},
-                "uris": [chunk_text(uri)],
+                "uris": [uri],
                 "enc": envelope,
             },
         ],
@@ -532,15 +521,11 @@ def _envelope_to_wire(envelope: _SealedEnvelopeDataclass) -> EncryptionEnvelope:
     # boundary so downstream encoders typecheck.
     # Per-slot wire shape is KEM-driven (the dataclass carries epk XOR kem_ct):
     #   - x25519:         { epk: bstr(32), wrap: bstr(48) }
-    #   - mlkem768x25519: { kem_ct: [bstr, ...], wrap: bstr(48) } — the 1120-byte
-    #     X-Wing enc chunked into <= 64-byte byte strings, NO per-slot epk. The
-    #     chunk boundaries match what crypto-core committed to slots_mac.
+    #   - mlkem768x25519: { kem_ct: bstr(1120), wrap: bstr(48) } — the X-Wing
+    #     ciphertext as a single byte string, NO per-slot epk.
     slots: list[dict[str, object]]
     if envelope.kem == "mlkem768x25519":
-        slots = [
-            {"kem_ct": _chunk_kem_ct(s.kem_ct or b""), "wrap": s.wrap}
-            for s in envelope.slots
-        ]
+        slots = [{"kem_ct": s.kem_ct or b"", "wrap": s.wrap} for s in envelope.slots]
     else:
         slots = [{"epk": s.epk, "wrap": s.wrap} for s in envelope.slots]
     return cast(
@@ -608,7 +593,7 @@ async def publish_merkle(
         "alg": "rfc9162-sha256",
         "root": root,
         "leaf_count": len(leaves_bytes),
-        "uris": [chunk_text(uri)],
+        "uris": [uri],
     }
     record: PoeRecord = {"v": 1, "merkle": [merkle_entry]}
     record_bytes = await _encode_record(record, signer)

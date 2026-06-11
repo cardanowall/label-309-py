@@ -39,8 +39,8 @@ CORPUS_PATH = Path(
 FIXTURES_DIR = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "verify-reports"
 
 CONFORMANCE_DENY: tuple[str, ...] = (
-    "cardanowall.com",
-    "*.cardanowall.com",
+    "operator.example",
+    "*.operator.example",
     "localhost",
     "127.0.0.1",
 )
@@ -55,9 +55,9 @@ def _load_corpus() -> list[CorpusRecord]:
 CORPUS: list[CorpusRecord] = _load_corpus()
 
 
-def _is_cardanowall_host(url: str) -> bool:
+def _is_denied_operator_host(url: str) -> bool:
     host = (urlparse(url).hostname or "").strip("[]").rstrip(".").lower()
-    return host == "cardanowall.com" or host.endswith(".cardanowall.com")
+    return host == "operator.example" or host.endswith(".operator.example")
 
 
 def test_corpus_has_at_least_100_records() -> None:
@@ -73,9 +73,7 @@ def _verify_input(record: CorpusRecord) -> VerifyTxInput:
     # plumb any recipient secret keys into `decryption`.
     use_blockfrost = record.get("provider") == "blockfrost"
     decryption = tuple(
-        DecryptionRecipient(
-            item_index=r["item_index"], recipient_secret_key=bytes.fromhex(r["secret_key"])
-        )
+        DecryptionRecipient(recipient_secret_key=bytes.fromhex(r["secret_key"]))
         for r in record.get("recipient_secret_keys", [])
     )
     return VerifyTxInput(
@@ -107,4 +105,4 @@ def test_verify_report_matches_expected_fixture(record: CorpusRecord) -> None:
         f"VerifyReport diverged from expected fixture for tx {record['tx_hash']}"
     )
     assert result.verdict == record["expected_verdict"]
-    assert all(not _is_cardanowall_host(c.url) for c in result.http_calls)
+    assert all(not _is_denied_operator_host(c.url) for c in result.audit_trail)

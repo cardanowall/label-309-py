@@ -214,9 +214,7 @@ def test_publish_content_dedup_hit_true_on_200() -> None:
 
         signer = _make_signer()
         async with _client_with_handler(handler) as client:
-            out = await client.poe.publish_content(
-                content="x", quote_id=QUOTE_ID, signer=signer
-            )
+            out = await client.poe.publish_content(content="x", quote_id=QUOTE_ID, signer=signer)
             assert out["dedup_hit"] is True
 
     asyncio.run(run())
@@ -273,8 +271,8 @@ def test_publish_sealed_encrypts_uploads_publishes_with_ar_uri() -> None:
         item = result.record["items"][0]
         assert "enc" in item
         assert "uris" in item
-        # Reconstruct the chunked text array into the original URI.
-        assert "".join(item["uris"][0]) == ar_uri
+        # Each URI is one absolute URI in a single text string.
+        assert item["uris"] == [ar_uri]
         assert len(result.record["sigs"]) == 1
 
         # End-to-end decrypt.
@@ -290,6 +288,7 @@ def test_publish_sealed_encrypts_uploads_publishes_with_ar_uri() -> None:
         unwrap = ecies_sealed_poe_unwrap(
             envelope=envelope,
             ciphertext=cast("bytes", seen["ciphertext"]),
+            hashes=dict(item["hashes"].items()),
             recipient_secret_key=recipient_secret,
         )
         assert unwrap.matched
@@ -457,9 +456,7 @@ def test_publish_merkle_raises_partial_upload_error() -> None:
         signer = _make_signer()
         async with _client_with_handler(handler) as client:
             with pytest.raises(PartialUploadError):
-                await client.poe.publish_merkle(
-                    leaves=leaves, quote_id=QUOTE_ID, signer=signer
-                )
+                await client.poe.publish_merkle(leaves=leaves, quote_id=QUOTE_ID, signer=signer)
         assert call_count["n"] == 1
 
     asyncio.run(run())
@@ -590,9 +587,7 @@ def test_publish_prehashed_rejects_empty_hashes() -> None:
         signer = _make_signer()
         async with _client_with_handler(handler) as client:
             with pytest.raises(PublishError) as exc:
-                await client.poe.publish_prehashed(
-                    hashes={}, quote_id=QUOTE_ID, signer=signer
-                )
+                await client.poe.publish_prehashed(hashes={}, quote_id=QUOTE_ID, signer=signer)
             assert exc.value.code == "INVALID_DIGEST"
 
     asyncio.run(run())
@@ -670,12 +665,10 @@ def test_publish_sealed_defaults_to_hybrid_kem_and_round_trips() -> None:
         # The PQC-default correctness assertion: hybrid envelope + hybrid slots.
         assert enc["kem"] == "mlkem768x25519"
         for slot in enc["slots"]:
-            assert "kem_ct" in slot
             assert "epk" not in slot
-            # kem_ct is the chunked 1120-byte X-Wing enc (<=64B chunks).
-            assert sum(len(c) for c in slot["kem_ct"]) == 1120
-            for chunk in slot["kem_ct"]:
-                assert len(chunk) <= 64
+            # kem_ct is the SINGLE 1120-byte X-Wing encapsulation.
+            assert isinstance(slot["kem_ct"], bytes)
+            assert len(slot["kem_ct"]) == 1120
 
         # End-to-end decrypt with the recipient's X-Wing secret seed.
         envelope = _SealedEnvelopeDataclass(
@@ -684,14 +677,14 @@ def test_publish_sealed_defaults_to_hybrid_kem_and_round_trips() -> None:
             kem=enc["kem"],
             nonce=enc["nonce"],
             slots=tuple(
-                _SealedSlotDataclass(kem_ct=b"".join(s["kem_ct"]), wrap=s["wrap"])
-                for s in enc["slots"]
+                _SealedSlotDataclass(kem_ct=s["kem_ct"], wrap=s["wrap"]) for s in enc["slots"]
             ),
             slots_mac=enc["slots_mac"],
         )
         unwrap = ecies_sealed_poe_unwrap(
             envelope=envelope,
             ciphertext=cast("bytes", seen["ciphertext"]),
+            hashes=dict(item["hashes"].items()),
             recipient_secret_key=recipient_seed,
         )
         assert unwrap.matched
@@ -765,14 +758,13 @@ def test_publish_sealed_classical_kem_opt_out_emits_epk_slots() -> None:
             aead=enc["aead"],
             kem=enc["kem"],
             nonce=enc["nonce"],
-            slots=tuple(
-                _SealedSlotDataclass(epk=s["epk"], wrap=s["wrap"]) for s in enc["slots"]
-            ),
+            slots=tuple(_SealedSlotDataclass(epk=s["epk"], wrap=s["wrap"]) for s in enc["slots"]),
             slots_mac=enc["slots_mac"],
         )
         unwrap = ecies_sealed_poe_unwrap(
             envelope=envelope,
             ciphertext=cast("bytes", seen["ciphertext"]),
+            hashes=dict(result.record["items"][0]["hashes"].items()),
             recipient_secret_key=recipient_secret,
         )
         assert unwrap.matched

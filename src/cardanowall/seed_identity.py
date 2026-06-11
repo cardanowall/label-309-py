@@ -19,6 +19,7 @@ sourcing it securely; the SDK never persists or logs it.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TypedDict
 
@@ -118,16 +119,18 @@ def recipient_secret_keys_from_seed(seed: bytes) -> dict[str, list[bytes]]:
 
 
 def decrypt_sealed_from_seed(
-    *, seed: bytes, envelope: SealedEnvelope, ciphertext: bytes
+    *, seed: bytes, envelope: SealedEnvelope, ciphertext: bytes, hashes: Mapping[str, bytes]
 ) -> UnwrapResult:
     """Decrypt a sealed PoE (envelope + ciphertext) from the seed.
 
     Derives the recipient keys, selects the single secret matching
     ``envelope.kem`` (the X25519 secret key for the classical path, the X-Wing
-    secret seed for the hybrid path), and runs the single-priv unwrap. Never
-    throws on an authentication failure -- returns the discriminated
-    :class:`~cardanowall._crypto.sealed_poe.UnwrapResult` (``matched`` /
-    ``plaintext`` / ``reason``).
+    secret seed for the hybrid path), and runs the single-priv unwrap.
+    ``hashes`` is the item's content-hash map — the slots transcript binds its
+    digest, so the on-chain MAC match confirms the envelope was sealed for this
+    item's hash claim. Never throws on an authentication failure -- returns the
+    discriminated :class:`~cardanowall._crypto.sealed_poe.UnwrapResult`
+    (``matched`` / ``plaintext`` / ``reason``).
     """
     keys = derive_keys_from_seed(seed)
     secret = (
@@ -136,7 +139,7 @@ def decrypt_sealed_from_seed(
         else keys["mlkem768x25519"]["secret_seed"]
     )
     return ecies_sealed_poe_unwrap(
-        envelope=envelope, ciphertext=ciphertext, recipient_secret_key=secret
+        envelope=envelope, ciphertext=ciphertext, hashes=hashes, recipient_secret_key=secret
     )
 
 
