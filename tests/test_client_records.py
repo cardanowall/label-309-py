@@ -19,13 +19,14 @@ import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 
 from cardanowall.client.label309_client import Label309Client
 from cardanowall.client.record_not_found_error import RecordNotFoundError
+from cardanowall.client.types import PoeVerifyInput
 
 # Stable opaque bearer token — forwarded verbatim, never parsed by the client.
 FIXTURE_API_KEY = "opaque-bearer-fixture-token"
@@ -294,6 +295,32 @@ def test_verify_posts_records_verify_with_json_body_and_returns_typed_verify_rep
         # ONLY accepted field, so this also pins that the client wire body
         # carries no decryption credentials.
         assert captured["body"] == {"fetch_content": False}
+
+    asyncio.run(run())
+
+
+def test_verify_whitelists_wire_body_so_unknown_caller_keys_never_sent() -> None:
+    async def run() -> None:
+        captured: dict[str, object] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            captured["content"] = req.content.decode("utf-8")
+            return httpx.Response(200, json=_verify_report_fixture())
+
+        # An untyped call site can smuggle arbitrary keys — including
+        # decryption credentials — into the input dict. The client must drop
+        # everything except the known ``fetch_content`` key, asserted here on
+        # the raw body bytes.
+        poisoned: dict[str, Any] = {
+            "fetch_content": False,
+            "decryption": [{"recipient_secret_key": "SECRET"}],
+            "verify_uris": ["x"],
+        }
+        async with _client_with_handler(handler) as client:
+            await client.records.verify(TX_HASH, cast(PoeVerifyInput, poisoned))
+
+        assert captured["content"] == '{"fetch_content":false}'
+        assert "SECRET" not in str(captured["content"])
 
     asyncio.run(run())
 

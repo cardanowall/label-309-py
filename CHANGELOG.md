@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > change in backward-incompatible ways until a 1.0 release. Pre-1.0 versions do
 > not carry the stability guarantees of [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-06-13
+
+### Security
+
+- `client.records.verify()` builds the request body field by field and transmits only `fetch_content`. An untyped call site (a raw dict) can no longer pass extra keys — including decryption credentials — through to the gateway.
+
 ## [0.5.0] - 2026-06-12
 
 ### Breaking

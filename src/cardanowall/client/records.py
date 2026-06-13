@@ -163,9 +163,16 @@ class RecordsNamespace:
         ``fetch_content: False`` skips content re-fetching; affected claims
         report ``not_checked``.
         """
+        # Whitelist-build the wire body key by key — never serialize the
+        # caller's dict verbatim — so unknown keys smuggled in by an untyped
+        # call site (including credential material) can never reach the
+        # gateway.
+        safe: dict[str, object] = {}
+        if input is not None and "fetch_content" in input:
+            safe["fetch_content"] = input["fetch_content"]
         response = await self._config.http_client.post(
             f"{self._config.base_url}/api/v1/records/{tx_hash}/verify",
-            content=json.dumps(input or {}, separators=(",", ":")),
+            content=json.dumps(safe, separators=(",", ":")),
             headers=_build_headers(self._config.api_key),
         )
         _raise_for_status(response)

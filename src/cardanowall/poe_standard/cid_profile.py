@@ -65,13 +65,23 @@ def _b32_decode(s: str, alpha_index: dict[str, int]) -> bytes | None:
     return bytes(out)
 
 
-def _b16_decode(s: str) -> bytes | None:
+_B16_ALPHA_LOWER: Final[str] = "0123456789abcdef"
+_B16_INDEX_LOWER: Final[dict[str, int]] = {c: i for i, c in enumerate(_B16_ALPHA_LOWER)}
+_B16_ALPHA_UPPER: Final[str] = "0123456789ABCDEF"
+_B16_INDEX_UPPER: Final[dict[str, int]] = {c: i for i, c in enumerate(_B16_ALPHA_UPPER)}
+
+
+def _b16_decode(s: str, alpha_index: dict[str, int]) -> bytes | None:
     if len(s) % 2 != 0:
         return None
-    try:
-        return bytes.fromhex(s)
-    except ValueError:
-        return None
+    out = bytearray()
+    for i in range(0, len(s), 2):
+        hi = alpha_index.get(s[i])
+        lo = alpha_index.get(s[i + 1])
+        if hi is None or lo is None:
+            return None
+        out.append((hi << 4) | lo)
+    return bytes(out)
 
 
 def _read_varint(data: bytes, offset: int) -> tuple[int, int] | None:
@@ -108,17 +118,20 @@ def _is_valid_cidv1(s: str) -> bool:
     prefix = s[0]
     rest = s[1:]
     payload: bytes | None
-    # RFC 4648 base32/base16 are case-insensitive encodings, so the body is
-    # case-folded before decoding regardless of which case the multibase
-    # prefix advertises. base58btc is case-significant and is never folded.
+    # Decode the body VERBATIM against the case the prefix advertises — never
+    # case-fold. RFC 4648 base32/base16 each have a distinct lower- and
+    # upper-case multibase prefix (``b``/``B``, ``f``/``F``); a body whose case
+    # disagrees with its prefix is not a canonical CID and is rejected (the
+    # mismatched character is absent from the advertised alphabet), not folded
+    # into the advertised case. base58btc is case-significant and never folded.
     if prefix == "b":
-        payload = _b32_decode(rest.lower(), _B32_INDEX_LOWER)
+        payload = _b32_decode(rest, _B32_INDEX_LOWER)
     elif prefix == "B":
-        payload = _b32_decode(rest.upper(), _B32_INDEX_UPPER)
+        payload = _b32_decode(rest, _B32_INDEX_UPPER)
     elif prefix == "f":
-        payload = _b16_decode(rest.lower())
+        payload = _b16_decode(rest, _B16_INDEX_LOWER)
     elif prefix == "F":
-        payload = _b16_decode(rest.upper())
+        payload = _b16_decode(rest, _B16_INDEX_UPPER)
     elif prefix == "z":
         payload = _b58_decode(rest)
     else:
