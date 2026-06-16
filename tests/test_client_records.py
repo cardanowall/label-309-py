@@ -1,16 +1,15 @@
 """Unit tests for client.records.* — the records read namespace that wraps
-``GET /api/v1/records``, ``GET /api/v1/records/{tx_hash}`` and
-``POST /api/v1/records/{tx_hash}/verify``.
+``GET /api/v1/records`` and ``GET /api/v1/records/{tx_hash}``.
 
 Test shape mirrors the server fixture: we assert on the actual HTTP request
 shape (URL, method, headers, body) AND on the response being parsed into the
-typed ``RecordResource`` / ``VerifyReport`` JSON.
+typed ``RecordResource`` JSON.
 
-The previous incarnation of these tests (under ``client.poe.get/verify``) was
+The previous incarnation of these tests (under ``client.poe.get``) was
 mock-asserts-input — it would have continued to pass even when the methods
 hit a non-existent ``/api/v1/poe/{tx_hash}`` URL. The fixtures below come
-from the real server response shapes (the RecordResource schema on the
-server side; VerifyReport in ``cardanowall.verifier.types``).
+from the real server response shape (the RecordResource projection the
+indexer serves).
 """
 
 from __future__ import annotations
@@ -19,14 +18,13 @@ import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import httpx
 import pytest
 
 from cardanowall.client.label309_client import Label309Client
 from cardanowall.client.record_not_found_error import RecordNotFoundError
-from cardanowall.client.types import PoeVerifyInput
 
 # Stable opaque bearer token — forwarded verbatim, never parsed by the client.
 FIXTURE_API_KEY = "opaque-bearer-fixture-token"
@@ -42,7 +40,11 @@ def _client_with_handler(
     transport = httpx.MockTransport(handler)
     return Label309Client(
         api_key=api_key,
-        base_url="http://test.example",
+        # Full versioned base: the version segment lives here, not in the
+        # client's per-request URL building. Resource suffixes append to it,
+        # so the served path stays /api/v1/records/… and the cross-SDK parity
+        # fixtures remain byte-identical.
+        base_url="http://test.example/api/v1",
         http_client=httpx.AsyncClient(transport=transport),
     )
 
@@ -60,24 +62,6 @@ def _record_fixture(**overrides: Any) -> dict[str, Any]:
         "item_count": 1,
         "signer_ed25519": None,
         "metadata_cbor_base64": "oWNmb29jYmFy",
-    }
-    base.update(overrides)
-    return base
-
-
-def _verify_report_fixture(**overrides: Any) -> dict[str, Any]:
-    """Realistic VerifyReport fixture — mirrors the shape the server returns."""
-    base: dict[str, Any] = {
-        "tx_hash": TX_HASH,
-        "network": "mainnet",
-        "verdict": "valid",
-        "exit_code": 0,
-        "profile": "core",
-        "num_confirmations": 100,
-        "confirmation_depth_threshold": 12,
-        "metadata_present": True,
-        "validation": {"valid": True},
-        "http_calls": [],
     }
     base.update(overrides)
     return base
@@ -270,99 +254,6 @@ def test_get_404_raises_record_not_found() -> None:
     asyncio.run(run())
 
 
-def test_verify_posts_records_verify_with_json_body_and_returns_typed_verify_report() -> None:
-    async def run() -> None:
-        captured: dict[str, object] = {}
-
-        def handler(req: httpx.Request) -> httpx.Response:
-            captured["method"] = req.method
-            captured["path"] = req.url.path
-            captured["body"] = json.loads(req.content) if req.content else None
-            return httpx.Response(200, json=_verify_report_fixture())
-
-        async with _client_with_handler(handler) as client:
-            out = await client.records.verify(TX_HASH, {"fetch_content": False})
-
-        assert out["verdict"] == "valid"
-        assert out["exit_code"] == 0
-        assert out["validation"]["valid"] is True
-
-        assert captured["method"] == "POST"
-        assert captured["path"] == f"/api/v1/records/{TX_HASH}/verify"
-        # Body MUST round-trip the caller-supplied flag — proves the body is
-        # actually sent over the wire (not mock-asserted against itself).
-        # The endpoint is the hosted PUBLIC verifier: ``fetch_content`` is the
-        # ONLY accepted field, so this also pins that the client wire body
-        # carries no decryption credentials.
-        assert captured["body"] == {"fetch_content": False}
-
-    asyncio.run(run())
-
-
-def test_verify_whitelists_wire_body_so_unknown_caller_keys_never_sent() -> None:
-    async def run() -> None:
-        captured: dict[str, object] = {}
-
-        def handler(req: httpx.Request) -> httpx.Response:
-            captured["content"] = req.content.decode("utf-8")
-            return httpx.Response(200, json=_verify_report_fixture())
-
-        # An untyped call site can smuggle arbitrary keys — including
-        # decryption credentials — into the input dict. The client must drop
-        # everything except the known ``fetch_content`` key, asserted here on
-        # the raw body bytes.
-        poisoned: dict[str, Any] = {
-            "fetch_content": False,
-            "decryption": [{"recipient_secret_key": "SECRET"}],
-            "verify_uris": ["x"],
-        }
-        async with _client_with_handler(handler) as client:
-            await client.records.verify(TX_HASH, cast(PoeVerifyInput, poisoned))
-
-        assert captured["content"] == '{"fetch_content":false}'
-        assert "SECRET" not in str(captured["content"])
-
-    asyncio.run(run())
-
-
-def test_verify_sends_empty_json_body_when_no_input() -> None:
-    async def run() -> None:
-        captured: dict[str, object] = {}
-
-        def handler(req: httpx.Request) -> httpx.Response:
-            captured["body"] = json.loads(req.content) if req.content else None
-            return httpx.Response(200, json=_verify_report_fixture())
-
-        async with _client_with_handler(handler) as client:
-            await client.records.verify(TX_HASH)
-
-        assert captured["body"] == {}
-
-    asyncio.run(run())
-
-
-def test_verify_404_raises_record_not_found() -> None:
-    async def run() -> None:
-        def handler(_req: httpx.Request) -> httpx.Response:
-            return httpx.Response(
-                404,
-                json={
-                    "type": "https://cardanowall.com/problems/record-not-found",
-                    "title": "Record Not Found",
-                    "status": 404,
-                    "detail": "No record is indexed under that transaction hash.",
-                    "code": "record-not-found",
-                    "trace_id": "01977c00-0000-7000-8000-000000000000",
-                },
-            )
-
-        async with _client_with_handler(handler) as client:
-            with pytest.raises(RecordNotFoundError):
-                await client.records.verify(TX_HASH)
-
-    asyncio.run(run())
-
-
 def test_records_get_request_shape_matches_cross_sdk_parity_fixture() -> None:
     """Both SDKs (TS + Py) must produce a byte-identical HTTP request shape
     for the canonical ``client.records.get(TX_HASH)`` call. The fixture lives
@@ -394,5 +285,106 @@ def test_records_get_request_shape_matches_cross_sdk_parity_fixture() -> None:
         assert captured["url"] == fixture["url"]
         assert captured["authorization"] == fixture["authorization"]
         assert captured["accept"] == fixture["accept"]
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# records.count() — GET /records/count, signer required.
+# ---------------------------------------------------------------------------
+
+
+def test_count_returns_typed_count() -> None:
+    async def run() -> None:
+        captured: dict[str, object] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            captured["url"] = str(req.url)
+            return httpx.Response(
+                200,
+                json={"object": "count", "count": 42, "url": "/api/v1/records/count"},
+            )
+
+        async with _client_with_handler(handler) as client:
+            out = await client.records.count({"signer": "a" * 64})
+            assert out["object"] == "count"
+            assert out["count"] == 42
+            assert out["url"] == "/api/v1/records/count"
+
+        url = str(captured["url"])
+        assert "/api/v1/records/count" in url
+        assert "signer=" + "a" * 64 in url
+
+    asyncio.run(run())
+
+
+def test_count_forwards_all_narrowers() -> None:
+    async def run() -> None:
+        captured: dict[str, object] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(req.url.params)
+            return httpx.Response(
+                200, json={"object": "count", "count": 3, "url": "/api/v1/records/count"}
+            )
+
+        async with _client_with_handler(handler) as client:
+            await client.records.count(
+                {
+                    "signer": "b" * 64,
+                    "scheme": 1,
+                    "sealed": True,
+                    "from_block": 100,
+                    "to_block": 200,
+                    "from_time": "2026-01-01T00:00:00Z",
+                    "to_time": "2026-02-01T00:00:00Z",
+                }
+            )
+
+        params = captured["params"]
+        assert isinstance(params, dict)
+        # Exact wire query names mirror the list/count gateway grammar.
+        assert params["signer"] == "b" * 64
+        assert params["scheme"] == "1"
+        assert params["sealed"] == "true"
+        assert params["from_block"] == "100"
+        assert params["to_block"] == "200"
+        assert params["from_time"] == "2026-01-01T00:00:00Z"
+        assert params["to_time"] == "2026-02-01T00:00:00Z"
+
+    asyncio.run(run())
+
+
+def test_count_rejects_non_hex_signer_client_side() -> None:
+    async def run() -> None:
+        def handler(_req: httpx.Request) -> httpx.Response:  # pragma: no cover - never called
+            raise AssertionError("count must reject a bad signer before any request")
+
+        async with _client_with_handler(handler) as client:
+            # Uppercase / wrong-length signers are rejected before the request.
+            with pytest.raises(ValueError, match="signer"):
+                await client.records.count({"signer": "A" * 64})
+            with pytest.raises(ValueError, match="signer"):
+                await client.records.count({"signer": "abc"})
+
+    asyncio.run(run())
+
+
+def test_count_sealed_false_serializes_false() -> None:
+    async def run() -> None:
+        captured: dict[str, object] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(req.url.params)
+            return httpx.Response(
+                200, json={"object": "count", "count": 0, "url": "/api/v1/records/count"}
+            )
+
+        async with _client_with_handler(handler) as client:
+            await client.records.count({"signer": "c" * 64, "sealed": False})
+
+        params = captured["params"]
+        assert isinstance(params, dict)
+        assert params["sealed"] == "false"
 
     asyncio.run(run())

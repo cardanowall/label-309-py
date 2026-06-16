@@ -1,15 +1,19 @@
 """``client.records.*`` — open-standard indexer read surface.
 
-Wraps the canonical record routes:
+Wraps the canonical record routes (suffixes appended to the configured
+versioned ``base_url``):
 
-* ``GET  /api/v1/records``                   → :meth:`RecordsNamespace.list`
-* ``GET  /api/v1/records/{tx_hash}``         → :meth:`RecordsNamespace.get`
-* ``POST /api/v1/records/{tx_hash}/verify``  → :meth:`RecordsNamespace.verify`
+* ``GET  /records``                   → :meth:`RecordsNamespace.list`
+* ``GET  /records/{tx_hash}``         → :meth:`RecordsNamespace.get`
 
 The ``poe`` namespace owns the mutation methods (``uploads``, ``publish``,
 ``publish_batch`` + the high-level ``publish_content`` / ``publish_sealed``
-/ ``publish_merkle`` helpers); reads and verifications live here under
-Records — same tag grouping the OpenAPI registry uses.
+/ ``publish_merkle`` helpers); reads live here under Records — same tag
+grouping the OpenAPI registry uses.
+
+Verification is a client-side concern: run the ``cardanowall.verifier``
+module against fetched chain data. The SDK does not call any hosted verify
+endpoint.
 
 Auth is optional: chain data is public. When an API key is configured the
 SDK forwards it as ``Authorization: Bearer …`` so owner-only fields
@@ -20,13 +24,25 @@ SDK forwards it as ``Authorization: Bearer …`` so owner-only fields
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, cast
 
 import httpx
 
 from .parse_http_error import parse_http_error
-from .types import PoeVerifyInput, RecordResource, RecordsListInput, RecordsListResponse
+from .types import (
+    RecordResource,
+    RecordsCountInput,
+    RecordsCountResponse,
+    RecordsListInput,
+    RecordsListResponse,
+)
+
+# A publisher's Ed25519 verification key on the wire: 64 lowercase-hex
+# characters. The gateway rejects anything else, so the SDK validates client-side
+# to fail fast with a clear message rather than on an opaque 422.
+_SIGNER_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -87,8 +103,7 @@ def _raise_for_status(response: httpx.Response) -> None:
 
 
 class RecordsNamespace:
-    """``GET /api/v1/records``, ``GET /api/v1/records/{tx_hash}`` +
-    ``POST /api/v1/records/{tx_hash}/verify``."""
+    """``GET /records`` + ``GET /records/{tx_hash}``."""
 
     def __init__(self, config: _ResolvedConfig) -> None:
         self._config = config
@@ -115,7 +130,7 @@ class RecordsNamespace:
             if cursor is not None:
                 params["cursor"] = cursor
         response = await self._config.http_client.get(
-            f"{self._config.base_url}/api/v1/records",
+            f"{self._config.base_url}/records",
             params=params,
             headers=_build_headers(self._config.api_key),
         )
@@ -140,43 +155,61 @@ class RecordsNamespace:
         invariant).
         """
         response = await self._config.http_client.get(
-            f"{self._config.base_url}/api/v1/records/{tx_hash}",
+            f"{self._config.base_url}/records/{tx_hash}",
             headers=_build_headers(self._config.api_key),
         )
         _raise_for_status(response)
         return response.json()  # type: ignore[no-any-return]
 
-    async def verify(self, tx_hash: str, input: PoeVerifyInput | None = None) -> dict[str, Any]:
-        """Run the canonical Label 309 verifier against the record at ``tx_hash``.
+    async def count(self, input: RecordsCountInput) -> RecordsCountResponse:
+        """Return the exact count of records matching a filter.
 
-        Returns the same ``VerifyReport`` JSON shape the standalone verifier
-        emits — ``VerifyReport`` IS the wire body of this endpoint, no
-        transformer in between (see the verifier types in
-        ``cardanowall.verifier.types``).
+        The counting counterpart to :meth:`list` — the paginated feed never
+        carries a total, so a consumer that needs "how many records match this
+        filter" (a public profile's proof count, an explorer facet) asks here.
 
-        Auth required (Bearer with ``poe:read`` scope, or NextAuth session
-        cookie). This is the hosted PUBLIC verifier: it accepts no decryption
-        credentials, and sealed items report as unverifiable without
-        decryption. To verify as a recipient (decrypt + plaintext-hash
-        recheck), run the ``cardanowall.verifier`` module locally with its
-        ``decryption`` input — keys never leave the process. Optional
-        ``fetch_content: False`` skips content re-fetching; affected claims
-        report ``not_checked``.
+        ``signer`` is REQUIRED (64 lowercase-hex characters): a count's cost is
+        the cardinality of the matching set, and only a publisher key bounds it,
+        so the gateway 422s a count without one. The remaining fields (``scheme``,
+        ``sealed``, ``from_block`` / ``to_block``, ``from_time`` / ``to_time``)
+        are optional narrowers on top of the signer scope, using the same wire
+        query names as :meth:`list`.
+
+        Returns ``{"object": "count", "count": <int>, "url": <str>}``.
         """
-        # Whitelist-build the wire body key by key — never serialize the
-        # caller's dict verbatim — so unknown keys smuggled in by an untyped
-        # call site (including credential material) can never reach the
-        # gateway.
-        safe: dict[str, object] = {}
-        if input is not None and "fetch_content" in input:
-            safe["fetch_content"] = input["fetch_content"]
-        response = await self._config.http_client.post(
-            f"{self._config.base_url}/api/v1/records/{tx_hash}/verify",
-            content=json.dumps(safe, separators=(",", ":")),
+        signer = input["signer"]
+        if not _SIGNER_HEX_RE.match(signer):
+            raise ValueError(
+                "records.count requires `signer` to be 64 lowercase-hex characters "
+                "(a count is always scoped to one publisher's records)"
+            )
+        params: dict[str, Any] = {"signer": signer}
+        scheme = input.get("scheme")
+        if scheme is not None:
+            params["scheme"] = scheme
+        sealed = input.get("sealed")
+        if sealed is not None:
+            # Lowercase 'true'/'false' wire form, mirroring the list route.
+            params["sealed"] = "true" if sealed else "false"
+        from_block = input.get("from_block")
+        if from_block is not None:
+            params["from_block"] = from_block
+        to_block = input.get("to_block")
+        if to_block is not None:
+            params["to_block"] = to_block
+        from_time = input.get("from_time")
+        if from_time is not None:
+            params["from_time"] = from_time
+        to_time = input.get("to_time")
+        if to_time is not None:
+            params["to_time"] = to_time
+        response = await self._config.http_client.get(
+            f"{self._config.base_url}/records/count",
+            params=params,
             headers=_build_headers(self._config.api_key),
         )
         _raise_for_status(response)
-        return response.json()  # type: ignore[no-any-return]
+        return cast(RecordsCountResponse, response.json())
 
 
 __all__ = ["RecordsNamespace"]

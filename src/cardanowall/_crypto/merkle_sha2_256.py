@@ -18,6 +18,15 @@ _DIGEST_LENGTH: Final[int] = 32
 _LEAF_PREFIX: Final[bytes] = b"\x00"
 _INTERNAL_PREFIX: Final[bytes] = b"\x01"
 
+# The verify fold tracks the leaf index and subtree size with a right shift.
+# That arithmetic is only exact while both values stay within 32 bits, so the
+# algorithm's safe domain is 1 <= tree_size <= 2^32 - 1 (and 0 <= index <
+# tree_size). A tree_size at or above 2^32 would let a forged proof verify
+# against the wrong subtree shape, so we reject the whole out-of-range domain up
+# front rather than fold it. The on-chain commitment caps leaf_count at the same
+# 2^32 - 1, so no legitimate tree is excluded.
+_MAX_TREE_SIZE: Final[int] = 0xFFFFFFFF
+
 
 class MerkleError(ValueError):
     """Structural rejection raised by the public Merkle entry points.
@@ -26,6 +35,23 @@ class MerkleError(ValueError):
     Python idiom) continue to work; the explicit class lets downstream
     code discriminate on `isinstance(e, MerkleError)` when needed.
     """
+
+
+def _validate_tree_range(index: int, tree_size: int, fn_name: str) -> None:
+    # Reject an out-of-range (index, tree_size) pair as a structural error. The
+    # parity twins in the TypeScript and Rust SDKs mirror this guard so a forged
+    # oversized tree_size is refused identically across all implementations.
+    if (
+        not isinstance(tree_size, int)
+        or isinstance(tree_size, bool)
+        or tree_size < 1
+        or tree_size > _MAX_TREE_SIZE
+    ):
+        raise MerkleError(
+            f"{fn_name}: tree_size {tree_size!r} out of range [1, {_MAX_TREE_SIZE}]"
+        )
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0 or index >= tree_size:
+        raise MerkleError(f"{fn_name}: index {index!r} out of range [0, {tree_size})")
 
 
 def _largest_pow2_lt(n: int) -> int:
@@ -99,10 +125,7 @@ def merkle_sha2_256_inclusion_proof(leaves: Sequence[bytes], index: int) -> list
     single-leaf trees the path is empty (RFC 9162 §2.1.1).
     """
     _validate_leaves(leaves)
-    if not isinstance(index, int) or isinstance(index, bool):
-        raise MerkleError(f"index must be an int; got {type(index).__name__}")
-    if index < 0 or index >= len(leaves):
-        raise MerkleError(f"index {index} out of range for tree_size {len(leaves)}")
+    _validate_tree_range(index, len(leaves), "merkle_sha2_256_inclusion_proof")
     return _audit_path(leaves, index)
 
 
@@ -116,20 +139,19 @@ def merkle_sha2_256_verify_inclusion(
     """Verify an inclusion proof.
 
     Iterative RFC 9162 §2.1.3.2 fold. Returns True iff the proof reconstructs
-    a hash byte-equal to `root` (constant-time compared). Any structural
-    inconsistency returns False — verification is a Boolean predicate, not a
-    parser.
+    a hash byte-equal to `root` (constant-time compared). A byte-shape problem
+    (wrong-length leaf/root/sibling) returns False — that is genuine non-
+    verification. An out-of-range (index, tree_size) pair is a structural error,
+    not a "does not verify" verdict: the fold's shift arithmetic is undefined
+    outside the safe domain, so we raise rather than return a (potentially
+    forged) Boolean.
     """
-    # Structural checks (Boolean predicate, never raise).
+    # Out-of-range (index, tree_size) is rejected up front (raises).
+    _validate_tree_range(index, tree_size, "merkle_sha2_256_verify_inclusion")
+    # Byte-shape checks (Boolean predicate, never raise).
     if not isinstance(leaf, (bytes, bytearray)) or len(leaf) != _DIGEST_LENGTH:
         return False
     if not isinstance(root, (bytes, bytearray)) or len(root) != _DIGEST_LENGTH:
-        return False
-    if not isinstance(tree_size, int) or isinstance(tree_size, bool) or tree_size < 1:
-        return False
-    if not isinstance(index, int) or isinstance(index, bool):
-        return False
-    if index < 0 or index >= tree_size:
         return False
     for s in proof:
         if not isinstance(s, (bytes, bytearray)) or len(s) != _DIGEST_LENGTH:

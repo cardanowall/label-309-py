@@ -52,7 +52,9 @@ def _client_with_handler(handler: Callable[[httpx.Request], httpx.Response]) -> 
     transport = httpx.MockTransport(handler)
     return Label309Client(
         api_key=FIXTURE_API_KEY,
-        base_url="http://test.example",
+        # Full versioned base: the resource suffixes append to it, so the
+        # served path stays /api/v1/poe/… and the parity fixture matches.
+        base_url="http://test.example/api/v1",
         http_client=httpx.AsyncClient(transport=transport),
     )
 
@@ -567,7 +569,7 @@ def test_poe_publish_request_shape_matches_cross_sdk_parity_fixture() -> None:
         transport = httpx.MockTransport(handler)
         async with Label309Client(
             api_key=parity_key,
-            base_url="http://test.example",
+            base_url="http://test.example/api/v1",
             http_client=httpx.AsyncClient(transport=transport),
         ) as client:
             # 16 bytes of canonical-CBOR-shaped placeholder — the fixture only
@@ -585,5 +587,45 @@ def test_poe_publish_request_shape_matches_cross_sdk_parity_fixture() -> None:
         assert captured["content_type"] == fixture["content_type"]
         assert captured["accept"] == fixture["accept"]
         assert captured["body"] == fixture["body"]
+
+    asyncio.run(run())
+
+
+def test_quote_parses_optional_breakdown_when_present() -> None:
+    # A gateway that exposes its pricing internals returns the breakdown
+    # fields alongside the core four; the SDK surfaces them additively.
+    async def run() -> None:
+        breakdown_body: dict[str, Any] = {
+            "quote_id": QUOTE_ID,
+            "amount": "180000",
+            "currency": "USD",
+            "expires_at": "2026-05-26T12:15:00.000Z",
+            "usd_micros": "180000",
+            "breakdown": {
+                "network_usd_micros": "100000",
+                "storage_usd_micros": "60000",
+                "service_usd_micros": "20000",
+            },
+            "margin_pct": 12.5,
+            "margin_source": "override",
+            "fx_age_seconds": 42,
+        }
+
+        def handler(_req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=breakdown_body)
+
+        async with _client_with_handler(handler) as client:
+            out = await client.poe.quote(
+                record_bytes=256, recipient_count=1, file_bytes_total=1_048_576
+            )
+        # Core fields plus the optional breakdown all survive.
+        assert out["quote_id"] == QUOTE_ID
+        assert out["usd_micros"] == "180000"
+        assert out["breakdown"]["network_usd_micros"] == "100000"
+        assert out["breakdown"]["storage_usd_micros"] == "60000"
+        assert out["breakdown"]["service_usd_micros"] == "20000"
+        assert out["margin_pct"] == 12.5
+        assert out["margin_source"] == "override"
+        assert out["fx_age_seconds"] == 42
 
     asyncio.run(run())

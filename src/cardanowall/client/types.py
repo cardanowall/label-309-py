@@ -13,13 +13,22 @@ from __future__ import annotations
 
 from typing import Any, Literal, NotRequired, TypedDict
 
-PoeStatus = Literal["submitting", "submitted", "confirmed", "permanent_failure"]
+# Publish-record lifecycle status. The known values are enumerated for
+# discoverability, but the alias stays `str`-tolerant: the gateway may introduce
+# a new status (e.g. an intermediate ``confirming``) without breaking an older
+# SDK, so an unknown value flows through verbatim rather than failing
+# deserialisation. Compare against the documented literals; treat anything else
+# as forward-compatible.
+PoeStatus = (
+    Literal["submitting", "submitted", "confirming", "confirmed", "failed", "permanent_failure"]
+    | str
+)
 ConformanceProfile = Literal["core", "signed", "sealed", "recipient-sealed"]
 StorageTarget = Literal["arweave"]
 
 
 # =============================================================================
-# POST /api/v1/poe/uploads — multipart binary upload to a storage backend
+# POST /poe/uploads — multipart binary upload to a storage backend
 # =============================================================================
 #
 # The SDK presents the wire shape directly: caller passes a ``target`` enum
@@ -29,8 +38,8 @@ StorageTarget = Literal["arweave"]
 # ``{ok: false, error}``.
 #
 # Billing: free. The storage cost is part of the publish quote (POST
-# /api/v1/poe/quote → POST /api/v1/poe/publish); it is debited once at
-# publish time against the locked price snapshot.
+# /poe/quote → POST /poe/publish); it is debited once at publish time against
+# the locked price snapshot.
 
 
 class UploadSuccessEntry(TypedDict):
@@ -60,7 +69,154 @@ class UploadsResponse(TypedDict):
 
 
 # =============================================================================
-# POST /api/v1/poe/quote — lock the price for an upcoming /publish call
+# Resumable / chunked upload sessions — /poe/uploads/sessions + /attempts
+# =============================================================================
+#
+# A file at or below ``RESUMABLE_THRESHOLD_BYTES`` is sent with the single-shot
+# multipart ``uploads()`` call; a larger file is uploaded as a content-addressed
+# session — create, PUT each fixed-size chunk, complete — converging on one
+# ``ar://`` URI. These TypedDicts are the wire shapes of the session/attempt
+# routes; the driver lives in :mod:`cardanowall.client.resumable_upload`.
+
+
+class UploadSessionCreateResponse(TypedDict):
+    """``POST /poe/uploads/sessions`` — a fresh session was created."""
+
+    session_id: str
+    chunk_bytes: int
+    chunk_count: int
+    # Indices already held server-side; empty on a fresh create.
+    received: list[int]
+    expires_at: str
+    # The gateway's authoritative ceiling; it may clamp ``chunk_bytes`` to this.
+    max_chunk_bytes: int
+
+
+class UploadSessionDeduplicatedResponse(TypedDict):
+    """``POST /poe/uploads/sessions`` — create-time dedup: the bytes already exist."""
+
+    deduplicated: Literal[True]
+    uri: str
+    sha256: str
+    bytes: int
+    charged_usd_micros: int
+
+
+class UploadSessionStatus(TypedDict, total=False):
+    """``GET /poe/uploads/sessions/{sid}`` — the live session state."""
+
+    session_id: str
+    # 'pending' | 'assembling' | 'completed' | 'failed' | 'expired' (string-tolerant).
+    state: str
+    sha256: str
+    total_bytes: int
+    chunk_bytes: int
+    chunk_count: int
+    received: list[int]
+    # The authoritative set of indices still to send. Older gateways may omit it,
+    # in which case the driver derives the gap from ``received`` + ``chunk_count``.
+    missing: list[int]
+    attempt_id: str | None
+    uri: str | None
+
+
+class UploadSessionChunkResponse(TypedDict):
+    """``PUT /poe/uploads/sessions/{sid}/chunks/{index}`` — chunk accepted."""
+
+    index: int
+    received: list[int]
+    remaining: int
+    complete: bool
+
+
+class UploadSessionCompleteOk(TypedDict, total=False):
+    """``POST .../complete`` — synchronous terminal success."""
+
+    ok: Literal[True]
+    uri: str
+    sha256: str
+    bytes: int
+    # 0 for a dedup-on-commit (bytes already stored); the held amount otherwise.
+    charged_usd_micros: int
+
+
+class UploadSessionCompleteAccepted(TypedDict):
+    """``POST .../complete`` — completion accepted asynchronously; poll the attempt."""
+
+    accepted: Literal[True]
+    attempt_id: str
+
+
+UploadSessionCompleteResponse = UploadSessionCompleteOk | UploadSessionCompleteAccepted
+
+
+class UploadAttemptReserved(TypedDict):
+    """``GET /poe/uploads/attempts/{id}`` — in flight (the only non-terminal state)."""
+
+    attempt_id: str
+    state: Literal["reserved"]
+    sha256: str
+    bytes: int
+    backend: str
+
+
+class UploadAttemptCommitted(TypedDict):
+    """``GET /poe/uploads/attempts/{id}`` — terminal success; carries the URI."""
+
+    attempt_id: str
+    state: Literal["committed"]
+    sha256: str
+    bytes: int
+    backend: str
+    uri: str
+    charged_usd_micros: int
+
+
+class UploadAttemptReleased(TypedDict):
+    """``GET /poe/uploads/attempts/{id}`` — terminal failure; carries the reason."""
+
+    attempt_id: str
+    state: Literal["released"]
+    sha256: str
+    bytes: int
+    backend: str
+    reason: str
+
+
+UploadAttemptStatus = UploadAttemptReserved | UploadAttemptCommitted | UploadAttemptReleased
+
+
+class UploadProgress(TypedDict):
+    """Progress snapshot delivered to ``on_progress`` after each chunk PUT.
+
+    ``bytes_sent`` / ``chunk_index`` count completed chunks against
+    ``total_bytes`` / ``chunks_total``. On the single-shot path a single 100%
+    snapshot is delivered on success.
+    """
+
+    bytes_sent: int
+    total_bytes: int
+    chunk_index: int
+    chunks_total: int
+
+
+class UploadResumableResult(TypedDict):
+    """Terminal result of :meth:`PoeNamespace.upload_resumable`."""
+
+    # Canonical ``ar://<tx>`` URI of the stored content.
+    uri: str
+    # Whole-file SHA-256, lowercase hex.
+    sha256: str
+    # Stored byte count.
+    bytes: int
+    # ``True`` when the bytes were already stored (create-time or commit-time dedup).
+    deduplicated: bool
+    # Which ingress path carried the bytes.
+    mode: Literal["single-shot", "chunked"]
+
+
+# =============================================================================
+# POST /poe/quote — lock the price for an upcoming /publish call
 # =============================================================================
 #
 # The gateway prices the described publish (from the supplied byte counts),
@@ -71,27 +227,60 @@ class UploadsResponse(TypedDict):
 # id and rejects expired / already-consumed quotes.
 
 
-class QuoteResponse(TypedDict):
-    """An opaque price lock returned by ``POST /api/v1/poe/quote``.
+class QuoteBreakdown(TypedDict):
+    """Per-component USD micro-cents cost of a priced publish.
 
-    It is a sealed price token, not a pricing breakdown: pass ``quote_id`` to
-    ``/publish`` and surface ``amount`` / ``currency`` / ``expires_at`` to the
-    user. The gateway's pricing internals (FX, margins, per-component costs)
-    are not exposed.
+    Present only on the optional ``breakdown`` field of :class:`QuoteResponse`,
+    populated by a gateway that exposes its pricing components; each value is a
+    decimal string of USD micro-cents.
     """
 
-    # Opaque id of the persisted price lock; pass to /publish.
+    network_usd_micros: str
+    storage_usd_micros: str
+    service_usd_micros: str
+
+
+class QuoteResponse(TypedDict, total=False):
+    """A price lock returned by ``POST /poe/quote``.
+
+    The four core fields (``quote_id`` / ``amount`` / ``currency`` /
+    ``expires_at``) are always present: pass ``quote_id`` to ``/publish`` and
+    surface ``amount`` / ``currency`` / ``expires_at`` to the user. A gateway
+    that chooses to expose its pricing internals MAY additionally return an
+    optional breakdown (``usd_micros``, ``breakdown``, ``margin_pct``,
+    ``margin_source``, ``fx_age_seconds``); a gateway that treats the quote as a
+    sealed opaque token omits them. The breakdown fields are read-only diagnostic
+    surface — ``/publish`` consumes only ``quote_id``.
+    """
+
+    # Opaque id of the persisted price lock; pass to /publish. (Always present.)
     quote_id: str
     # Total locked price, as a decimal string (promote to int as needed).
+    # (Always present.)
     amount: str
     # Currency the ``amount`` is denominated in (e.g. ISO 4217 ``USD``).
+    # (Always present.)
     currency: str
     # ISO8601 expiry timestamp after which the gateway rejects the quote.
+    # (Always present.)
     expires_at: str
+    # ---- Optional pricing breakdown (present only on a gateway that exposes it) ----
+    # Total locked price in USD micro-cents (decimal string); the breakdown
+    # counterpart of ``amount`` when the gateway prices in micro-cents.
+    usd_micros: str
+    # Per-component cost split.
+    breakdown: QuoteBreakdown
+    # Effective margin percentage applied to the cost-pass-through base.
+    margin_pct: float
+    # Which precedence path produced ``margin_pct`` (e.g. ``"override"``,
+    # ``"default"``, a ``"delegation:"``-prefixed string), verbatim from the gateway.
+    margin_source: str
+    # Age (seconds) of the gateway's FX snapshot at quote time.
+    fx_age_seconds: int
 
 
 # =============================================================================
-# POST /api/v1/poe/publish — finalised single-record submission (JSON only)
+# POST /poe/publish — finalised single-record submission (JSON only)
 # =============================================================================
 
 
@@ -128,7 +317,7 @@ class PublishResponse(TypedDict):
 
 
 # =============================================================================
-# POST /api/v1/poe/publish-batch — 1..50 finalised records
+# POST /poe/publish-batch — 1..50 finalised records
 # =============================================================================
 
 
@@ -166,12 +355,12 @@ class PublishBatchResponse(TypedDict):
 
 
 # =============================================================================
-# GET /api/v1/records/{tx_hash} — single record resource
+# GET /records/{tx_hash} — single record resource
 # =============================================================================
 #
 # ``RecordResource`` is the canonical wire shape served by
-# ``GET /api/v1/records/{tx_hash}`` AND projected into every entry of
-# ``data[]`` in ``GET /api/v1/records``.
+# ``GET /records/{tx_hash}`` AND projected into every entry of
+# ``data[]`` in ``GET /records``.
 #
 # ``status`` is chain-derived ('confirming' / 'confirmed') for all viewers
 # on anchored rows; un-anchored rows (block_height is None) only surface to
@@ -197,7 +386,7 @@ class RecordResource(TypedDict, total=False):
 
 
 # =============================================================================
-# GET /api/v1/records — paginated record list (client.records.list)
+# GET /records — paginated record list (client.records.list)
 # =============================================================================
 #
 # The optional ``sealed`` filter narrows the page to sealed records addressed
@@ -233,7 +422,49 @@ class RecordsListResponse(TypedDict):
 
 
 # =============================================================================
-# GET /api/v1/account/balance
+# GET /records/count — exact count of records matching a filter
+# =============================================================================
+#
+# The counting counterpart to ``GET /records``: the cursor-paginated feed never
+# carries a total, so a consumer that needs "how many records match this filter"
+# (a public profile's proof count, an explorer facet) asks here.
+#
+# The gateway REQUIRES a ``signer``: a count's cost is the cardinality of the
+# matching set, and only a publisher key bounds it (a block/time window can span
+# the whole chain; ``scheme``/``sealed`` only partition it). A count without a
+# ``signer`` is rejected (HTTP 422), so ``signer`` is non-optional in the input.
+# The remaining filters are the same narrowing grammar as the list route.
+
+
+class RecordsCountInput(TypedDict):
+    """Filter for :meth:`RecordsNamespace.count`.
+
+    ``signer`` is REQUIRED (64 lowercase-hex Ed25519 verification-key bytes); the
+    rest are optional narrowers on top of the signer scope, using the same wire
+    query names as the list route.
+    """
+
+    # REQUIRED. 64 lowercase-hex characters (the publisher's Ed25519 verification
+    # key). The gateway 422s a count without it.
+    signer: str
+    # Optional narrowers (all NotRequired via total=False semantics below).
+    scheme: NotRequired[RecordScheme]
+    sealed: NotRequired[bool]
+    from_block: NotRequired[int]
+    to_block: NotRequired[int]
+    # ISO-8601 datetime strings.
+    from_time: NotRequired[str]
+    to_time: NotRequired[str]
+
+
+class RecordsCountResponse(TypedDict):
+    object: Literal["count"]
+    count: int
+    url: str
+
+
+# =============================================================================
+# GET /account/balance
 # =============================================================================
 
 
@@ -244,50 +475,44 @@ class AccountBalance(TypedDict):
     balance_usd_micros: str
 
 
-# =============================================================================
-# POST /api/v1/records/{tx_hash}/verify
-# =============================================================================
-
-
-# Request body for the hosted verify endpoint.
-#
-# The endpoint is a PUBLIC verifier — structural validation plus record-level
-# signature verification over public chain data. It accepts no decryption
-# credentials: a body carrying any is rejected with 400 validation-failed, and
-# sealed (enc-bearing) items report as unverifiable without decryption.
-# Recipient verification (sealed-envelope decrypt + plaintext-hash recheck)
-# runs locally — use the ``cardanowall.verifier`` module's ``decryption``
-# input, which never leaves the process.
-class PoeVerifyInput(TypedDict, total=False):
-    # The master content-fetch switch (item URIs and Merkle leaves lists
-    # alike). The server defaults it to True; pass False to skip content
-    # re-fetching — affected claims then report ``not_checked``.
-    fetch_content: bool
-
-
 __all__ = [
     "AccountBalance",
     "ConformanceProfile",
     "PoeItemResponse",
     "PoeStatus",
-    "PoeVerifyInput",
     "PublishBatchFailureEntry",
     "PublishBatchFailureError",
     "PublishBatchResponse",
     "PublishBatchResultEntry",
     "PublishBatchSuccessEntry",
     "PublishResponse",
+    "QuoteBreakdown",
     "QuoteResponse",
     "RecordResource",
     "RecordScheme",
     "RecordSignature",
     "RecordStatus",
+    "RecordsCountInput",
+    "RecordsCountResponse",
     "RecordsListInput",
     "RecordsListResponse",
     "StorageTarget",
+    "UploadAttemptCommitted",
+    "UploadAttemptReleased",
+    "UploadAttemptReserved",
+    "UploadAttemptStatus",
     "UploadEntry",
     "UploadFailureEntry",
     "UploadFailureErrorBlock",
+    "UploadProgress",
+    "UploadResumableResult",
+    "UploadSessionChunkResponse",
+    "UploadSessionCompleteAccepted",
+    "UploadSessionCompleteOk",
+    "UploadSessionCompleteResponse",
+    "UploadSessionCreateResponse",
+    "UploadSessionDeduplicatedResponse",
+    "UploadSessionStatus",
     "UploadSuccessEntry",
     "UploadsResponse",
 ]

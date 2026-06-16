@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-from . import hash, merkle
+from . import certificate, hash, merkle
 from ._crypto.sealed_poe import (
+    RecipientKeyBundle,
+    StreamUnwrapResult,
+    ecies_sealed_poe_seal_stream,
     ecies_sealed_poe_unwrap,
+    ecies_sealed_poe_unwrap_stream,
     ecies_sealed_poe_wrap,
     passphrase_sealed_poe_open,
     passphrase_sealed_poe_seal,
 )
+from ._crypto.stream import sha256_stream, stream_sealed_length
 from .client import (
     BatchEmptyError,
     BatchTooLargeError,
@@ -135,12 +140,14 @@ __all__ = [
     "QuoteExpiredError",
     "QuoteNotFoundError",
     "RateLimitedError",
+    "RecipientKeyBundle",
     "RecordNotFoundError",
     "SeedKeys",
     "SeedRecipients",
     "SeedSigner",
     "ServiceUnavailableError",
     "Severity",
+    "StreamUnwrapResult",
     "UnauthenticatedError",
     "UnauthorizedError",
     "ValidationFailedError",
@@ -148,6 +155,7 @@ __all__ = [
     "VerifyReport",
     "VerifyTxInput",
     "build_to_sign",
+    "certificate",
     "decode_crockford_base32",
     "decode_prefixed_id",
     "decrypt_sealed_from_seed",
@@ -157,7 +165,9 @@ __all__ = [
     "derive_mlkem768x25519_keypair_from_seed",
     "derive_x25519_keypair_from_seed",
     "detect_conformance_profile",
+    "ecies_sealed_poe_seal_stream",
     "ecies_sealed_poe_unwrap",
+    "ecies_sealed_poe_unwrap_stream",
     "ecies_sealed_poe_wrap",
     "encode_age_x25519_recipient",
     "encode_age_xwing_recipient",
@@ -176,7 +186,9 @@ __all__ = [
     "passphrase_sealed_poe_seal",
     "recipient_secret_keys_from_seed",
     "recipients_from_seed",
+    "sha256_stream",
     "signer_from_seed",
+    "stream_sealed_length",
     "validate_poe_record",
     "verify_tx",
 ]

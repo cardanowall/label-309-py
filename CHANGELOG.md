@@ -9,6 +9,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > change in backward-incompatible ways until a 1.0 release. Pre-1.0 versions do
 > not carry the stability guarantees of [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-06-16
+
+### Added
+
+- Label 309 **inclusion certificates**: `build_inclusion_certificate`, `verify_inclusion_certificate`, and the COSE / RFC 9162-aligned CBOR proof encoders (including the bare IETF inclusion-proof byte string), byte-identical with the TypeScript and Rust SDKs. An inclusion certificate is a self-contained, standalone-verifiable proof that a content hash was committed as a leaf of an RFC 9162 SHA-256 Merkle tree whose root was published on Cardano under metadata label 309.
+- Streaming sealed-PoE: a streaming seal/open path for the segmented `chacha20-poly1305-stream64k` content layer, plus a resumable upload client with progress, cancel, and abandon.
+
+### Breaking
+
+- Client base URLs now carry the full versioned API root (e.g. `https://gateway.example.com/api/v1`); the client appends only bare resource suffixes. Update your configuration to include the version segment.
+- `client.records.verify()` has been removed. A Label 309 verdict must never require trusting a gateway; use this SDK's standalone verifier instead.
+
+### Security
+
+- Require `cryptography>=48.0.1`, which bundles a patched OpenSSL — closing a high-severity advisory present in the OpenSSL shipped with earlier `cryptography` wheels.
+
 ## [0.6.0] - 2026-06-13
 
 ### Security

@@ -1,6 +1,6 @@
 """410 ``quote-expired`` — the publish quote referenced by ``quote_id``
 exceeded its TTL (15 minutes from issuance) before /publish consumed it.
-The caller should request a fresh quote via POST /api/v1/poe/quote and
+The caller should request a fresh quote via POST /poe/quote and
 retry.
 
 Wire-format extension members (RFC 7807 §3.2)::

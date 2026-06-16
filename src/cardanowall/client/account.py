@@ -1,8 +1,9 @@
 """``client.account.*`` — account read surface.
 
-Wraps the account read route:
+Wraps the account read route (suffix appended to the configured versioned
+``base_url``):
 
-* ``GET /api/v1/account/balance`` → :meth:`AccountNamespace.balance`
+* ``GET /account/balance`` → :meth:`AccountNamespace.balance`
 
 Auth is required (Bearer with ``account:read`` scope, or a session cookie when
 the gateway is browser-fronted). The configured API key is forwarded as
@@ -66,7 +67,7 @@ def _raise_for_status(response: httpx.Response) -> None:
 
 
 class AccountNamespace:
-    """``GET /api/v1/account/balance``."""
+    """``GET /account/balance``."""
 
     def __init__(self, config: _ResolvedConfig) -> None:
         self._config = config
@@ -84,7 +85,7 @@ class AccountNamespace:
         lacks the ``account:read`` scope.
         """
         response = await self._config.http_client.get(
-            f"{self._config.base_url}/api/v1/account/balance",
+            f"{self._config.base_url}/account/balance",
             headers=_build_headers(self._config.api_key),
         )
         _raise_for_status(response)

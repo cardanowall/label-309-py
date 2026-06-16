@@ -26,7 +26,7 @@ from __future__ import annotations
 import hashlib
 import hmac as stdlib_hmac
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final
 
@@ -45,7 +45,16 @@ from .passphrase import (
     PassphraseNormalizationError,
     normalize_passphrase,
 )
-from .stream import TAG_SIZE, StreamTamperedError, stream_open, stream_seal
+from .stream import (
+    CHUNK_SIZE,
+    SEALED_CHUNK_SIZE,
+    TAG_SIZE,
+    StreamOpener,
+    StreamSealer,
+    StreamTamperedError,
+    stream_open,
+    stream_seal,
+)
 
 # HKDF info strings and SHA-256 prefix labels (KEK salts, transcripts, the
 # item-hashes digest) are fixed protocol labels: exact ASCII, no terminator, no
@@ -228,6 +237,10 @@ class EciesSealedPoeError(Exception):
     PASSPHRASE_INPUT_TOO_LONG = "PASSPHRASE_INPUT_TOO_LONG"  # noqa: S105
     INVALID_PASSPHRASE_PARAMS = "INVALID_PASSPHRASE_PARAMS"  # noqa: S105
     KDF_DERIVATION_FAILED = "KDF_DERIVATION_FAILED"
+    # The caller's cooperative cancel callback returned True mid-stream: the
+    # streaming seal stops producing ciphertext. Construction-only — there is no
+    # wire counterpart.
+    CANCELLED = "CANCELLED"
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{code}: {message}")
@@ -260,6 +273,36 @@ class SealedEnvelope:
 class SealedPoeOutput:
     envelope: SealedEnvelope
     ciphertext: bytes
+
+
+# Unified recipient key bundle. A caller holds BOTH the X25519 private-key chain
+# (current + archived, for the classical KEM and rotation history) AND the X-Wing
+# secret seed(s) (for the hybrid KEM), without knowing which KEM a given record
+# was sealed under. They pass the whole bundle; unwrap / streaming-unwrap select
+# the correct secret list from ``envelope.kem``:
+#
+#   • kem == "x25519"          → x25519_private_keys
+#   • kem == "mlkem768x25519"  → mlkem768x25519_secret_seeds
+#
+# Both lists are ordered newest-first (the caller's responsibility — the outer
+# trial-decrypt loop scans them in order). A list MAY be empty when the recipient
+# holds no key for that KEM (e.g. archived-only X25519 identities predate the
+# hybrid KEM, so their hybrid-seed list is empty); a bundle whose selected list
+# is empty unwraps to a clean no-match (WRONG_RECIPIENT_KEY) without touching any
+# KEM primitive — it is NOT a programmer error, unlike an empty flat
+# ``recipient_secret_keys`` sequence.
+@dataclass(frozen=True)
+class RecipientKeyBundle:
+    x25519_private_keys: Sequence[bytes]
+    mlkem768x25519_secret_seeds: Sequence[bytes]
+
+
+def _select_bundle_secrets(envelope: SealedEnvelope, bundle: RecipientKeyBundle) -> Sequence[bytes]:
+    return (
+        bundle.x25519_private_keys
+        if envelope.kem == KEM_X25519
+        else bundle.mlkem768x25519_secret_seeds
+    )
 
 
 @dataclass(frozen=True)
@@ -534,27 +577,30 @@ def _wrap_slot_mlkem768x25519(
     return SealedSlot(kem_ct=enc, wrap=wrap)
 
 
-def ecies_sealed_poe_wrap(
+# The sealed envelope plus the derived content payload_key, produced once and
+# shared by both the buffered (`ecies_sealed_poe_wrap`) and streaming
+# (`ecies_sealed_poe_seal_stream`) seal paths. The envelope (slots + slots_mac)
+# depends only on the CEK, nonce, recipients, and item hashes — never the
+# plaintext — so it is fully resolved before a single content byte is sealed,
+# and both paths drive the SAME `payload_key` over the SAME STREAM layout, which
+# is what makes their ciphertext byte-identical.
+@dataclass(frozen=True)
+class _BuiltSealedEnvelope:
+    envelope: SealedEnvelope
+    payload_key: bytes
+
+
+def _build_sealed_envelope(
     *,
-    plaintext: bytes,
     recipient_public_keys: Sequence[bytes],
-    # The item's complete hashes map (algorithm id → digest bytes). Its
-    # labelled digest is bound into the slots transcript, so the on-chain
-    # slots_mac commits to this item's hash claim.
     hashes: Mapping[str, bytes],
-    # KEM branch selector. Defaults to 'x25519' for the classical path. The
-    # recipient public-key length is validated against the chosen KEM.
-    kem: str = KEM_X25519,
-    # Test-only deterministic overrides — production callers MUST NOT pass these.
-    cek: bytes | None = None,
-    nonce: bytes | None = None,
-    # Deterministic X25519 ephemeral scalars (32 bytes each) — x25519 branch only.
-    ephemeral_secrets: Sequence[bytes] | None = None,
-    # Deterministic X-Wing encapsulation randomness (64 bytes each) — hybrid
-    # branch only. One per recipient, parallel to recipient_public_keys.
-    eseeds: Sequence[bytes] | None = None,
-    skip_shuffle: bool = False,
-) -> SealedPoeOutput:
+    kem: str,
+    cek: bytes | None,
+    nonce: bytes | None,
+    ephemeral_secrets: Sequence[bytes] | None,
+    eseeds: Sequence[bytes] | None,
+    skip_shuffle: bool,
+) -> _BuiltSealedEnvelope:
     n = len(recipient_public_keys)
 
     # The KEM identifier is validated before any per-recipient check: an
@@ -667,7 +713,6 @@ def ecies_sealed_poe_wrap(
     # transitively — payload_key derives from the CEK, and the CEK is committed
     # to the full header (including hashes_hash) by slots_mac.
     payload_key = _slots_payload_key(cek, nonce)
-    ciphertext = stream_seal(payload_key, plaintext)
 
     envelope = SealedEnvelope(
         scheme=1,
@@ -677,7 +722,131 @@ def ecies_sealed_poe_wrap(
         slots=tuple(slots),
         slots_mac=slots_mac,
     )
-    return SealedPoeOutput(envelope=envelope, ciphertext=ciphertext)
+    return _BuiltSealedEnvelope(envelope=envelope, payload_key=payload_key)
+
+
+def ecies_sealed_poe_wrap(
+    *,
+    plaintext: bytes,
+    recipient_public_keys: Sequence[bytes],
+    # The item's complete hashes map (algorithm id → digest bytes). Its
+    # labelled digest is bound into the slots transcript, so the on-chain
+    # slots_mac commits to this item's hash claim.
+    hashes: Mapping[str, bytes],
+    # KEM branch selector. Defaults to 'x25519' for the classical path. The
+    # recipient public-key length is validated against the chosen KEM.
+    kem: str = KEM_X25519,
+    # Test-only deterministic overrides — production callers MUST NOT pass these.
+    cek: bytes | None = None,
+    nonce: bytes | None = None,
+    # Deterministic X25519 ephemeral scalars (32 bytes each) — x25519 branch only.
+    ephemeral_secrets: Sequence[bytes] | None = None,
+    # Deterministic X-Wing encapsulation randomness (64 bytes each) — hybrid
+    # branch only. One per recipient, parallel to recipient_public_keys.
+    eseeds: Sequence[bytes] | None = None,
+    skip_shuffle: bool = False,
+) -> SealedPoeOutput:
+    built = _build_sealed_envelope(
+        recipient_public_keys=recipient_public_keys,
+        hashes=hashes,
+        kem=kem,
+        cek=cek,
+        nonce=nonce,
+        ephemeral_secrets=ephemeral_secrets,
+        eseeds=eseeds,
+        skip_shuffle=skip_shuffle,
+    )
+    ciphertext = stream_seal(built.payload_key, plaintext)
+    return SealedPoeOutput(envelope=built.envelope, ciphertext=ciphertext)
+
+
+def ecies_sealed_poe_seal_stream(
+    *,
+    # The plaintext as an iterable of byte chunks. Source read boundaries are NOT
+    # STREAM chunk boundaries: the input is re-chunked internally to exactly
+    # CHUNK_SIZE (64 KiB) before sealing, so the producer may yield any sizes.
+    plaintext: Iterable[bytes],
+    recipient_public_keys: Sequence[bytes],
+    hashes: Mapping[str, bytes],
+    kem: str = KEM_X25519,
+    # Cooperative cancellation: checked before each chunk is read and sealed. When
+    # it returns True the generator raises EciesSealedPoeError(CANCELLED) and stops
+    # producing ciphertext.
+    cancel: Callable[[], bool] | None = None,
+    # Test-only deterministic overrides — production callers MUST NOT pass these.
+    cek: bytes | None = None,
+    nonce: bytes | None = None,
+    ephemeral_secrets: Sequence[bytes] | None = None,
+    eseeds: Sequence[bytes] | None = None,
+    skip_shuffle: bool = False,
+) -> tuple[SealedEnvelope, Iterator[bytes]]:
+    """Streaming sealed-PoE seal: the envelope is resolved up front; the body is
+    sealed lazily as the returned generator is consumed.
+
+    The envelope (slots + slots_mac) depends only on the CEK, nonce, recipients,
+    and item hashes — never the plaintext — so it is returned immediately. The
+    second element is a generator that re-chunks ``plaintext`` to exactly
+    CHUNK_SIZE and yields the sealed STREAM 64 KiB at a time. Concatenating every
+    yielded chunk is byte-identical to ``ecies_sealed_poe_wrap(...).ciphertext``
+    for the same CEK/nonce. Peak memory is one plaintext chunk plus one sealed
+    chunk; nothing is sealed until the generator is iterated.
+    """
+    built = _build_sealed_envelope(
+        recipient_public_keys=recipient_public_keys,
+        hashes=hashes,
+        kem=kem,
+        cek=cek,
+        nonce=nonce,
+        ephemeral_secrets=ephemeral_secrets,
+        eseeds=eseeds,
+        skip_shuffle=skip_shuffle,
+    )
+    return built.envelope, _seal_stream_body(built.payload_key, plaintext, cancel)
+
+
+def _seal_stream_body(
+    payload_key: bytes,
+    plaintext: Iterable[bytes],
+    cancel: Callable[[], bool] | None,
+) -> Iterator[bytes]:
+    # EOF lookahead (R1): source read boundaries are not STREAM chunk boundaries,
+    # and a final chunk may itself be a FULL CHUNK_SIZE (stream_seal makes the
+    # last 64 KiB the final chunk with NO trailing empty chunk; an exact multiple
+    # of CHUNK_SIZE ends in a full final chunk). So we accumulate input into an
+    # exactly-CHUNK_SIZE buffer and keep ONE full chunk PENDING, only sealing it
+    # with final=True once the producer signals true end-of-input. Empty input is
+    # the sole empty-final case → one seal_chunk(b"", final=True).
+    sealer = StreamSealer(payload_key)
+    buffer = bytearray()
+    pending: bytes | None = None
+    for piece in plaintext:
+        if cancel is not None and cancel():
+            raise EciesSealedPoeError(
+                EciesSealedPoeError.CANCELLED, "seal cancelled before completion"
+            )
+        buffer += piece
+        while len(buffer) >= CHUNK_SIZE:
+            full = bytes(buffer[:CHUNK_SIZE])
+            del buffer[:CHUNK_SIZE]
+            # A completed full chunk is not necessarily the final chunk — hold it
+            # until we know whether anything follows. Flush the PREVIOUS pending
+            # one as non-final now that this newer chunk proves more data exists.
+            if pending is not None:
+                yield sealer.seal_chunk(pending, final=False)
+            pending = full
+    if cancel is not None and cancel():
+        raise EciesSealedPoeError(EciesSealedPoeError.CANCELLED, "seal cancelled before completion")
+    # End of input. Anything left in `buffer` is the short final chunk; otherwise
+    # the held `pending` full chunk is final. If neither exists the whole
+    # plaintext was empty → one zero-length final chunk.
+    if len(buffer) > 0:
+        if pending is not None:
+            yield sealer.seal_chunk(pending, final=False)
+        yield sealer.seal_chunk(bytes(buffer), final=True)
+    elif pending is not None:
+        yield sealer.seal_chunk(pending, final=True)
+    else:
+        yield sealer.seal_chunk(b"", final=True)
 
 
 # Per-private-key scan over the full slot array with the slot-set MAC folded
@@ -957,6 +1126,54 @@ def _assert_envelope_structure(
 # rotations the recipient has performed), a documented trade-off; making it
 # constant-work would cost a full KEM decapsulation per archived priv on every
 # record.
+# Resolve the three mutually-exclusive recipient-key forms (single-priv,
+# flat multi-priv, unified bundle) into one flat newest-first priv list, shared
+# by `ecies_sealed_poe_unwrap` and `ecies_sealed_poe_unwrap_stream`.
+#
+# Exactly one form MUST be supplied. The bundle form selects its list from the
+# envelope's KEM and a selected-empty list is a CLEAN no-match (the recipient
+# simply holds no key for that KEM) — signalled by returning `clean_no_match`,
+# never raised — whereas an explicitly-empty flat `recipient_secret_keys` is
+# caller misuse and raises.
+@dataclass(frozen=True)
+class _ResolvedUnwrapPrivs:
+    privs: Sequence[bytes]
+    clean_no_match: bool
+
+
+def _resolve_unwrap_privs(
+    envelope: SealedEnvelope,
+    recipient_secret_key: bytes | None,
+    recipient_secret_keys: Sequence[bytes] | None,
+    recipient_key_bundle: RecipientKeyBundle | None,
+) -> _ResolvedUnwrapPrivs:
+    forms_supplied = sum(
+        x is not None for x in (recipient_secret_key, recipient_secret_keys, recipient_key_bundle)
+    )
+    if forms_supplied != 1:
+        raise EciesSealedPoeError(
+            EciesSealedPoeError.INVALID_RECIPIENT_KEY,
+            "exactly one of recipient_secret_key / recipient_secret_keys / "
+            "recipient_key_bundle MUST be supplied",
+        )
+    if recipient_key_bundle is not None:
+        selected = _select_bundle_secrets(envelope, recipient_key_bundle)
+        if len(selected) == 0:
+            # The recipient holds no key for this envelope's KEM — a clean
+            # no-match, never an error.
+            return _ResolvedUnwrapPrivs(privs=(), clean_no_match=True)
+        return _ResolvedUnwrapPrivs(privs=selected, clean_no_match=False)
+    if recipient_secret_keys is not None:
+        if len(recipient_secret_keys) == 0:
+            raise EciesSealedPoeError(
+                EciesSealedPoeError.INVALID_RECIPIENT_KEY,
+                "recipient_secret_keys MUST be a non-empty sequence, got length=0",
+            )
+        return _ResolvedUnwrapPrivs(privs=recipient_secret_keys, clean_no_match=False)
+    assert recipient_secret_key is not None  # noqa: S101
+    return _ResolvedUnwrapPrivs(privs=[recipient_secret_key], clean_no_match=False)
+
+
 def ecies_sealed_poe_unwrap(
     *,
     envelope: SealedEnvelope,
@@ -964,6 +1181,11 @@ def ecies_sealed_poe_unwrap(
     hashes: Mapping[str, bytes],
     recipient_secret_key: bytes | None = None,
     recipient_secret_keys: Sequence[bytes] | None = None,
+    # Unified-bundle form: the caller passes both KEMs' newest-first secret lists
+    # and the dispatch picks the right one from `envelope.kem`. The surface every
+    # read-path consumer (inbox decrypt, CLI decrypt, recipient verifier) should
+    # use — they hold the whole identity key bundle and must NOT pre-select a list.
+    recipient_key_bundle: RecipientKeyBundle | None = None,
     # Test-only instrumentation for constant-time-N verification.
     # Single-priv path: list is treated as a one-element accumulator overwriting
     # index 0 each slot iteration. Multi-priv path: each outer-loop iteration
@@ -974,26 +1196,15 @@ def ecies_sealed_poe_unwrap(
     # overwritten) once per outer iteration with k + 1.
     _privs_attempted_out: list[int] | None = None,
 ) -> UnwrapResult:
-    # Exactly-one-of validation for the discriminated form.
-    has_single = recipient_secret_key is not None
-    has_multi = recipient_secret_keys is not None
-    if has_single == has_multi:
-        raise EciesSealedPoeError(
-            EciesSealedPoeError.INVALID_RECIPIENT_KEY,
-            "exactly one of recipient_secret_key / recipient_secret_keys MUST be supplied",
-        )
-    privs: Sequence[bytes]
-    if has_multi:
-        assert recipient_secret_keys is not None  # noqa: S101
-        if len(recipient_secret_keys) == 0:
-            raise EciesSealedPoeError(
-                EciesSealedPoeError.INVALID_RECIPIENT_KEY,
-                "recipient_secret_keys MUST be a non-empty sequence, got length=0",
-            )
-        privs = recipient_secret_keys
-    else:
-        assert recipient_secret_key is not None  # noqa: S101
-        privs = [recipient_secret_key]
+    resolved = _resolve_unwrap_privs(
+        envelope, recipient_secret_key, recipient_secret_keys, recipient_key_bundle
+    )
+    if resolved.clean_no_match:
+        return UnwrapResult(matched=False, plaintext=None, reason=UNWRAP_REASON_WRONG_RECIPIENT_KEY)
+    privs = resolved.privs
+    # Whether the flat multi-priv per-priv instrumentation path is active (the
+    # single-priv key form threads the slots accumulator directly).
+    has_multi = recipient_secret_key is None
 
     # Partitioning-oracle pre-checks (incl. per-priv length validation).
     _assert_envelope_structure(envelope, privs)
@@ -1094,6 +1305,134 @@ def ecies_sealed_poe_trial_decrypt(
                 kind=TRIAL_DECRYPT_KIND_MATCH, slot_idx=scan.slot_idx, cek=scan.cek
             )
     return TrialDecryptOnlyResult(kind=TRIAL_DECRYPT_KIND_NO_MATCH, slot_idx=None, cek=None)
+
+
+# Streaming-unwrap outcome. The streaming API does NOT write to a final
+# destination and does NOT recompute the whole-item hash — both are the caller's
+# responsibility (the desktop writes to its encrypted quarantine, then recomputes
+# the item hash before release). `outcome` is the released-bytes verdict the
+# caller MUST check once the generator is exhausted: it is `Matched` only when
+# every chunk's Poly1305 tag and the final-flag verified. Per-chunk integrity +
+# truncation resistance does NOT make the plaintext final — released bytes stay
+# TENTATIVE until the caller's whole-item hash recompute matches the record's
+# `hashes`. A mid-stream tamper resolves `outcome` to NotMatched and the
+# generator stops; the caller discards the quarantine.
+@dataclass
+class StreamUnwrapResult:
+    matched: bool | None
+    reason: str | None
+
+
+def ecies_sealed_poe_unwrap_stream(
+    *,
+    envelope: SealedEnvelope,
+    # The ciphertext STREAM as an iterable of byte chunks. Source read boundaries
+    # are NOT STREAM chunk boundaries: the input is re-chunked internally to
+    # exactly SEALED_CHUNK_SIZE before opening.
+    ciphertext: Iterable[bytes],
+    hashes: Mapping[str, bytes],
+    recipient_secret_key: bytes | None = None,
+    recipient_secret_keys: Sequence[bytes] | None = None,
+    recipient_key_bundle: RecipientKeyBundle | None = None,
+    # Cooperative cancellation: checked before each sealed chunk is read and
+    # opened. When it returns True the generator raises EciesSealedPoeError(CANCELLED).
+    cancel: Callable[[], bool] | None = None,
+) -> tuple[Iterator[bytes], StreamUnwrapResult]:
+    """Streaming sealed-PoE unwrap: trial-decrypt the header up front, then open
+    the body lazily as the returned generator is consumed.
+
+    Returns ``(plaintext_chunks, result)``. The header is trial-decrypted eagerly,
+    so a wrong recipient (or a bundle holding no key for the envelope's KEM)
+    resolves ``result`` to a no-match and yields nothing. On a match the generator
+    re-chunks ``ciphertext`` to exactly SEALED_CHUNK_SIZE and yields each opened,
+    tag-verified plaintext chunk; ``result`` is resolved when the generator is
+    exhausted (or on the first mid-stream tamper, which stops it).
+
+    Tentative-until-hash contract (R2): per-chunk Poly1305 + the final flag give
+    per-segment integrity and truncation resistance, but the yielded bytes are
+    TENTATIVE. The whole-item hash recompute is per-item and caller-owned; this
+    API does NOT perform it. The caller MUST check ``result.matched`` AND recompute
+    the plaintext item hash against the record's ``hashes`` before releasing the
+    bytes (write to a quarantine, not a final destination, until both pass).
+    """
+    result = StreamUnwrapResult(matched=None, reason=None)
+    resolved = _resolve_unwrap_privs(
+        envelope, recipient_secret_key, recipient_secret_keys, recipient_key_bundle
+    )
+    if resolved.clean_no_match:
+        result.matched = False
+        result.reason = UNWRAP_REASON_WRONG_RECIPIENT_KEY
+        return iter(()), result
+
+    trial = ecies_sealed_poe_trial_decrypt(
+        envelope=envelope, hashes=hashes, recipient_secret_keys=resolved.privs
+    )
+    if trial.kind != TRIAL_DECRYPT_KIND_MATCH or trial.cek is None:
+        result.matched = False
+        result.reason = UNWRAP_REASON_WRONG_RECIPIENT_KEY
+        return iter(()), result
+
+    payload_key = _slots_payload_key(trial.cek, envelope.nonce)
+    return _unwrap_stream_body(payload_key, ciphertext, cancel, result), result
+
+
+def _unwrap_stream_body(
+    payload_key: bytes,
+    ciphertext: Iterable[bytes],
+    cancel: Callable[[], bool] | None,
+    result: StreamUnwrapResult,
+) -> Iterator[bytes]:
+    # EOF lookahead (R1): consume SEALED_CHUNK_SIZE-byte sealed chunks and keep
+    # ONE PENDING; on end-of-input open the pending chunk as final=True EVEN IF it
+    # is exactly SEALED_CHUNK_SIZE (a full final chunk is valid — `stream_open`
+    # treats len % SEALED_CHUNK_SIZE == 0 as a full final chunk). The pending one
+    # is held back precisely so we never mis-open a full final chunk as non-final.
+    opener = StreamOpener(payload_key)
+    buffer = bytearray()
+    pending: bytes | None = None
+    try:
+        for piece in ciphertext:
+            if cancel is not None and cancel():
+                raise EciesSealedPoeError(
+                    EciesSealedPoeError.CANCELLED, "unwrap cancelled before completion"
+                )
+            buffer += piece
+            while len(buffer) >= SEALED_CHUNK_SIZE:
+                full = bytes(buffer[:SEALED_CHUNK_SIZE])
+                del buffer[:SEALED_CHUNK_SIZE]
+                # Flush the previous pending sealed chunk as non-final now that a
+                # newer full chunk proves more sealed data follows.
+                if pending is not None:
+                    yield opener.open_chunk(pending, final=False)
+                pending = full
+        if cancel is not None and cancel():
+            raise EciesSealedPoeError(
+                EciesSealedPoeError.CANCELLED, "unwrap cancelled before completion"
+            )
+        # End of input. `buffer` holds the trailing partial sealed chunk (16..
+        # SEALED_CHUNK_SIZE-1 bytes) when the stream did not end on a full-chunk
+        # boundary; otherwise the held `pending` full chunk is the final one. A
+        # ciphertext shorter than the 16-byte tag floor (no pending, <16 trailing)
+        # is a layout violation, caught by open_chunk's final-size check.
+        if len(buffer) > 0:
+            if pending is not None:
+                yield opener.open_chunk(pending, final=False)
+            yield opener.open_chunk(bytes(buffer), final=True)
+        elif pending is not None:
+            yield opener.open_chunk(pending, final=True)
+        else:
+            # Empty ciphertext: drive a zero-length final open so the 16-byte
+            # floor check fails as a layout violation (TAMPERED_CIPHERTEXT),
+            # never a silent empty success.
+            yield opener.open_chunk(b"", final=True)
+    except StreamTamperedError:
+        # A mid-stream tag or layout failure: released bytes are quarantine the
+        # caller discards. Resolve to a tampered-ciphertext no-match and stop.
+        result.matched = False
+        result.reason = UNWRAP_REASON_TAMPERED_CIPHERTEXT
+        return
+    result.matched = True
+    result.reason = None
 
 
 # ---------------------------------------------------------------------------

@@ -49,11 +49,28 @@ from .quote_not_found_error import QuoteNotFoundError
 from .rate_limited_error import RateLimitedError
 from .record_not_found_error import RecordNotFoundError
 from .records import RecordsNamespace
+from .resumable_source import ResumableSource, ResumableSourceInput, to_resumable_source
+from .resumable_upload import (
+    RESUMABLE_CHUNK_BYTES,
+    RESUMABLE_THRESHOLD_BYTES,
+    ResumableUploadError,
+    UploadCancelledError,
+)
 from .service_unavailable_error import ServiceUnavailableError
+from .types import (
+    QuoteBreakdown,
+    QuoteResponse,
+    RecordsCountInput,
+    RecordsCountResponse,
+    UploadProgress,
+    UploadResumableResult,
+)
 from .unauthorized_error import UnauthenticatedError, UnauthorizedError
 from .validation_failed_error import ValidationFailedError
 
 __all__ = [
+    "RESUMABLE_CHUNK_BYTES",
+    "RESUMABLE_THRESHOLD_BYTES",
     "AccountNamespace",
     "BatchEmptyError",
     "BatchTooLargeError",
@@ -81,16 +98,26 @@ __all__ = [
     "PublishResponse",
     "PublishSealedInput",
     "QuoteAlreadyConsumedError",
+    "QuoteBreakdown",
     "QuoteExpiredError",
     "QuoteNotFoundError",
+    "QuoteResponse",
     "RateLimitedError",
     "RecordNotFoundError",
+    "RecordsCountInput",
+    "RecordsCountResponse",
     "RecordsNamespace",
+    "ResumableSource",
+    "ResumableSourceInput",
+    "ResumableUploadError",
     "ServiceUnavailableError",
     "Signer",
     "SupportedHashAlg",
     "UnauthenticatedError",
     "UnauthorizedError",
+    "UploadCancelledError",
+    "UploadProgress",
+    "UploadResumableResult",
     "ValidationFailedError",
     "assemble_cose_sign1",
     "assemble_cose_sign1_hashed",
@@ -99,4 +126,5 @@ __all__ = [
     "parse_http_error",
     "prepare_sig_structure",
     "prepare_sig_structure_hashed",
+    "to_resumable_source",
 ]

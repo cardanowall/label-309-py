@@ -46,7 +46,9 @@ def _client_with_handler(handler: Callable[[httpx.Request], httpx.Response]) -> 
     transport = httpx.MockTransport(handler)
     return Label309Client(
         api_key=FIXTURE_API_KEY,
-        base_url="http://test.example",
+        # Full versioned base: the served path stays /api/v1/poe/… after the
+        # resource suffix joins, so the handler path matches keep working.
+        base_url="http://test.example/api/v1",
         http_client=httpx.AsyncClient(transport=transport),
     )
 

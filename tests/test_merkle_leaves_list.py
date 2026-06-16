@@ -1,7 +1,10 @@
 """Label 309 Merkle leaves-list codec tests.
 
-The 4-leaf canonical CBOR bytes pinned below (275 bytes) drive the
-byte-identical encode/decode round-trip.
+The positive known-answer vectors (per-size canonical-CBOR bytes, both with and
+without the optional leaf_alg key) are loaded from the shared cross-SDK fixture
+so the Python, TypeScript, and Rust twins assert against one byte-identical
+corpus. The 4-leaf vector doubles as the input set for the structural and
+negative codec tests below.
 """
 
 from __future__ import annotations
@@ -20,34 +23,76 @@ from cardanowall._crypto.merkle_leaves_list import (
 )
 from cardanowall._crypto.merkle_sha2_256 import merkle_sha2_256_root
 
-# 4-leaf fixture inputs.
-PINNED_LEAVES = [
-    bytes.fromhex("b5e62a21038c1c2fdf28ad4d39ba6502e0568591c8647cac6998bfff67a25b3c"),
-    bytes.fromhex("986aad6d251d450b9e7cd0c811e65bc95f95688060d963a83ab6505da350be56"),
-    bytes.fromhex("27f4c2b7157b2e28b1a08e47fce1c3fa27a0f2c8a6760f5995c8a83c9cd1cacc"),
-    bytes.fromhex("49707d9c71d5ebf72aaa3ada7a34e152d41811b345366681fc09849e8c634076"),
-]
-PINNED_ROOT = bytes.fromhex("93a86cdff4f26f1a7c9793cc7c3ce107102570a81a323902617f7c13670582ee")
+FIXTURES = Path(__file__).parent / "fixtures"
+_LEAVES_LIST_KAT = json.loads((FIXTURES / "merkle" / "leaves-list-kat.json").read_text())
+_LEAVES_LIST_VECTORS = _LEAVES_LIST_KAT["vectors"]
 
-# Expected canonical-CBOR leaves-list bytes (275 B).
-PINNED_LEAVES_LIST_CBOR = bytes.fromhex(
-    "a664726f6f74582093a86cdff4f26f1a7c9793cc7c3ce107102570a81a323902617f7c13670582ee"
-    "66666f726d6174781c63617264616e6f2d706f652d6d65726b6c652d6c65617665732d7631666c65"
-    "61766573845820b5e62a21038c1c2fdf28ad4d39ba6502e0568591c8647cac6998bfff67a25b3c58"
-    "20986aad6d251d450b9e7cd0c811e65bc95f95688060d963a83ab6505da350be56582027f4c2b715"
-    "7b2e28b1a08e47fce1c3fa27a0f2c8a6760f5995c8a83c9cd1cacc582049707d9c71d5ebf72aaa3a"
-    "da7a34e152d41811b345366681fc09849e8c634076686c6561665f616c6768736861322d32353668"
-    "747265655f616c676e726663393136322d7368613235366a6c6561665f636f756e7404"
-)
+# The 4-leaf vector seeds the structural/negative tests below.
+_FOUR_LEAF = next(v for v in _LEAVES_LIST_VECTORS if v["leaf_count"] == 4)
+PINNED_LEAVES = [bytes.fromhex(h) for h in _FOUR_LEAF["leaves"]]
+PINNED_ROOT = bytes.fromhex(_FOUR_LEAF["root"])
+PINNED_LEAVES_LIST_CBOR = bytes.fromhex(_FOUR_LEAF["cbor_hex_with_leaf_alg"])
 
 
 def test_constants_are_canonical_v1() -> None:
     assert LEAVES_LIST_FORMAT_V1 == "cardano-poe-merkle-leaves-v1"
     assert DEFAULT_TREE_ALG == "rfc9162-sha256"
+    assert _LEAVES_LIST_KAT["format"] == LEAVES_LIST_FORMAT_V1
+    assert _LEAVES_LIST_KAT["alg"] == DEFAULT_TREE_ALG
+
+
+def test_leaves_list_kat_encode_decode_round_trip() -> None:
+    """Every pinned vector: encode(inputs) == cbor (with and without leaf_alg),
+    and decode(cbor) recovers the canonical dict whose leaves recompute the root."""
+    seen_sizes = set()
+    for vector in _LEAVES_LIST_VECTORS:
+        leaves = [bytes.fromhex(h) for h in vector["leaves"]]
+        root = bytes.fromhex(vector["root"])
+        leaf_alg = vector["leaf_alg"]
+        with_alg = bytes.fromhex(vector["cbor_hex_with_leaf_alg"])
+        no_alg = bytes.fromhex(vector["cbor_hex_no_leaf_alg"])
+
+        # Encode reproduces both pinned forms byte-for-byte.
+        assert encode_leaves_list(leaves=leaves, root=root, leaf_alg=leaf_alg) == with_alg, (
+            f"{vector['name']} with leaf_alg"
+        )
+        assert encode_leaves_list(leaves=leaves, root=root) == no_alg, (
+            f"{vector['name']} without leaf_alg"
+        )
+
+        # Decode of the with-leaf_alg form yields the canonical dict.
+        decoded = decode_leaves_list(with_alg)
+        assert decoded["format"] == LEAVES_LIST_FORMAT_V1
+        assert decoded["tree_alg"] == DEFAULT_TREE_ALG
+        assert decoded["root"] == root
+        assert decoded["leaves"] == leaves
+        assert decoded["leaf_count"] == vector["leaf_count"]
+        assert decoded["leaf_alg"] == leaf_alg
+        # The decoded leaves recompute to the declared on-chain commit.
+        assert merkle_sha2_256_root(decoded["leaves"]) == root
+
+        # encode(decode(cbor)) == cbor byte-for-byte (both forms).
+        assert (
+            encode_leaves_list(
+                leaves=decoded["leaves"], root=decoded["root"], leaf_alg=decoded["leaf_alg"]
+            )
+            == with_alg
+        )
+
+        # The no-leaf_alg form omits exactly that key on decode.
+        decoded_no_alg = decode_leaves_list(no_alg)
+        assert "leaf_alg" not in decoded_no_alg
+        assert decoded_no_alg["leaf_count"] == vector["leaf_count"]
+        assert decoded_no_alg["root"] == root
+        assert encode_leaves_list(leaves=leaves, root=root) == no_alg
+
+        seen_sizes.add(vector["leaf_count"])
+
+    assert seen_sizes == {1, 2, 3, 4, 5, 7}
 
 
 def test_encode_matches_pinned_cbor_bytes() -> None:
-    """Encoded bytes MUST match the pinned 275-byte CBOR."""
+    """Encoded bytes MUST match the pinned 4-leaf CBOR (275 B)."""
     out = encode_leaves_list(leaves=PINNED_LEAVES, root=PINNED_ROOT, leaf_alg="sha2-256")
     assert out == PINNED_LEAVES_LIST_CBOR
     assert len(out) == 275

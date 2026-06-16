@@ -24,6 +24,8 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Iterable
 from typing import Final
 
 from .aead import (
@@ -39,7 +41,11 @@ from .aead import (
 CHUNK_SIZE: Final[int] = 65536
 TAG_SIZE: Final[int] = 16
 
-_SEALED_CHUNK_SIZE: Final[int] = CHUNK_SIZE + TAG_SIZE
+# One whole sealed chunk on the wire: a full plaintext chunk plus its 16-byte
+# tag. Public so the streaming wrappers re-chunk the ciphertext against this
+# exact boundary rather than re-deriving (and risking drifting from) the literal
+# 65552.
+SEALED_CHUNK_SIZE: Final[int] = CHUNK_SIZE + TAG_SIZE
 _PAYLOAD_KEY_LENGTH: Final[int] = 32
 _NONCE_COUNTER_BYTES: Final[int] = 11
 _MAX_COUNTER: Final[int] = (1 << 88) - 1
@@ -144,9 +150,9 @@ class StreamOpener:
         if self._counter > _MAX_COUNTER:
             raise StreamTamperedError("STREAM chunk counter exhausted")
         if final:
-            if len(sealed) < TAG_SIZE or len(sealed) > _SEALED_CHUNK_SIZE:
+            if len(sealed) < TAG_SIZE or len(sealed) > SEALED_CHUNK_SIZE:
                 raise StreamTamperedError("final chunk size violates the STREAM layout")
-        elif len(sealed) != _SEALED_CHUNK_SIZE:
+        elif len(sealed) != SEALED_CHUNK_SIZE:
             raise StreamTamperedError("non-final chunk size violates the STREAM layout")
         try:
             plaintext = chacha20_poly1305_decrypt(
@@ -205,9 +211,38 @@ def stream_open(payload_key: bytes, ciphertext: bytes) -> bytes:
     pos = 0
     while True:
         remaining = n - pos
-        final = remaining <= _SEALED_CHUNK_SIZE
-        take = remaining if final else _SEALED_CHUNK_SIZE
+        final = remaining <= SEALED_CHUNK_SIZE
+        take = remaining if final else SEALED_CHUNK_SIZE
         out += opener.open_chunk(ciphertext[pos : pos + take], final=final)
         pos += take
         if final:
             return bytes(out)
+
+
+def stream_sealed_length(plaintext_length: int) -> int:
+    """Predict the sealed STREAM byte length for a plaintext of ``plaintext_length`` bytes.
+
+    The layout adds exactly one 16-byte tag per chunk, and the chunk count is
+    ``ceil(plaintext_length / CHUNK_SIZE)`` with the empty plaintext occupying
+    exactly one zero-length final chunk (so the minimum is one tag) and an exact
+    multiple of CHUNK_SIZE ending in a FULL final chunk (never an extra empty
+    one). Lets a caller size a destination / report a content length without
+    materialising the ciphertext.
+    """
+    if plaintext_length < 0:
+        raise ValueError(f"plaintext_length MUST be a non-negative integer, got {plaintext_length}")
+    chunk_count = max(1, (plaintext_length + CHUNK_SIZE - 1) // CHUNK_SIZE)
+    return plaintext_length + chunk_count * TAG_SIZE
+
+
+def sha256_stream(chunks: Iterable[bytes]) -> bytes:
+    """SHA-256 over an iterable of byte chunks, hashing incrementally.
+
+    The single-hash streaming companion to :func:`cardanowall._crypto.hash.dual_hash_stream`:
+    a large input (a file read in slices, a generator) is folded into the digest
+    without ever being concatenated in memory.
+    """
+    digest = hashlib.sha256()
+    for chunk in chunks:
+        digest.update(chunk)
+    return digest.digest()

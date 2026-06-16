@@ -132,7 +132,7 @@ class _ResolvedPublishConfig:
 
 class PublishContentInput(TypedDict, total=False):
     content: bytes | str  # required
-    quote_id: str  # required — UUID from POST /api/v1/poe/quote
+    quote_id: str  # required — UUID from POST /poe/quote
     hash_alg: SupportedHashAlg
     signer: Signer
     idempotency_key: str
@@ -148,7 +148,7 @@ class PublishPrehashedInput(TypedDict, total=False):
     """
 
     hashes: dict[SupportedHashAlg, str]  # required
-    quote_id: str  # required — UUID from POST /api/v1/poe/quote
+    quote_id: str  # required — UUID from POST /poe/quote
     signer: Signer
     idempotency_key: str
 
@@ -158,7 +158,7 @@ class PublishSealedInput(TypedDict, total=False):
     # Recipient public keys. Length is KEM-dependent: 32 bytes for kem='x25519',
     # 1216 bytes for kem='mlkem768x25519' (X-Wing hybrid).
     recipients: Sequence[bytes]  # required
-    quote_id: str  # required — UUID from POST /api/v1/poe/quote
+    quote_id: str  # required — UUID from POST /poe/quote
     hash_alg: SupportedHashAlg
     # KEM the sealed envelope is built under. Defaults to 'mlkem768x25519'
     # (post-quantum-safe X-Wing hybrid). Every recipient MUST be addressed under
@@ -170,7 +170,7 @@ class PublishSealedInput(TypedDict, total=False):
 
 class PublishMerkleInput(TypedDict, total=False):
     leaves: list[bytes | str]  # required
-    quote_id: str  # required — UUID from POST /api/v1/poe/quote
+    quote_id: str  # required — UUID from POST /poe/quote
     hash_alg: Literal["sha2-256"]
     signer: Signer
     idempotency_key: str
@@ -326,7 +326,7 @@ async def _post_publish(
 ) -> PublishResponse:
     body = {"record": record_bytes_hex, "quote_id": quote_id}
     response = await config.http_client.post(
-        f"{config.base_url}/api/v1/poe/publish",
+        f"{config.base_url}/poe/publish",
         content=json.dumps(body, separators=(",", ":")),
         headers=_build_json_headers(config.api_key, idempotency_key),
     )
@@ -350,7 +350,7 @@ async def _post_uploads(
             )
         )
     response = await config.http_client.post(
-        f"{config.base_url}/api/v1/poe/uploads",
+        f"{config.base_url}/poe/uploads",
         data={"target": _STORAGE_TARGET_ARWEAVE},
         files=files,
         headers=_build_multipart_headers(config.api_key, idempotency_key),

@@ -31,7 +31,9 @@ def _client_with_handler(
     transport = httpx.MockTransport(handler)
     return Label309Client(
         api_key=api_key,
-        base_url="http://test.example",
+        # Full versioned base: the version segment lives here. The served path
+        # stays /api/v1/account/balance after the suffix join.
+        base_url="http://test.example/api/v1",
         http_client=httpx.AsyncClient(transport=transport),
     )
 

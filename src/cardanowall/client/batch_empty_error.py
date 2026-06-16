@@ -1,5 +1,5 @@
 """400 ``batch-empty`` — the ``records[]`` array on
-``/api/v1/poe/publish-batch`` was empty. The batch endpoint requires at
+``/poe/publish-batch`` was empty. The batch endpoint requires at
 least one record.
 """
 

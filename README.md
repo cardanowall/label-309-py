@@ -82,10 +82,12 @@ else:
 ### Publish with the gateway-agnostic client
 
 The client targets **any** Label 309 gateway. `base_url` is **required** and used
-verbatim; `api_key` is an **opaque bearer token** forwarded as
-`Authorization: Bearer <key>` with no format assumptions. `cardanowall.com` below
-is only one example deployment — substitute any conformant gateway, including a
-self-hosted one.
+verbatim — it is the **full versioned base**, including the API version segment
+(e.g. `https://gateway.example.com/api/v1`); each request appends only a resource
+suffix (`/records`, `/poe/quote`, …) to it. `api_key` is an **opaque bearer
+token** forwarded as `Authorization: Bearer <key>` with no format assumptions.
+`gateway.example.com` below is only one example deployment — substitute any
+conformant gateway, including a self-hosted one.
 
 ```python
 import asyncio
@@ -94,7 +96,7 @@ from cardanowall import Label309Client, signer_from_seed
 async def main() -> None:
     signer = signer_from_seed(seed=b"\x00" * 32)  # 32-byte seed; SDK never sees the private key persisted
     async with Label309Client(
-        base_url="https://gateway.example.com",
+        base_url="https://gateway.example.com/api/v1",
         api_key="<opaque-bearer>",
     ) as client:
         quote = await client.poe.quote(

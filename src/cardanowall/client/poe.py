@@ -1,9 +1,10 @@
-"""Wraps the mutating ``/api/v1/poe/*`` REST surface:
+"""Wraps the mutating ``/poe/*`` REST surface (suffixes appended to the
+configured versioned ``base_url``):
 
-- POST ``/api/v1/poe/quote`` — lock a USD price for an upcoming publish
-- POST ``/api/v1/poe/uploads`` — multipart binary upload to a backend
-- POST ``/api/v1/poe/publish`` — single finalised record (JSON)
-- POST ``/api/v1/poe/publish-batch`` — 1..50 finalised records (JSON)
+- POST ``/poe/quote`` — lock a USD price for an upcoming publish
+- POST ``/poe/uploads`` — multipart binary upload to a backend
+- POST ``/poe/publish`` — single finalised record (JSON)
+- POST ``/poe/publish-batch`` — 1..50 finalised records (JSON)
 
 Plus high-level helpers that compose the above into common flows:
 
@@ -12,8 +13,8 @@ Plus high-level helpers that compose the above into common flows:
 - :py:meth:`PoeNamespace.publish_sealed` — encrypt + uploads + publish
 - :py:meth:`PoeNamespace.publish_merkle` — uploads + publish, Merkle root
 
-Reads and verifications live under
-:class:`cardanowall.client.records.RecordsNamespace`.
+Reads live under :class:`cardanowall.client.records.RecordsNamespace`;
+verification runs locally via :mod:`cardanowall.verifier`.
 
 All methods are coroutines (async). Use ``asyncio.run(...)`` for sync use.
 """
@@ -28,6 +29,7 @@ from typing import Any, cast
 import httpx
 
 from .parse_http_error import parse_http_error
+from .partial_upload_error import PartialUploadError
 from .publish import (
     PublishMerkleResponse,
     Signer,
@@ -47,12 +49,28 @@ from .publish import (
 from .publish import (
     publish_sealed as _publish_sealed_impl,
 )
+from .resumable_source import ResumableSourceInput
+from .resumable_upload import (
+    Cancel,
+    OnProgress,
+    OnSessionCreated,
+)
+from .resumable_upload import (
+    _ResolvedConfig as _ResumableResolvedConfig,
+)
+from .resumable_upload import (
+    abandon_session as _abandon_session_impl,
+)
+from .resumable_upload import (
+    upload_resumable as _upload_resumable_impl,
+)
 from .types import (
     PublishBatchResponse,
     PublishResponse,
     QuoteResponse,
     RecordSignature,
     StorageTarget,
+    UploadResumableResult,
     UploadsResponse,
 )
 
@@ -153,7 +171,7 @@ class PoeNamespace:
             "file_bytes_total": file_bytes_total,
         }
         response = await self._config.http_client.post(
-            f"{self._config.base_url}/api/v1/poe/quote",
+            f"{self._config.base_url}/poe/quote",
             content=json.dumps(body, separators=(",", ":")),
             headers=_build_json_headers(self._config.api_key),
         )
@@ -173,8 +191,8 @@ class PoeNamespace:
         retry just the failed indices.
 
         Billing: free. The storage cost is part of the publish quote (POST
-        /api/v1/poe/quote → POST /api/v1/poe/publish) and is debited once
-        at publish time against the locked price snapshot.
+        /poe/quote → POST /poe/publish) and is debited once at publish time
+        against the locked price snapshot.
 
         On HTTP-level failure (auth, rate limit, malformed request) this
         raises a typed :class:`Label309HttpError` subclass. Per-file
@@ -192,13 +210,113 @@ class PoeNamespace:
                 )
             )
         response = await self._config.http_client.post(
-            f"{self._config.base_url}/api/v1/poe/uploads",
+            f"{self._config.base_url}/poe/uploads",
             data={"target": target},
             files=files,
             headers=_build_multipart_headers(self._config.api_key, idempotency_key),
         )
         _raise_for_status(response)
         return cast(UploadsResponse, response.json())
+
+    async def upload_resumable(
+        self,
+        *,
+        source: ResumableSourceInput,
+        target: StorageTarget | None = None,
+        threshold: int | None = None,
+        chunk_bytes: int | None = None,
+        parallelism: int | None = None,
+        max_chunk_retries: int | None = None,
+        idempotency_key: str | None = None,
+        content_type: str | None = None,
+        session_id: str | None = None,
+        cancel: Cancel | None = None,
+        on_progress: OnProgress | None = None,
+        on_session_created: OnSessionCreated | None = None,
+    ) -> UploadResumableResult:
+        """Upload one file, choosing the single-shot or chunked-session path by size.
+
+        A file at or below ``threshold`` (~48 MiB by default) is sent with the
+        single-shot ``uploads()`` path; a larger one is uploaded as a
+        content-addressed resumable session (create → PUT chunks in parallel →
+        complete), converging on one ``ar://`` URI. ``source`` may be ``bytes``,
+        a filesystem path, an open binary file, or a ``ResumableSource``.
+
+        Resume an interrupted upload by passing the ``session_id`` from a prior
+        attempt: the helper adopts the server's status and re-sends only the
+        missing chunks, WITHOUT re-hashing the local source.
+
+        Cancellation: a cooperative ``cancel`` callable is checked at every phase,
+        and a cancelled task (``asyncio.CancelledError``) is honoured too; either,
+        once a session exists, abandons it before the error propagates.
+        ``on_session_created(session_id)`` fires the instant the session is
+        created (before any chunk PUT) so a caller can persist it for crash-resume;
+        ``on_progress(UploadProgress)`` fires after each chunk PUT.
+
+        On a per-file storage failure inside the single-shot path the response is
+        surfaced as a :class:`PartialUploadError` (mirroring the high-level
+        publish helpers); HTTP-level failures raise a typed
+        :class:`Label309HttpError` subclass.
+        """
+        resumable_config = _ResumableResolvedConfig(
+            api_key=self._config.api_key,
+            base_url=self._config.base_url,
+            http_client=self._config.http_client,
+        )
+        return await _upload_resumable_impl(
+            resumable_config,
+            self._single_shot_upload,
+            source=source,
+            target=target,
+            threshold=threshold,
+            chunk_bytes=chunk_bytes,
+            parallelism=parallelism,
+            max_chunk_retries=max_chunk_retries,
+            idempotency_key=idempotency_key,
+            content_type=content_type,
+            session_id=session_id,
+            cancel=cancel,
+            on_progress=on_progress,
+            on_session_created=on_session_created,
+        )
+
+    async def _single_shot_upload(
+        self,
+        *,
+        target: StorageTarget,
+        data: bytes,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Single-shot ``uploads()`` of one blob, returning ``{uri, sha256, bytes}``.
+
+        Injected into the resumable driver. A per-file failure is raised as a
+        :class:`PartialUploadError` so the small-file path reports a storage
+        failure the same way the high-level publish helpers do.
+        """
+        result = await self.uploads(target=target, data=[data], idempotency_key=idempotency_key)
+        first = result["uploads"][0]
+        if first["ok"] is False:
+            raise PartialUploadError(result)
+        return {
+            "uri": first["uri"],
+            "sha256": first["sha256"],
+            "bytes": first["bytes"],
+        }
+
+    async def abandon_upload_session(self, session_id: str) -> None:
+        """Discard an in-progress resumable upload session.
+
+        ``DELETE /poe/uploads/sessions/{session_id}``. Idempotent — a session the
+        gateway has already reclaimed (404/410) is treated as success — so a
+        caller can safely abandon a session it is unsure still exists (e.g. after
+        a crash, before re-trying).
+        """
+        resumable_config = _ResumableResolvedConfig(
+            api_key=self._config.api_key,
+            base_url=self._config.base_url,
+            http_client=self._config.http_client,
+        )
+        await _abandon_session_impl(resumable_config, session_id)
 
     async def publish(
         self,
@@ -226,7 +344,7 @@ class PoeNamespace:
         if signatures is not None:
             body["signatures"] = list(signatures)
         response = await self._config.http_client.post(
-            f"{self._config.base_url}/api/v1/poe/publish",
+            f"{self._config.base_url}/poe/publish",
             content=json.dumps(body, separators=(",", ":")),
             headers=_build_json_headers(self._config.api_key, idempotency_key),
         )
@@ -261,7 +379,7 @@ class PoeNamespace:
             wire_records.append(entry)
         body = {"records": wire_records}
         response = await self._config.http_client.post(
-            f"{self._config.base_url}/api/v1/poe/publish-batch",
+            f"{self._config.base_url}/poe/publish-batch",
             content=json.dumps(body, separators=(",", ":")),
             headers=_build_json_headers(self._config.api_key, idempotency_key),
         )

@@ -1,7 +1,7 @@
 """RFC 7807 ``application/problem+json`` envelope and the typed error class
 hierarchy raised by the SDK on every non-2xx response.
 
-A conforming Label 309 gateway's ``/api/v1/*`` routes emit the canonical shape::
+A conforming Label 309 gateway's REST routes emit the canonical shape::
 
     Content-Type: application/problem+json
     {
