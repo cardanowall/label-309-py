@@ -79,6 +79,13 @@ def _verify_input(record: CorpusRecord) -> VerifyTxInput:
     return VerifyTxInput(
         tx_hash=record["tx_hash"],
         cardano_gateway_chain=() if use_blockfrost else ("https://api.koios.rest/api/v1",),
+        # Pin the Arweave chain to the single gateway the corpus stub serves, so
+        # this report-parity test stays decoupled from the default gateway
+        # ROTATION (whose membership/order is asserted independently in
+        # test_verifier_fetch.py). Without the pin, the verifier would try the
+        # default chain's first gateway, get an unserved-host failure from the
+        # stub, and record an extra audit row that diverges from the fixture.
+        arweave_gateway_chain=("https://arweave.net",),
         blockfrost_project_id="corpus" if use_blockfrost else None,
         decryption=decryption if len(decryption) > 0 else None,
         deny_hosts=CONFORMANCE_DENY,

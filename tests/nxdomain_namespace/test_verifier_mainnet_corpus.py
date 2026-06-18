@@ -76,6 +76,11 @@ def _verify_input(record: CorpusRecord, deny_hosts: tuple[str, ...]) -> VerifyTx
     return VerifyTxInput(
         tx_hash=record["tx_hash"],
         cardano_gateway_chain=() if use_blockfrost else ("https://api.koios.rest/api/v1",),
+        # Pin the Arweave chain to the single gateway the corpus stub serves
+        # (the default rotation's membership/order is asserted separately in
+        # test_verifier_fetch.py); otherwise the verifier tries the default
+        # chain's first gateway, which this stub does not serve.
+        arweave_gateway_chain=("https://arweave.net",),
         blockfrost_project_id="corpus" if use_blockfrost else None,
         decryption=decryption if len(decryption) > 0 else None,
         deny_hosts=deny_hosts,

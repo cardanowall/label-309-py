@@ -76,6 +76,12 @@ class FetchOutboundOptions:
     # therefore untrusted; a hostile gateway must not be able to stream
     # unbounded bytes into memory. None → DEFAULT_OUTBOUND_MAX_BYTES.
     max_bytes: int | None = None
+    # Deny-host list forwarded by ``wrap_fetch_outbound`` so the transport can
+    # re-apply it to a same-domain redirect target (arweave purpose only). The
+    # wrapper validated the ORIGINAL url against this list before dispatch; the
+    # transport re-validates each redirect hop it chooses to follow so a 3xx
+    # can never pivot the fetch onto a denied host behind the wrapper's back.
+    deny_hosts: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)

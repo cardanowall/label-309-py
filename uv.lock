@@ -112,7 +112,7 @@ wheels = [
 
 [[package]]
 name = "cardanowall-sdk"
-version = "0.7.0"
+version = "0.7.1"
 source = { editable = "." }
 dependencies = [
     { name = "argon2-cffi" },

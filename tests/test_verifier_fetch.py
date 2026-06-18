@@ -372,3 +372,200 @@ def test_body_at_or_under_cap_returns_full_body() -> None:
     )
     assert result.status == 200
     assert result.bytes == payload
+
+
+# --- Default Arweave gateway chain --------------------------------------------
+
+
+def test_arweave_gateway_defaults() -> None:
+    # turbo-gateway.com first (the producer's default storage provider), then
+    # arweave.net, then permagate.io. The dead ar-io.net / g8way.io hosts (no
+    # DNS A-record) were removed. Pinned for cross-SDK parity (TS / PY / RS).
+    from cardanowall.verifier.fetch import ARWEAVE_GATEWAY_DEFAULTS
+
+    assert ARWEAVE_GATEWAY_DEFAULTS == (
+        "https://turbo-gateway.com",
+        "https://arweave.net",
+        "https://permagate.io",
+    )
+
+
+# --- Same-domain sandbox redirect (arweave purpose) ---------------------------
+#
+# Arweave gateways 302 `{gw}/{txid}` → `{base32}.{gw}/{txid}` (a sandbox
+# subdomain of the SAME registrable domain). The transport follows that
+# same-domain hop manually (httpx keeps follow_redirects=False), while
+# cross-domain or denied targets fail the gateway so the caller fails over.
+
+_TXID = "a" * 43
+_SANDBOX = "https://base32sandbox.arweave.net/" + _TXID
+
+
+def test_arweave_same_domain_redirect_is_followed_to_200() -> None:
+    payload = b"sandbox-content"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "arweave.net":
+            # Bare-domain request 302s to the sandbox subdomain.
+            return httpx.Response(302, headers={"location": _SANDBOX})
+        if request.url.host == "base32sandbox.arweave.net":
+            return httpx.Response(200, content=payload)
+        raise AssertionError(f"unexpected host {request.url.host}")
+
+    result = _run_with_mock_transport(
+        handler,
+        f"https://arweave.net/{_TXID}",
+        FetchOutboundOptions(method="GET", purpose="arweave"),
+    )
+    assert result.status == 200
+    assert result.bytes == payload
+
+
+def test_arweave_cross_domain_redirect_is_not_followed() -> None:
+    # A 302 pointing off the gateway's registrable domain (here the cloud
+    # metadata IP) must not be followed: the fetch fails so the caller can move
+    # on to the next gateway. This is the SSRF-pivot block.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            302, headers={"location": "https://169.254.169.254/latest/meta-data/"}
+        )
+
+    with pytest.raises(RuntimeError) as exc:
+        _run_with_mock_transport(
+            handler,
+            f"https://arweave.net/{_TXID}",
+            FetchOutboundOptions(method="GET", purpose="arweave"),
+        )
+    assert "redirect refused" in str(exc.value)
+
+
+def test_arweave_cross_domain_redirect_to_external_host_is_not_followed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "https://evil.example/x"})
+
+    with pytest.raises(RuntimeError) as exc:
+        _run_with_mock_transport(
+            handler,
+            f"https://arweave.net/{_TXID}",
+            FetchOutboundOptions(method="GET", purpose="arweave"),
+        )
+    assert "redirect refused" in str(exc.value)
+
+
+def test_arweave_redirect_to_denied_host_is_rejected() -> None:
+    # Even a same-registrable-domain redirect target is refused when it lands on
+    # a deny-listed host: the wrapper's deny check is re-applied to the hop.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "https://blocked.arweave.net/" + _TXID})
+
+    with pytest.raises(RuntimeError) as exc:
+        _run_with_mock_transport(
+            handler,
+            f"https://arweave.net/{_TXID}",
+            FetchOutboundOptions(
+                method="GET",
+                purpose="arweave",
+                deny_hosts=("*.arweave.net",),
+            ),
+        )
+    assert "redirect refused" in str(exc.value)
+
+
+def test_arweave_redirect_hop_cap_is_enforced() -> None:
+    # A gateway that keeps redirecting within its own domain is bounded: after
+    # MAX_REDIRECT_HOPS follows the fetch fails rather than looping forever.
+    from cardanowall.verifier.fetch import MAX_REDIRECT_HOPS
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Each hop points to another same-domain subdomain, never reaching 200.
+        nxt = f"https://hop-{request.url.path.count('/')}.arweave.net/{_TXID}"
+        return httpx.Response(302, headers={"location": nxt})
+
+    with pytest.raises(RuntimeError) as exc:
+        _run_with_mock_transport(
+            handler,
+            f"https://arweave.net/{_TXID}",
+            FetchOutboundOptions(method="GET", purpose="arweave"),
+        )
+    assert "redirect limit exceeded" in str(exc.value)
+    assert str(MAX_REDIRECT_HOPS) in str(exc.value)
+
+
+def test_non_arweave_purpose_does_not_follow_redirects() -> None:
+    # Redirect-following is scoped to the arweave gateway-fetch purpose. Every
+    # other purpose surfaces a readable 3xx verbatim as a non-2xx status (the
+    # caller's attempt handling fails it like a 5xx) — no Location is consulted.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": _SANDBOX})
+
+    result = _run_with_mock_transport(
+        handler,
+        f"https://arweave.net/{_TXID}",
+        FetchOutboundOptions(method="GET", purpose="cardano"),
+    )
+    assert result.status == 302
+
+
+# --- Multi-hop redirect chain: every hop anchored on the ORIGINAL host --------
+#
+# A multi-hop chain must be validated against the host of the URL the fetch
+# STARTED from, not against the previous hop's (drifting) host. This matches the
+# Rust twin's `gateway_redirect_allowed(origin, ...)`: `origin` is fixed for the
+# whole chain.
+
+
+def test_arweave_multi_hop_subdomains_followed_anchored_on_original_host() -> None:
+    # arweave.net → a.arweave.net → b.arweave.net: every hop is a subdomain of
+    # the ORIGINAL arweave.net, so the whole chain is followed to the 200 body.
+    # b.arweave.net is NOT a subdomain of a.arweave.net (the previous hop), so
+    # per-hop anchoring would have wrongly refused it.
+    payload = b"deep-sandbox-content"
+    visited: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        visited.append(host)
+        if host == "arweave.net":
+            return httpx.Response(302, headers={"location": f"https://a.arweave.net/{_TXID}"})
+        if host == "a.arweave.net":
+            return httpx.Response(302, headers={"location": f"https://b.arweave.net/{_TXID}"})
+        if host == "b.arweave.net":
+            return httpx.Response(200, content=payload)
+        raise AssertionError(f"unexpected host {host}")
+
+    result = _run_with_mock_transport(
+        handler,
+        f"https://arweave.net/{_TXID}",
+        FetchOutboundOptions(method="GET", purpose="arweave"),
+    )
+    assert result.status == 200
+    assert result.bytes == payload
+    assert visited == ["arweave.net", "a.arweave.net", "b.arweave.net"]
+
+
+def test_arweave_multi_hop_cross_domain_refused_at_drifting_hop() -> None:
+    # arweave.net → a.arweave.net → c.other.com: the final hop leaves the
+    # ORIGINAL registrable domain and is refused — even though under the old
+    # per-hop anchoring c.other.com would have been compared against a.arweave.net
+    # (still cross-domain) the regression this guards is the inverse drift, so
+    # we also assert the cross-domain hop never gets contacted.
+    visited: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        visited.append(host)
+        if host == "arweave.net":
+            return httpx.Response(302, headers={"location": f"https://a.arweave.net/{_TXID}"})
+        if host == "a.arweave.net":
+            return httpx.Response(302, headers={"location": "https://c.other.com/steal"})
+        raise AssertionError(f"unexpected host {host}")
+
+    with pytest.raises(RuntimeError) as exc:
+        _run_with_mock_transport(
+            handler,
+            f"https://arweave.net/{_TXID}",
+            FetchOutboundOptions(method="GET", purpose="arweave"),
+        )
+    assert "redirect refused" in str(exc.value)
+    # The cross-domain target is never contacted.
+    assert visited == ["arweave.net", "a.arweave.net"]

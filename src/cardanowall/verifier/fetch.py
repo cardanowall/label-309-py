@@ -47,9 +47,9 @@ import random
 import re
 import time
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -84,9 +84,9 @@ _LOOPBACK_127_RE: Final[re.Pattern[str]] = re.compile(r"^127\.\d{1,3}\.\d{1,3}\.
 # and one that does not is a deployment that declines IPFS
 # (URI_TARGET_FORBIDDEN at fetch time).
 ARWEAVE_GATEWAY_DEFAULTS: Final[tuple[str, ...]] = (
+    "https://turbo-gateway.com",
     "https://arweave.net",
-    "https://ar-io.net",
-    "https://g8way.io",
+    "https://permagate.io",
 )
 
 _ARWEAVE_TXID_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]{43}$")
@@ -180,6 +180,59 @@ def matches_deny_list(host: str, deny: Sequence[str]) -> bool:
     return False
 
 
+# Maximum redirect hops the arweave-gateway content fetch will follow before
+# treating the gateway as failed. Arweave gateways 302 once
+# (`{gw}/{txid}` → sandbox subdomain); the small ceiling tolerates a gateway
+# that chains a couple of internal hops while bounding the work.
+MAX_REDIRECT_HOPS: Final[int] = 3
+
+
+def _resolve_same_domain_redirect(
+    from_url: str, location: str | None, original_gw_host: str, deny_hosts: Sequence[str]
+) -> str | None:
+    """Decide whether a 3xx Location may be followed for the arweave
+    content-fetch purpose. Arweave gateways 302 ``{gw}/{txid}`` →
+    ``{base32}.{gw}/{txid}`` (a sandbox subdomain of the SAME registrable
+    domain); following same-domain redirects is REQUIRED to fetch content,
+    while cross-domain redirects stay blocked to prevent SSRF pivots (e.g. a
+    302 → ``169.254.169.254`` or → ``evil.com``). The SDK has no browser
+    boundary, so the validation must live here in code.
+
+    Every hop of a multi-hop chain is anchored against ``original_gw_host`` —
+    the host of the URL the fetch STARTED from — not the previous hop's host.
+    Anchoring on the previous hop would let the allowed host drift as the chain
+    is followed (``a.arweave.net`` → ``evil.com`` would pass once the comparison
+    host had already drifted), and would also wrongly refuse a legitimate
+    sibling sandbox (``a.arweave.net`` → ``b.arweave.net``). The caller
+    canonicalises ``original_gw_host`` once before the follow-loop.
+
+    Returns the absolute, same-domain, non-denied target URL to re-issue the GET
+    against, or ``None`` to fail this gateway."""
+    if location is None:
+        return None
+    try:
+        target = urljoin(from_url, location)
+        target_parsed = urlparse(target)
+    except ValueError:
+        return None
+    # 1. The Location must resolve to an absolute https URL.
+    if target_parsed.scheme.lower() != "https":
+        return None
+    host = _canonicalise_host(target_parsed.hostname or "")
+    if not host or not original_gw_host:
+        return None
+    # 2. The Location host must equal the ORIGINAL gateway's host or be a
+    #    subdomain of it: `host == original_gw_host or
+    #    host.endswith("." + original_gw_host)`.
+    if host != original_gw_host and not host.endswith("." + original_gw_host):
+        return None
+    # 3. The redirect target must not be in the deny-host list — the same check
+    #    the wrapper applied to the original url, re-applied to the new target.
+    if deny_hosts and matches_deny_list(host, deny_hosts):
+        return None
+    return target
+
+
 def _is_allowed_protocol(url: str) -> bool:
     try:
         scheme = urlparse(url).scheme.lower()
@@ -266,6 +319,12 @@ def wrap_fetch_outbound(
                 )
                 raise DenyHostError(host=_canonicalise_host(host), url=url)
 
+        # Forward the wrapper's deny-host list into the transport so it can
+        # re-apply the same check to any same-domain redirect target it follows
+        # (arweave purpose only) — a 3xx must never pivot the fetch onto a
+        # denied host behind the wrapper's back.
+        inner_opts = replace(opts, deny_hosts=tuple(deny_hosts) if deny_hosts else None)
+
         # Retry loop.
         last_status: int | None = None
         last_error: BaseException | None = None
@@ -273,7 +332,7 @@ def wrap_fetch_outbound(
         for attempt in range(1, total_attempts + 1):
             t0_ms = int(time.monotonic() * 1000)
             try:
-                result = await inner(url, opts)
+                result = await inner(url, inner_opts)
             except (DenyHostError, UnsupportedProtocolError, UnsupportedMethodError) as e:
                 duration_ms = int(time.monotonic() * 1000) - t0_ms
                 audit.append(
@@ -339,35 +398,89 @@ async def default_fetch_outbound(url: str, opts: FetchOutboundOptions) -> FetchO
     headers = dict(opts.headers) if opts.headers else {}
     max_bytes = opts.max_bytes if opts.max_bytes is not None else DEFAULT_OUTBOUND_MAX_BYTES
     content = opts.body.encode("utf-8") if opts.method == "POST" and opts.body else None
+    deny_hosts = opts.deny_hosts or ()
+    # httpx's AsyncClient defaults to follow_redirects=False, so a 3xx is
+    # returned verbatim — the transport, not httpx, decides whether to follow
+    # it. The arweave content-fetch purpose follows same-domain sandbox
+    # redirects manually (see below); every other purpose keeps the
+    # refuse-all-redirects behaviour, surfacing a readable 3xx as a non-2xx
+    # status (like a 5xx) so the caller's attempt handling fails the gateway.
+    # Anchor every redirect hop against the host of the URL the fetch STARTED
+    # from, captured once here. As the chain is followed, `current_url` drifts
+    # onto the (validated) sandbox subdomains; the same-domain test must keep
+    # comparing against this fixed original host, never the per-hop host.
+    original_gw_host = _canonicalise_host(urlparse(url).hostname or "")
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_MS / 1000) as client:
-        # Stream the body so a hostile gateway cannot make us buffer unbounded
-        # bytes. `client.stream` leaves the body unread until we iterate it; we
-        # stop and tear the connection down the instant the running count exceeds
-        # the cap (the underlying socket is closed when we leave the context).
-        async with client.stream(opts.method, url, headers=headers, content=content) as res:
-            # Fast path: a truthful Content-Length over the cap lets us bail
-            # before reading a single body byte. A lying/absent header is still
-            # caught by the streaming counter below.
-            declared = res.headers.get("content-length")
-            if declared is not None:
-                try:
-                    declared_len = int(declared)
-                except ValueError:
-                    declared_len = -1
-                if declared_len > max_bytes:
-                    raise BodyTooLargeError(url, max_bytes)
+        current_url = url
+        for hop in range(MAX_REDIRECT_HOPS + 1):
+            # Stream the body so a hostile gateway cannot make us buffer
+            # unbounded bytes. `client.stream` leaves the body unread until we
+            # iterate it; we stop and tear the connection down the instant the
+            # running count exceeds the cap (the underlying socket is closed
+            # when we leave the context).
+            async with client.stream(
+                opts.method, current_url, headers=headers, content=content
+            ) as res:
+                # For the arweave purpose only, decide whether to follow a 3xx
+                # to a validated same-domain target. Arweave gateways 302
+                # `{gw}/{txid}` → `{base32}.{gw}/{txid}` (a sandbox subdomain of
+                # the SAME registrable domain); following same-domain redirects
+                # is REQUIRED to fetch content, while cross-domain redirects
+                # stay blocked to prevent SSRF pivots (e.g. a 302 →
+                # 169.254.169.254 or → evil.com). The SDK has no browser
+                # boundary, so the validation runs here in code.
+                if opts.purpose == "arweave" and 300 <= res.status_code < 400:
+                    if hop >= MAX_REDIRECT_HOPS:
+                        raise RuntimeError(
+                            f"redirect limit exceeded ({MAX_REDIRECT_HOPS} hops): "
+                            f"{url} kept redirecting"
+                        )
+                    next_url = _resolve_same_domain_redirect(
+                        current_url,
+                        res.headers.get("location"),
+                        original_gw_host,
+                        deny_hosts,
+                    )
+                    if next_url is None:
+                        # Not an absolute https same-domain non-denied target:
+                        # treat this gateway as failed and let the caller move
+                        # to the next gateway.
+                        location = res.headers.get("location") or "(no Location)"
+                        raise RuntimeError(
+                            f"redirect refused: {current_url} → {location} "
+                            "is not a same-domain https target"
+                        )
+                    current_url = next_url
+                    continue
 
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in res.aiter_bytes():
-                total += len(chunk)
-                if total > max_bytes:
-                    raise BodyTooLargeError(url, max_bytes)
-                chunks.append(chunk)
-            body = b"".join(chunks)
-            status = res.status_code
-    duration_ms = int((time.monotonic() - t0) * 1000)
-    return FetchOutboundResult(status=status, bytes=body, duration_ms=duration_ms)
+                # Fast path: a truthful Content-Length over the cap lets us bail
+                # before reading a single body byte. A lying/absent header is
+                # still caught by the streaming counter below.
+                declared = res.headers.get("content-length")
+                if declared is not None:
+                    try:
+                        declared_len = int(declared)
+                    except ValueError:
+                        declared_len = -1
+                    if declared_len > max_bytes:
+                        raise BodyTooLargeError(current_url, max_bytes)
+
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in res.aiter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise BodyTooLargeError(current_url, max_bytes)
+                    chunks.append(chunk)
+                body = b"".join(chunks)
+                status = res.status_code
+                duration_ms = int((time.monotonic() - t0) * 1000)
+                return FetchOutboundResult(status=status, bytes=body, duration_ms=duration_ms)
+
+    # Unreachable: the loop returns on a non-redirect response and raises on a
+    # redirect that exhausts the hop budget. The explicit raise satisfies the
+    # type checker that every path produces a value.
+    raise RuntimeError(f"redirect handling fell through for {url}")
 
 
 # -----------------------------------------------------------------------------
