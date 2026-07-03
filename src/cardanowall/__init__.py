@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from . import certificate, hash, merkle
+from . import certificate, estimate, hash, merkle
 from ._crypto.sealed_poe import (
     RecipientKeyBundle,
     StreamUnwrapResult,
@@ -27,6 +27,8 @@ from .client import (
     MalformedCborError,
     NotFoundError,
     PartialUploadError,
+    PoeFailedError,
+    PoeWaitTimeoutError,
     ProblemDetails,
     ProblemErrorEntry,
     PublishError,
@@ -132,7 +134,9 @@ __all__ = [
     "NotFoundError",
     "ParsedAgeRecipient",
     "PartialUploadError",
+    "PoeFailedError",
     "PoeRecord",
+    "PoeWaitTimeoutError",
     "ProblemDetails",
     "ProblemErrorEntry",
     "PublishError",
@@ -177,6 +181,7 @@ __all__ = [
     "encode_poe_record",
     "encode_prefixed_id",
     "encode_record_body_for_signing",
+    "estimate",
     "hash",
     "is_prefixed_id",
     "merkle",

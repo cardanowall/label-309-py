@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol, TypedDict, cast, runtime_checkable
+from typing import Any, Literal, Protocol, TypedDict, cast, runtime_checkable
 
 import httpx
 
@@ -53,9 +53,17 @@ from cardanowall.poe_standard import (
 from .off_host_sign import assemble_cose_sign1, prepare_sig_structure
 from .parse_http_error import parse_http_error
 from .partial_upload_error import PartialUploadError
+from .resumable_upload import (
+    RESUMABLE_THRESHOLD_BYTES,
+    upload_resumable,
+)
+from .resumable_upload import (
+    _ResolvedConfig as _ResumableResolvedConfig,
+)
 from .types import (
     PoeStatus,
     PublishResponse,
+    StorageTarget,
     UploadsResponse,
 )
 
@@ -166,6 +174,10 @@ class PublishSealedInput(TypedDict, total=False):
     kem: SupportedKem
     signer: Signer
     idempotency_key: str
+    # Requested chunk size when the ciphertext exceeds the single-shot
+    # threshold and is uploaded as a resumable session; the server clamps it
+    # to its max_chunk_bytes.
+    chunk_bytes: int
 
 
 class PublishMerkleInput(TypedDict, total=False):
@@ -174,6 +186,10 @@ class PublishMerkleInput(TypedDict, total=False):
     hash_alg: Literal["sha2-256"]
     signer: Signer
     idempotency_key: str
+    # Requested chunk size when the leaves-list exceeds the single-shot
+    # threshold and is uploaded as a resumable session; the server clamps it
+    # to its max_chunk_bytes.
+    chunk_bytes: int
 
 
 class PublishMerkleResponse(TypedDict):
@@ -362,6 +378,60 @@ async def _post_uploads(
     return result
 
 
+async def _upload_blob(
+    config: _ResolvedPublishConfig,
+    data: bytes,
+    idempotency_key: str | None,
+    chunk_bytes: int | None,
+) -> str:
+    """Upload one blob (sealed ciphertext or Merkle leaves-list) and return its
+    ``ar://`` URI.
+
+    A blob at or below the resumable threshold takes the unchanged single-shot
+    multipart path; a larger blob transparently uses the resumable session flow
+    so a multi-GB ciphertext clears CDN/proxy single-request caps. Both paths
+    end at the same URI, so the publish helpers' signatures and on-chain record
+    shape are unaffected by the blob's size. ``chunk_bytes`` is the requested
+    session chunk size on the resumable path; the server clamps it to its
+    ``max_chunk_bytes`` and its echo is authoritative.
+    """
+    if len(data) <= RESUMABLE_THRESHOLD_BYTES:
+        uploads_resp = await _post_uploads(config, [data], idempotency_key)
+        first = uploads_resp["uploads"][0]
+        # narrowed: _post_uploads raised on any failure, so every entry has ok=True
+        return cast("str", first.get("uri"))
+
+    resumable_config = _ResumableResolvedConfig(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        http_client=config.http_client,
+    )
+
+    async def single_shot(
+        *,
+        target: StorageTarget,
+        data: bytes,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        del target  # the publish blobs always go to the default Arweave target
+        result = await _post_uploads(config, [data], idempotency_key)
+        first = result["uploads"][0]
+        return {
+            "uri": first.get("uri"),
+            "sha256": first.get("sha256"),
+            "bytes": first.get("bytes"),
+        }
+
+    result = await upload_resumable(
+        resumable_config,
+        single_shot,
+        source=data,
+        chunk_bytes=chunk_bytes,
+        idempotency_key=idempotency_key,
+    )
+    return result["uri"]
+
+
 async def publish_content(
     config: _ResolvedPublishConfig,
     *,
@@ -448,6 +518,7 @@ async def publish_sealed(
     hash_alg: SupportedHashAlg = "sha2-256",
     kem: SupportedKem = "mlkem768x25519",
     idempotency_key: str | None = None,
+    chunk_bytes: int | None = None,
 ) -> PublishResponse:
     """Sealed-PoE: encrypt content to N X25519 recipients (age-style
     envelope), upload the ciphertext to Arweave, build a single-item record
@@ -489,10 +560,7 @@ async def publish_sealed(
         kem=kem,
     )
 
-    uploads_resp = await _post_uploads(config, [sealed.ciphertext], idempotency_key)
-    first = uploads_resp["uploads"][0]
-    # narrowed: _post_uploads raised on any failure, so every entry has ok=True
-    uri = cast("str", first.get("uri"))
+    uri = await _upload_blob(config, sealed.ciphertext, idempotency_key, chunk_bytes)
 
     envelope_data = sealed.envelope
     envelope: EncryptionEnvelope = _envelope_to_wire(envelope_data)
@@ -549,6 +617,7 @@ async def publish_merkle(
     signer: Signer | None = None,
     hash_alg: Literal["sha2-256"] = "sha2-256",
     idempotency_key: str | None = None,
+    chunk_bytes: int | None = None,
 ) -> PublishMerkleResponse:
     """Batch publish via a Merkle root — N leaves under one transaction.
     The leaves-list CBOR is uploaded to Arweave; the on-chain record carries
@@ -584,9 +653,7 @@ async def publish_merkle(
     root = merkle_sha2_256_root(leaves_bytes)
     leaves_list_cbor = encode_leaves_list(leaves=leaves_bytes, root=root)
 
-    uploads_resp = await _post_uploads(config, [leaves_list_cbor], idempotency_key)
-    first = uploads_resp["uploads"][0]
-    uri = cast("str", first.get("uri"))
+    uri = await _upload_blob(config, leaves_list_cbor, idempotency_key, chunk_bytes)
 
     # MERKLE_ALG_ID is the only registered tree algorithm string.
     merkle_entry: MerkleCommit = {

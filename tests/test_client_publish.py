@@ -773,3 +773,101 @@ def test_publish_sealed_classical_kem_opt_out_emits_epk_slots() -> None:
         assert unwrap.plaintext == b"classical"
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# chunk_bytes plumbing (threshold-gated resumable upload path)
+# ---------------------------------------------------------------------------
+
+
+def test_publish_sealed_large_ciphertext_requests_custom_chunk_bytes() -> None:
+    """A ciphertext above the resumable threshold must be uploaded via the
+    session flow, forwarding the caller's ``chunk_bytes`` into the session
+    create body — never through the single-shot multipart route. (A dedup 200
+    at create keeps the test free of chunk traffic.)
+    """
+
+    async def run() -> None:
+        from cardanowall.client.resumable_upload import RESUMABLE_THRESHOLD_BYTES
+
+        recipient_pub = x25519_public_key(b"\x22" * 32)
+        requested_chunk_bytes = 8_388_608  # 8 MiB
+        seen: dict[str, Any] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.method == "POST" and req.url.path == "/api/v1/poe/uploads/sessions":
+                body = json.loads(req.content)
+                seen["create_body"] = body
+                return httpx.Response(
+                    200,
+                    json={
+                        "deduplicated": True,
+                        "uri": "ar://" + "d" * 43,
+                        "sha256": body["sha256"],
+                        "bytes": body["total_bytes"],
+                        "charged_usd_micros": 0,
+                    },
+                )
+            if req.method == "POST" and req.url.path == "/api/v1/poe/publish":
+                seen["publish_body"] = json.loads(req.content)
+                return httpx.Response(202, json=PUBLISH_BODY)
+            raise AssertionError(f"unexpected route for a large blob: {req.url.path}")
+
+        async with _client_with_handler(handler) as client:
+            out = await client.poe.publish_sealed(
+                content=b"\x00" * (RESUMABLE_THRESHOLD_BYTES + 1),
+                recipients=[recipient_pub],
+                quote_id=QUOTE_ID,
+                kem="x25519",
+                chunk_bytes=requested_chunk_bytes,
+            )
+        assert out["id"] == PUBLISH_BODY["id"]
+        # The caller's requested chunk size reached the session create verbatim
+        # (the server clamps to its own max; the request is a pure pass-through).
+        assert seen["create_body"]["chunk_bytes"] == requested_chunk_bytes
+        assert seen["create_body"]["target"] == "arweave"
+        # The deduped URI landed in the published record.
+        result = validate(bytes.fromhex(seen["publish_body"]["record"]))
+        assert result.ok
+        assert result.record["items"][0]["uris"] == ["ar://" + "d" * 43]
+
+    asyncio.run(run())
+
+
+def test_publish_merkle_small_leaves_list_stays_single_shot_with_chunk_bytes() -> None:
+    """Below the threshold ``chunk_bytes`` is inert: a small leaves-list still
+    takes the unchanged single-shot multipart route (no session is created).
+    """
+
+    async def run() -> None:
+        routes: list[str] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            routes.append(req.url.path)
+            if req.url.path == "/api/v1/poe/uploads":
+                return httpx.Response(
+                    200,
+                    json={
+                        "uploads": [
+                            {
+                                "idx": 0,
+                                "ok": True,
+                                "uri": "ar://leaves-list",
+                                "sha256": "00" * 32,
+                                "bytes": 128,
+                            }
+                        ],
+                    },
+                )
+            return httpx.Response(202, json=PUBLISH_BODY)
+
+        async with _client_with_handler(handler) as client:
+            out = await client.poe.publish_merkle(
+                leaves=[hashlib.sha256(bytes([i])).digest() for i in range(3)],
+                quote_id=QUOTE_ID,
+                chunk_bytes=8_388_608,
+            )
+        assert out["ar_uri"] == "ar://leaves-list"
+        assert routes == ["/api/v1/poe/uploads", "/api/v1/poe/publish"]
+
+    asyncio.run(run())

@@ -9,6 +9,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > change in backward-incompatible ways until a 1.0 release. Pre-1.0 versions do
 > not carry the stability guarantees of [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-07-03
+
+### Added
+
+- `client.poe.wait(poe_id, target=..., timeout=...)` — follows the gateway's `GET /poe/events/{poe_id}` SSE stream over the injected `httpx` client until the record reaches the requested state. Spec-correct SSE parsing (buffered `id` commits, 64 KiB line / 256 KiB event caps), reconnect backoff with `last-event-id` resume, `Retry-After` on 429, and status normalization; a failed record raises `PoeFailedError`, a deadline raises `PoeWaitTimeoutError` carrying the last snapshot.
+- `cardanowall.estimate` — exact upper-bound record-size arithmetic for item, Merkle, and sealed record shapes, for quoting before the final record bytes exist. Strings are charged at UTF-8 byte length; the arithmetic is pinned to the same cross-SDK parity constants as the TypeScript and Rust implementations.
+- `chunk_bytes` option on `publish_sealed` / `publish_merkle`, forwarded to the resumable upload session.
+
+### Changed
+
+- Large sealed ciphertexts and Merkle leaves lists now route through the resumable upload above the same size threshold as the TypeScript and Rust clients (previously always single-shot).
+
 ## [0.8.0] - 2026-07-02
 
 ### Changed

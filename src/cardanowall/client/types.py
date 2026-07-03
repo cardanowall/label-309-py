@@ -296,6 +296,27 @@ class PoeItemResponse(TypedDict, total=False):
     enc: dict[str, Any]
 
 
+class PoeStatusSnapshot(TypedDict):
+    """A record's publish-lifecycle snapshot as carried by every event on
+    ``GET /poe/events/{poe_id}`` (the initial ``state`` frame and each live
+    event alike).
+
+    ``status`` is normalised before delivery: the raw engine statuses
+    ``submitted`` / ``permanent_failure`` read as ``confirming`` / ``failed``;
+    an unrecognised status flows through verbatim (forward-compatible, like
+    :data:`PoeStatus`). Fields the gateway has not populated yet (e.g.
+    ``tx_hash`` before submission) are ``None``.
+    """
+
+    id: str
+    status: PoeStatus
+    tx_hash: str | None
+    block_height: int | None
+    block_time: str | None
+    num_confirmations: int
+    request_id: str | None
+
+
 class PublishResponse(TypedDict):
     # Wire-format prefixed id (``poe_<26-char-crockford-base32>``) of the
     # freshly-inserted ``poe_record`` row. Stable across the submit→confirm
@@ -480,6 +501,7 @@ __all__ = [
     "ConformanceProfile",
     "PoeItemResponse",
     "PoeStatus",
+    "PoeStatusSnapshot",
     "PublishBatchFailureEntry",
     "PublishBatchFailureError",
     "PublishBatchResponse",

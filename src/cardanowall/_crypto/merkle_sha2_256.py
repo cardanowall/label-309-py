@@ -47,9 +47,7 @@ def _validate_tree_range(index: int, tree_size: int, fn_name: str) -> None:
         or tree_size < 1
         or tree_size > _MAX_TREE_SIZE
     ):
-        raise MerkleError(
-            f"{fn_name}: tree_size {tree_size!r} out of range [1, {_MAX_TREE_SIZE}]"
-        )
+        raise MerkleError(f"{fn_name}: tree_size {tree_size!r} out of range [1, {_MAX_TREE_SIZE}]")
     if not isinstance(index, int) or isinstance(index, bool) or index < 0 or index >= tree_size:
         raise MerkleError(f"{fn_name}: index {index!r} out of range [0, {tree_size})")
 

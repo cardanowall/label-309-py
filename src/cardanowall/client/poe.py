@@ -24,12 +24,18 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 
 from .parse_http_error import parse_http_error
 from .partial_upload_error import PartialUploadError
+from .poe_events import (
+    _ResolvedConfig as _PoeEventsResolvedConfig,
+)
+from .poe_events import (
+    wait_for_poe as _wait_for_poe_impl,
+)
 from .publish import (
     PublishMerkleResponse,
     Signer,
@@ -65,6 +71,7 @@ from .resumable_upload import (
     upload_resumable as _upload_resumable_impl,
 )
 from .types import (
+    PoeStatusSnapshot,
     PublishBatchResponse,
     PublishResponse,
     QuoteResponse,
@@ -318,6 +325,45 @@ class PoeNamespace:
         )
         await _abandon_session_impl(resumable_config, session_id)
 
+    async def wait(
+        self,
+        poe_id: str,
+        *,
+        target: Literal["submitted", "confirmed"] = "confirmed",
+        timeout: float | None = None,
+    ) -> PoeStatusSnapshot:
+        """Wait for a published record to reach a lifecycle target by
+        streaming ``GET /poe/events/{poe_id}`` (server-sent events).
+
+        ``poe_id`` is the ``poe_<crockford>`` id returned by ``publish()``.
+        ``target="submitted"`` resolves once the transaction left the gateway
+        for the chain (status ``confirming``, or ``confirmed`` directly);
+        ``target="confirmed"`` resolves only on ``confirmed``. Either way the
+        final normalised :class:`~cardanowall.client.types.PoeStatusSnapshot`
+        is returned.
+
+        The stream reconnects transparently on network drops (resuming from
+        the last seen frame id, so no status change is lost) and waits out the
+        gateway's concurrent-stream cap (429). A terminal publish failure
+        raises :class:`~cardanowall.client.poe_failed_error.PoeFailedError`
+        carrying the failure snapshot; a ``timeout`` (seconds) that elapses
+        first raises
+        :class:`~cardanowall.client.poe_wait_timeout_error.PoeWaitTimeoutError`
+        carrying the last snapshot seen. With ``timeout=None`` the wait is
+        unbounded — cancel the task to stop it.
+        """
+        events_config = _PoeEventsResolvedConfig(
+            api_key=self._config.api_key,
+            base_url=self._config.base_url,
+            http_client=self._config.http_client,
+        )
+        return await _wait_for_poe_impl(
+            events_config,
+            poe_id,
+            target=target,
+            timeout=timeout,
+        )
+
     async def publish(
         self,
         *,
@@ -448,6 +494,7 @@ class PoeNamespace:
         hash_alg: SupportedHashAlg = "sha2-256",
         kem: SupportedKem = "mlkem768x25519",
         idempotency_key: str | None = None,
+        chunk_bytes: int | None = None,
     ) -> PublishResponse:
         """Sealed-PoE: encrypt content to the recipient public keys (age-style
         sealed envelope), upload the ciphertext to Arweave via /uploads, build a
@@ -464,6 +511,10 @@ class PoeNamespace:
         The sender SHOULD include their own recipient public key in
         ``recipients`` to retain decrypt access — the SDK does NOT inject
         the sender silently.
+
+        A ciphertext above the resumable threshold (~48 MiB) is uploaded as a
+        resumable session; ``chunk_bytes`` requests its chunk size (the server
+        clamps to its ``max_chunk_bytes``).
         """
         config = _ResolvedPublishConfig(
             api_key=self._config.api_key,
@@ -479,6 +530,7 @@ class PoeNamespace:
             hash_alg=hash_alg,
             kem=kem,
             idempotency_key=idempotency_key,
+            chunk_bytes=chunk_bytes,
         )
 
     async def publish_merkle(
@@ -489,6 +541,7 @@ class PoeNamespace:
         signer: Signer | None = None,
         hash_alg: str = "sha2-256",
         idempotency_key: str | None = None,
+        chunk_bytes: int | None = None,
     ) -> PublishMerkleResponse:
         """Merkle batch publish: compute the RFC 9162 §2.1.1 root over N
         caller-supplied 32-byte leaf hashes, upload the canonical leaves-list
@@ -496,6 +549,10 @@ class PoeNamespace:
         ``merkle[0]`` of an on-chain record, optionally sign, and submit.
 
         Only ``'sha2-256'`` leaves are supported in v1.
+
+        A leaves-list above the resumable threshold (~48 MiB) is uploaded as a
+        resumable session; ``chunk_bytes`` requests its chunk size (the server
+        clamps to its ``max_chunk_bytes``).
         """
         config = _ResolvedPublishConfig(
             api_key=self._config.api_key,
@@ -512,6 +569,7 @@ class PoeNamespace:
             signer=signer,
             hash_alg=cast("Any", hash_alg),
             idempotency_key=idempotency_key,
+            chunk_bytes=chunk_bytes,
         )
 
 

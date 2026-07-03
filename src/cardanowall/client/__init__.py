@@ -32,6 +32,8 @@ from .off_host_sign import (
 from .parse_http_error import parse_http_error
 from .partial_upload_error import PartialUploadError
 from .poe import PoeNamespace
+from .poe_failed_error import PoeFailedError
+from .poe_wait_timeout_error import PoeWaitTimeoutError
 from .publish import (
     PublishContentInput,
     PublishError,
@@ -58,6 +60,7 @@ from .resumable_upload import (
 )
 from .service_unavailable_error import ServiceUnavailableError
 from .types import (
+    PoeStatusSnapshot,
     QuoteBreakdown,
     QuoteResponse,
     RecordsCountInput,
@@ -87,7 +90,10 @@ __all__ = [
     "NotFoundError",
     "OffHostSignError",
     "PartialUploadError",
+    "PoeFailedError",
     "PoeNamespace",
+    "PoeStatusSnapshot",
+    "PoeWaitTimeoutError",
     "ProblemDetails",
     "ProblemErrorEntry",
     "PublishContentInput",
