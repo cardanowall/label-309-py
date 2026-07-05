@@ -136,7 +136,7 @@ def build_inclusion_certificate(
         "verification": {
             "method": CERTIFICATE_VERIFICATION_METHOD,
             "independent_tools": list(CERTIFICATE_INDEPENDENT_TOOLS),
-            "requires_trust_in_cardanowall": False,
+            "requires_issuer_trust": False,
             "time_asserted_by": CERTIFICATE_TIME_ASSERTED_BY,
         },
     }

@@ -135,7 +135,7 @@ class InclusionCertificateVerification(TypedDict):
 
     method: str
     independent_tools: list[str]
-    requires_trust_in_cardanowall: bool
+    requires_issuer_trust: bool
     time_asserted_by: str
 
 

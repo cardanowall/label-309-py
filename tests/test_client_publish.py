@@ -2,7 +2,8 @@
 publish_prehashed() / publish_sealed() / publish_merkle() — asserting
 canonical record shape, signer integration, sealed-envelope construction,
 Merkle root binding, partial-upload handling, and input-validation
-boundaries.
+boundaries. The two-phase sealed surface itself (prepare / receipts /
+quote refresh) is covered in ``test_client_sealed_two_phase.py``.
 
 Round-trip parity through the structural validator is exercised because the
 test decodes the submitted bytes with the wire validator.
@@ -34,6 +35,7 @@ from cardanowall._crypto.sig import get_public_key_ed25519, sign_ed25519
 from cardanowall.client.label309_client import Label309Client
 from cardanowall.client.partial_upload_error import PartialUploadError
 from cardanowall.client.publish import PublishError, Signer
+from cardanowall.client.sealed import SealPrepareError, SubmitSealedError
 from cardanowall.merkle import merkle_sha2_256_root
 from cardanowall.poe_standard import validate
 
@@ -91,6 +93,16 @@ def _uploads_response(uri: str) -> dict[str, Any]:
     return {
         "uploads": [{"idx": 0, "ok": True, "uri": uri, "sha256": "00" * 32, "bytes": 42}],
     }
+
+
+# The internally quoting helpers (publish_sealed, publish_merkle) fetch their
+# own price lock; handlers serve this body on /poe/quote.
+QUOTE_BODY: dict[str, Any] = {
+    "quote_id": QUOTE_ID,
+    "amount": "42",
+    "currency": "USD",
+    "expires_at": "2100-01-01T00:00:00Z",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +247,8 @@ def test_publish_sealed_encrypts_uploads_publishes_with_ar_uri() -> None:
         seen: dict[str, Any] = {"ciphertext": None, "publish_body": None}
 
         def handler(req: httpx.Request) -> httpx.Response:
+            if req.method == "POST" and req.url.path == "/api/v1/poe/quote":
+                return httpx.Response(200, json=QUOTE_BODY)
             if req.method == "POST" and req.url.path == "/api/v1/poe/uploads":
                 body = req.content
                 marker = b'name="file_0"'
@@ -254,20 +268,23 @@ def test_publish_sealed_encrypts_uploads_publishes_with_ar_uri() -> None:
         signer = _make_signer()
         async with _client_with_handler(handler) as client:
             out = await client.poe.publish_sealed(
-                content="top-secret",
+                items=["top-secret"],
                 recipients=[recipient_pub],
-                quote_id=QUOTE_ID,
                 signer=signer,
                 kem="x25519",
             )
-            assert out["id"] == PUBLISH_BODY["id"]
+            assert out.response["id"] == PUBLISH_BODY["id"]
 
         # The ciphertext we captured decrypts back to the plaintext.
         assert seen["ciphertext"] is not None
         publish_body = seen["publish_body"]
         assert isinstance(publish_body, dict)
+        # The helper consumed its own internal quote and archived the exact
+        # published bytes in the submission.
         assert publish_body["quote_id"] == QUOTE_ID
         record_bytes = bytes.fromhex(publish_body["record"])
+        assert out.record_bytes == record_bytes
+        assert out.uris == (ar_uri,)
         result = validate(record_bytes)
         assert result.ok
         item = result.record["items"][0]
@@ -305,9 +322,12 @@ def test_publish_sealed_rejects_empty_recipients() -> None:
             raise AssertionError("network must not be touched on input rejection")
 
         async with _client_with_handler(handler) as client:
-            with pytest.raises(PublishError) as exc:
-                await client.poe.publish_sealed(content="x", recipients=[], quote_id=QUOTE_ID)
-            assert exc.value.code == "INVALID_RECIPIENT"
+            with pytest.raises(SubmitSealedError) as exc:
+                await client.poe.publish_sealed(items=["x"], recipients=[])
+            assert exc.value.uploads == ()
+            cause = exc.value.cause
+            assert isinstance(cause, SealPrepareError)
+            assert cause.code == "INVALID_RECIPIENT"
 
     asyncio.run(run())
 
@@ -318,18 +338,19 @@ def test_publish_sealed_rejects_wrong_length_recipient() -> None:
             raise AssertionError("network must not be touched on input rejection")
 
         async with _client_with_handler(handler) as client:
-            with pytest.raises(PublishError) as exc:
-                await client.poe.publish_sealed(
-                    content="x", recipients=[b"\x00" * 31], quote_id=QUOTE_ID
-                )
-            assert exc.value.code == "INVALID_RECIPIENT"
+            with pytest.raises(SubmitSealedError) as exc:
+                await client.poe.publish_sealed(items=["x"], recipients=[b"\x00" * 31])
+            cause = exc.value.cause
+            assert isinstance(cause, SealPrepareError)
+            assert cause.code == "INVALID_RECIPIENT"
 
     asyncio.run(run())
 
 
 def test_publish_sealed_raises_partial_upload_error_on_failed_upload() -> None:
-    """publish_sealed escalates a per-file /uploads failure into
-    PartialUploadError and never reaches /publish.
+    """publish_sealed escalates a per-file /uploads failure into a
+    SubmitSealedError whose cause is the PartialUploadError, and never
+    reaches /publish.
     """
 
     async def run() -> None:
@@ -338,6 +359,8 @@ def test_publish_sealed_raises_partial_upload_error_on_failed_upload() -> None:
 
         def handler(req: httpx.Request) -> httpx.Response:
             call_count["n"] += 1
+            if req.url.path == "/api/v1/poe/quote":
+                return httpx.Response(200, json=QUOTE_BODY)
             if req.url.path == "/api/v1/poe/uploads":
                 return httpx.Response(
                     200,
@@ -357,15 +380,18 @@ def test_publish_sealed_raises_partial_upload_error_on_failed_upload() -> None:
             raise AssertionError(f"/publish must not be called; got {req.url.path}")
 
         async with _client_with_handler(handler) as client:
-            with pytest.raises(PartialUploadError) as exc:
+            with pytest.raises(SubmitSealedError) as exc:
                 await client.poe.publish_sealed(
-                    content="x",
+                    items=["x"],
                     recipients=[recipient_pub],
-                    quote_id=QUOTE_ID,
                     kem="x25519",
                 )
-            assert exc.value.failed_indices == (0,)
-        assert call_count["n"] == 1
+            cause = exc.value.cause
+            assert isinstance(cause, PartialUploadError)
+            assert cause.failed_indices == (0,)
+            # Nothing completed, so no receipts ride the error.
+            assert exc.value.uploads == ()
+        assert call_count["n"] == 2
 
     asyncio.run(run())
 
@@ -383,6 +409,8 @@ def test_publish_merkle_binds_root_and_leaf_count() -> None:
         seen: dict[str, Any] = {"publish_body": None}
 
         def handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/api/v1/poe/quote":
+                return httpx.Response(200, json=QUOTE_BODY)
             if req.url.path == "/api/v1/poe/uploads":
                 return httpx.Response(200, json=_uploads_response(ar_uri))
             if req.url.path == "/api/v1/poe/publish":
@@ -392,9 +420,7 @@ def test_publish_merkle_binds_root_and_leaf_count() -> None:
 
         signer = _make_signer()
         async with _client_with_handler(handler) as client:
-            out = await client.poe.publish_merkle(
-                leaves=list(leaves), quote_id=QUOTE_ID, signer=signer
-            )
+            out = await client.poe.publish_merkle(leaves=list(leaves), signer=signer)
 
         assert out["leaf_count"] == 4
         assert out["root"] == expected_root.hex()
@@ -403,8 +429,11 @@ def test_publish_merkle_binds_root_and_leaf_count() -> None:
 
         submit_body = seen["publish_body"]
         assert isinstance(submit_body, dict)
+        # The helper consumed its own internal quote and archived the exact
+        # published bytes in the response.
         assert submit_body["quote_id"] == QUOTE_ID
         record_bytes = bytes.fromhex(submit_body["record"])
+        assert out["record_bytes"] == record_bytes
         result = validate(record_bytes)
         assert result.ok
         merkle = result.record["merkle"]
@@ -424,7 +453,7 @@ def test_publish_merkle_rejects_empty_leaves() -> None:
         signer = _make_signer()
         async with _client_with_handler(handler) as client:
             with pytest.raises(PublishError) as exc:
-                await client.poe.publish_merkle(leaves=[], quote_id=QUOTE_ID, signer=signer)
+                await client.poe.publish_merkle(leaves=[], signer=signer)
             assert exc.value.code == "INVALID_LEAVES"
 
     asyncio.run(run())
@@ -437,6 +466,8 @@ def test_publish_merkle_raises_partial_upload_error() -> None:
 
         def handler(req: httpx.Request) -> httpx.Response:
             call_count["n"] += 1
+            if req.url.path == "/api/v1/poe/quote":
+                return httpx.Response(200, json=QUOTE_BODY)
             if req.url.path == "/api/v1/poe/uploads":
                 return httpx.Response(
                     200,
@@ -458,8 +489,8 @@ def test_publish_merkle_raises_partial_upload_error() -> None:
         signer = _make_signer()
         async with _client_with_handler(handler) as client:
             with pytest.raises(PartialUploadError):
-                await client.poe.publish_merkle(leaves=leaves, quote_id=QUOTE_ID, signer=signer)
-        assert call_count["n"] == 1
+                await client.poe.publish_merkle(leaves=leaves, signer=signer)
+        assert call_count["n"] == 2
 
     asyncio.run(run())
 
@@ -633,6 +664,8 @@ def test_publish_sealed_defaults_to_hybrid_kem_and_round_trips() -> None:
         seen: dict[str, Any] = {"ciphertext": None, "publish_body": None}
 
         def handler(req: httpx.Request) -> httpx.Response:
+            if req.method == "POST" and req.url.path == "/api/v1/poe/quote":
+                return httpx.Response(200, json=QUOTE_BODY)
             if req.method == "POST" and req.url.path == "/api/v1/poe/uploads":
                 body = req.content
                 marker = b'name="file_0"'
@@ -651,11 +684,10 @@ def test_publish_sealed_defaults_to_hybrid_kem_and_round_trips() -> None:
         async with _client_with_handler(handler) as client:
             # No kem= → must default to the hybrid.
             out = await client.poe.publish_sealed(
-                content="top-secret-pq",
+                items=["top-secret-pq"],
                 recipients=[recipient_pub],
-                quote_id=QUOTE_ID,
             )
-            assert out["id"] == PUBLISH_BODY["id"]
+            assert out.response["id"] == PUBLISH_BODY["id"]
 
         assert seen["ciphertext"] is not None
         record_bytes = bytes.fromhex(seen["publish_body"]["record"])
@@ -704,13 +736,14 @@ def test_publish_sealed_hybrid_rejects_x25519_length_recipient() -> None:
             raise AssertionError("network must not be touched on input rejection")
 
         async with _client_with_handler(handler) as client:
-            with pytest.raises(PublishError) as exc:
+            with pytest.raises(SubmitSealedError) as exc:
                 await client.poe.publish_sealed(
-                    content="x",
+                    items=["x"],
                     recipients=[x25519_public_key(b"\x11" * 32)],  # 32 B, wrong for hybrid
-                    quote_id=QUOTE_ID,
                 )
-            assert exc.value.code == "INVALID_RECIPIENT"
+            cause = exc.value.cause
+            assert isinstance(cause, SealPrepareError)
+            assert cause.code == "INVALID_RECIPIENT"
 
     asyncio.run(run())
 
@@ -726,6 +759,8 @@ def test_publish_sealed_classical_kem_opt_out_emits_epk_slots() -> None:
         seen: dict[str, Any] = {"ciphertext": None, "publish_body": None}
 
         def handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/api/v1/poe/quote":
+                return httpx.Response(200, json=QUOTE_BODY)
             if req.url.path == "/api/v1/poe/uploads":
                 body = req.content
                 idx = body.find(b'name="file_0"')
@@ -741,9 +776,8 @@ def test_publish_sealed_classical_kem_opt_out_emits_epk_slots() -> None:
 
         async with _client_with_handler(handler) as client:
             await client.poe.publish_sealed(
-                content="classical",
+                items=["classical"],
                 recipients=[recipient_pub],
-                quote_id=QUOTE_ID,
                 kem="x25519",
             )
 
@@ -795,6 +829,8 @@ def test_publish_sealed_large_ciphertext_requests_custom_chunk_bytes() -> None:
         seen: dict[str, Any] = {}
 
         def handler(req: httpx.Request) -> httpx.Response:
+            if req.method == "POST" and req.url.path == "/api/v1/poe/quote":
+                return httpx.Response(200, json=QUOTE_BODY)
             if req.method == "POST" and req.url.path == "/api/v1/poe/uploads/sessions":
                 body = json.loads(req.content)
                 seen["create_body"] = body
@@ -815,13 +851,12 @@ def test_publish_sealed_large_ciphertext_requests_custom_chunk_bytes() -> None:
 
         async with _client_with_handler(handler) as client:
             out = await client.poe.publish_sealed(
-                content=b"\x00" * (RESUMABLE_THRESHOLD_BYTES + 1),
+                items=[b"\x00" * (RESUMABLE_THRESHOLD_BYTES + 1)],
                 recipients=[recipient_pub],
-                quote_id=QUOTE_ID,
                 kem="x25519",
                 chunk_bytes=requested_chunk_bytes,
             )
-        assert out["id"] == PUBLISH_BODY["id"]
+        assert out.response["id"] == PUBLISH_BODY["id"]
         # The caller's requested chunk size reached the session create verbatim
         # (the server clamps to its own max; the request is a pure pass-through).
         assert seen["create_body"]["chunk_bytes"] == requested_chunk_bytes
@@ -844,6 +879,8 @@ def test_publish_merkle_small_leaves_list_stays_single_shot_with_chunk_bytes() -
 
         def handler(req: httpx.Request) -> httpx.Response:
             routes.append(req.url.path)
+            if req.url.path == "/api/v1/poe/quote":
+                return httpx.Response(200, json=QUOTE_BODY)
             if req.url.path == "/api/v1/poe/uploads":
                 return httpx.Response(
                     200,
@@ -864,10 +901,9 @@ def test_publish_merkle_small_leaves_list_stays_single_shot_with_chunk_bytes() -
         async with _client_with_handler(handler) as client:
             out = await client.poe.publish_merkle(
                 leaves=[hashlib.sha256(bytes([i])).digest() for i in range(3)],
-                quote_id=QUOTE_ID,
                 chunk_bytes=8_388_608,
             )
         assert out["ar_uri"] == "ar://leaves-list"
-        assert routes == ["/api/v1/poe/uploads", "/api/v1/poe/publish"]
+        assert routes == ["/api/v1/poe/quote", "/api/v1/poe/uploads", "/api/v1/poe/publish"]
 
     asyncio.run(run())

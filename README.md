@@ -26,23 +26,13 @@ or verified by any sibling SDK. The whole package is type-checked under
 
 ## Install
 
-The package is not yet published to PyPI (it is pre-1.0, version `0.0.0`).
-Build it from the workspace or vendor it from source. Requires **Python 3.11+**.
-
 ```sh
-# From the package directory, build a wheel:
-python -m build        # or: uv build
-pip install dist/cardanowall_sdk-*.whl
+pip install cardanowall-sdk
 ```
 
-Once published, the intended install form will be:
-
-```sh
-pip install cardanowall-sdk   # forthcoming
-```
-
-The SDK is async-canonical (built on `httpx.AsyncClient`); every client method
-returns a coroutine. For synchronous use, wrap calls in `asyncio.run(...)`.
+Requires **Python 3.11+**. The SDK is async-canonical (built on
+`httpx.AsyncClient`); every client method returns a coroutine. For synchronous
+use, wrap calls in `asyncio.run(...)`.
 
 ## Quick start
 
@@ -112,9 +102,96 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Every PoE submission requires a `quote_id`. Request a quote first (it locks the
-USD price for a 15-minute TTL); pass the returned `quote_id` to the publish call.
-The quote is consumed atomically with the record insert.
+The hash-only flows (`publish_content`, `publish_prehashed`) and the low-level
+`publish` / `publish_batch` take a caller-supplied `quote_id`: request a quote
+first (it locks the USD price for a 15-minute TTL) and pass the returned
+`quote_id` to the call. The quote is consumed atomically with the record insert.
+
+The internally-quoting helpers price their exact record shape themselves and
+take **no** `quote_id`: `publish_merkle`, and the sealed flow's `submit_sealed`
+/ `publish_sealed`. They quote, enforce an optional `max_usd_micros` cap, and
+refresh the price lock if a slow upload outlived it. `quote_prepared_seal`
+returns a price preview a caller may hand to `submit_sealed` via its `quote`
+argument; a stale preview is silently re-quoted.
+
+### Publish a sealed PoE — encrypted to one or more recipients
+
+`publish_sealed` is the one-shot sealed flow: it seals every item to the
+recipient public keys (age-style sealed envelope), quotes internally, uploads
+each ciphertext to Arweave, and publishes the multi-item record. `items` is a
+**list** of `bytes`/`str` (one sealed item each — a bare `str` is rejected, so
+wrap a lone value in a list); `recipients` are raw KEM public keys (the
+post-quantum X-Wing hybrid by default, 1216 bytes each). It takes **no**
+`quote_id` — pass `max_usd_micros` to cap the internally-fetched price. The
+result is a `SealedSubmission` (the gateway `response`, the published
+`record_bytes`, and the `ar://` `uris`).
+
+```python
+import asyncio
+from cardanowall import Label309Client, derive_keys_from_seed
+
+async def main() -> None:
+    # In practice the recipient shares this key; here we derive it from a seed.
+    recipient_pub = derive_keys_from_seed(b"\x11" * 32)["mlkem768x25519"]["public_key"]
+    async with Label309Client(
+        base_url="https://gateway.example.com/api/v1",
+        api_key="<opaque-bearer>",
+    ) as client:
+        submission = await client.poe.publish_sealed(
+            items=[b"secret report", "second attachment"],  # a LIST, one sealed item each
+            recipients=[recipient_pub],                      # X-Wing public keys (1216 bytes)
+            max_usd_micros=500_000,                          # refuse above $0.50
+        )
+        print(submission.response["id"], submission.response["status"])
+        print(submission.uris)   # the ar:// URI of each item's ciphertext
+
+asyncio.run(main())
+```
+
+### Two-phase sealed publish with crash-safe resume
+
+For flows that must survive a crash (CI jobs, multi-GB ciphertexts), split the
+sealing from the network round-trips. `seal_prepare` is pure and offline: it
+hashes and encrypts every item and returns a `PreparedSeal` that serializes to
+the portable `prepared_seal_json_v1` artifact (`to_json()` / `from_json()`, the
+latter re-verifying its fingerprint). Persist that artifact, then `submit_sealed`
+quotes, uploads, and publishes. If `submit_sealed` fails **after** a paid
+upload, the `SubmitSealedError` carries validated `UploadReceipt`s — persist
+them and pass them back as `uploaded` on the retry, and the already-uploaded
+ciphertexts are never paid for twice.
+
+```python
+import asyncio
+from cardanowall import Label309Client, derive_keys_from_seed
+from cardanowall.client import PreparedSeal, SubmitSealedError, seal_prepare
+
+async def main() -> None:
+    recipient_pub = derive_keys_from_seed(b"\x11" * 32)["mlkem768x25519"]["public_key"]
+
+    # Phase 1 — pure and offline: no network, nothing secret leaves the host.
+    prepared = seal_prepare(items=[b"page one", b"page two"], recipients=[recipient_pub])
+
+    # Persist the portable artifact; from_json re-verifies its fingerprint on load.
+    prepared = PreparedSeal.from_json(prepared.to_json())
+
+    async with Label309Client(
+        base_url="https://gateway.example.com/api/v1",
+        api_key="<opaque-bearer>",
+    ) as client:
+        # Phase 2 — online: quote → upload each ciphertext → publish.
+        try:
+            submission = await client.poe.submit_sealed(prepared=prepared, max_usd_micros=1_000_000)
+        except SubmitSealedError as err:
+            # Resume: in a real flow you persist err.uploads (and the artifact)
+            # across process runs, then replay with the receipts — storage is
+            # charged only once.
+            submission = await client.poe.submit_sealed(
+                prepared=prepared, max_usd_micros=1_000_000, uploaded=err.uploads
+            )
+        print(submission.response["id"], submission.uris)
+
+asyncio.run(main())
+```
 
 ## API overview
 
@@ -141,9 +218,15 @@ fetches sealed-PoE ciphertext bounded by `DEFAULT_OUTBOUND_MAX_BYTES`.
 `Label309Client(base_url=..., api_key=..., http_client=...)` exposes four
 namespaces:
 
-- `client.poe` — `quote(...)`, `publish_content(...)`, `publish_sealed(...)`,
-  `publish_merkle(...)` (one-call high-level flows) plus the low-level
+- `client.poe` — `quote(...)`, `publish_content(...)`, `publish_merkle(...)`
+  (one-call high-level flows), the two-phase sealed surface — the pure
+  `seal_prepare(...)` (from `cardanowall.client`) feeding
+  `quote_prepared_seal(...)` / `submit_sealed(...)`, with
+  `publish_sealed(...)` as the one-shot wrapper — plus the low-level
   `uploads(...)`, `publish(...)`, `publish_batch(...)` wire-shape methods.
+  A `PreparedSeal` serializes to the portable `prepared_seal_json_v1`
+  artifact (`to_json()` / `from_json()`), so a failed publish retries from
+  persisted material and `UploadReceipt`s without ever re-encrypting.
 - `client.records` — `get(tx_hash)` to read a record by transaction hash.
 - `client.inbox` — sealed-PoE discovery for a recipient.
 - `client.account` — `balance()` and account-scoped reads.
@@ -165,8 +248,6 @@ All client failures raise typed errors inheriting from `Label309HttpError`:
   `SEVERITY`.
 - `PoeRecord` and the schema TypedDicts (`Item`, `Slot`, `EncryptionEnvelope`,
   `MerkleCommit`, …).
-- `chunk_bytes` / `chunk_text` / `bytes_chunk_array_concat` /
-  `reconstruct_chunked_uri` — the metadata-label-309 chunk codec.
 
 ### Primitives, identity, and signing
 

@@ -9,6 +9,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > change in backward-incompatible ways until a 1.0 release. Pre-1.0 versions do
 > not carry the stability guarantees of [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-07-05
+
+### Breaking
+
+- The sealed helper is now two-phase and the one-shot loses `quote_id`. `publish_sealed(items=[...], recipients=..., max_usd_micros=...)` seals a multi-item record and quotes the exact size internally under an optional USD cap; there is no separate quote step and no `quote_id`. `publish_merkle(leaves=..., leaf_alg=..., max_usd_micros=...)` likewise quotes internally (no `quote_id`) and returns the published record bytes.
+- The inclusion-certificate `verification.requires_trust_in_cardanowall` field is renamed `requires_issuer_trust`.
+
+### Added
+
+- Two-phase sealed publishing. `seal_prepare` encrypts every item offline and returns the portable, fingerprinted `prepared_seal_json_v1` artifact (`PreparedSeal.to_json()` / `from_json()`); `submit_sealed` runs the online half (internal exact-size quote, refresh-if-stale, upload, publish). A publish that fails after a paid upload raises `SubmitSealedError` carrying validated `UploadReceipt`s, so a retry resumes without re-encrypting or re-paying storage. `quote_prepared_seal` previews the price; `sealed_record` / `encode_sealed_record` are the air-gap seams. `quote_prepared_seal`, `submit_sealed`, and `publish_sealed` are exported from the package root.
+- `publish_merkle` carries an optional `leaf_alg` through to the leaves list.
+
+### Changed
+
+- `PreparedSeal.from_json` accepts only the exact canonical serialization of `prepared_seal_json_v1`; non-canonical encodings are rejected identically across the three SDKs. `seal_prepare` rejects a bare `str` for `items` (pass a list of items).
+
 ## [0.9.0] - 2026-07-03
 
 ### Added

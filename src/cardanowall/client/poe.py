@@ -10,8 +10,12 @@ Plus high-level helpers that compose the above into common flows:
 
 - :py:meth:`PoeNamespace.publish_content` — hash-only
 - :py:meth:`PoeNamespace.publish_prehashed` — caller already holds digest
-- :py:meth:`PoeNamespace.publish_sealed` — encrypt + uploads + publish
-- :py:meth:`PoeNamespace.publish_merkle` — uploads + publish, Merkle root
+- :py:meth:`PoeNamespace.publish_merkle` — internal quote + uploads +
+  publish, Merkle root
+- the two-phase sealed flow — :func:`cardanowall.client.sealed.seal_prepare`
+  (pure, offline) feeding :py:meth:`PoeNamespace.quote_prepared_seal` /
+  :py:meth:`PoeNamespace.submit_sealed`, with
+  :py:meth:`PoeNamespace.publish_sealed` as the one-shot wrapper
 
 Reads live under :class:`cardanowall.client.records.RecordsNamespace`;
 verification runs locally via :mod:`cardanowall.verifier`.
@@ -52,9 +56,6 @@ from .publish import (
 from .publish import (
     publish_prehashed as _publish_prehashed_impl,
 )
-from .publish import (
-    publish_sealed as _publish_sealed_impl,
-)
 from .resumable_source import ResumableSourceInput
 from .resumable_upload import (
     Cancel,
@@ -69,6 +70,20 @@ from .resumable_upload import (
 )
 from .resumable_upload import (
     upload_resumable as _upload_resumable_impl,
+)
+from .sealed import (
+    PreparedSeal,
+    SealedSubmission,
+    UploadReceipt,
+)
+from .sealed import (
+    publish_sealed as _publish_sealed_impl,
+)
+from .sealed import (
+    quote_prepared_seal as _quote_prepared_seal_impl,
+)
+from .sealed import (
+    submit_sealed as _submit_sealed_impl,
 )
 from .types import (
     PoeStatusSnapshot,
@@ -168,9 +183,11 @@ class PoeNamespace:
         ``amount`` is a decimal string; promote it to ``int`` at the
         application boundary if you need exact arithmetic.
 
-        Pass the returned ``quote_id`` to ``publish()`` (or one of the
-        high-level ``publish_content`` / ``publish_sealed`` /
-        ``publish_merkle`` helpers).
+        Pass the returned ``quote_id`` to ``publish()`` or the high-level
+        ``publish_content`` / ``publish_prehashed`` helpers. The internally
+        quoting helpers (``publish_merkle``, ``submit_sealed``,
+        ``publish_sealed``) take no quote id — they price their exact shape
+        themselves.
         """
         body = {
             "record_bytes": record_bytes,
@@ -484,37 +501,119 @@ class PoeNamespace:
             idempotency_key=idempotency_key,
         )
 
+    async def quote_prepared_seal(
+        self,
+        *,
+        prepared: PreparedSeal,
+        signer: Signer | None = None,
+        supersedes: str | None = None,
+    ) -> QuoteResponse:
+        """Price a prepared seal without uploading anything — the preview UIs
+        show before the user commits to storage.
+
+        ``prepared`` comes from :func:`cardanowall.client.sealed.seal_prepare`.
+        ``signer`` and ``supersedes`` affect the price only through their
+        presence (a signed or superseding record is larger); the signer is
+        not invoked. The returned quote may later be passed to
+        :py:meth:`submit_sealed` via its ``quote`` argument — a still-fresh
+        preview is consumed as the price lock, a stale one is silently
+        replaced by a fresh internal quote.
+        """
+        config = _ResolvedPublishConfig(
+            api_key=self._config.api_key,
+            base_url=self._config.base_url,
+            http_client=self._config.http_client,
+        )
+        return await _quote_prepared_seal_impl(
+            config,
+            prepared=prepared,
+            signer=signer,
+            supersedes=supersedes,
+        )
+
+    async def submit_sealed(
+        self,
+        *,
+        prepared: PreparedSeal,
+        signer: Signer | None = None,
+        max_usd_micros: int | None = None,
+        quote: QuoteResponse | None = None,
+        supersedes: str | None = None,
+        idempotency_key: str | None = None,
+        chunk_bytes: int | None = None,
+        uploaded: Sequence[UploadReceipt] = (),
+    ) -> SealedSubmission:
+        """Phase 2 of the sealed flow: submit a prepared seal — quote →
+        price-cap check → per-item ciphertext upload (skipping items covered
+        by validated ``uploaded`` receipts) → quote refresh if an upload
+        outlived the price lock → encode (optionally sign) → publish.
+
+        Uploads carry a deterministic per-item idempotency key derived from
+        the prepared artifact, so a crash-and-retry of the same prepared item
+        can never pay for its storage twice.
+
+        Raises :class:`cardanowall.client.sealed.SubmitSealedError`; when the
+        failure happened after any upload completed, its ``uploads`` attribute
+        carries the finished receipts — persist them and resume by passing
+        them back via ``uploaded``.
+        """
+        config = _ResolvedPublishConfig(
+            api_key=self._config.api_key,
+            base_url=self._config.base_url,
+            http_client=self._config.http_client,
+        )
+        return await _submit_sealed_impl(
+            config,
+            prepared=prepared,
+            signer=signer,
+            max_usd_micros=max_usd_micros,
+            quote=quote,
+            supersedes=supersedes,
+            idempotency_key=idempotency_key,
+            chunk_bytes=chunk_bytes,
+            uploaded=uploaded,
+        )
+
     async def publish_sealed(
         self,
         *,
-        content: bytes | str,
+        items: Sequence[bytes | str],
         recipients: Sequence[bytes],
-        quote_id: str,
-        signer: Signer | None = None,
         hash_alg: SupportedHashAlg = "sha2-256",
         kem: SupportedKem = "mlkem768x25519",
+        signer: Signer | None = None,
+        max_usd_micros: int | None = None,
+        supersedes: str | None = None,
         idempotency_key: str | None = None,
         chunk_bytes: int | None = None,
-    ) -> PublishResponse:
-        """Sealed-PoE: encrypt content to the recipient public keys (age-style
-        sealed envelope), upload the ciphertext to Arweave via /uploads, build a
-        Label 309 record with the resulting ``ar://`` URI, sign (optional), and
-        submit via /publish.
+    ) -> SealedSubmission:
+        """One-shot sealed publish: seal every item to the recipient public
+        keys (age-style sealed envelope), then quote internally, upload each
+        ciphertext to Arweave, build the multi-item Label 309 record with the
+        resulting ``ar://`` URIs, sign (optional), and submit via /publish.
+
+        Convenient when nothing needs to survive a process crash; a flow that
+        must resume (CI jobs, large ciphertexts) runs the two phases itself —
+        :func:`cardanowall.client.sealed.seal_prepare` and
+        :py:meth:`submit_sealed` — and persists the ``PreparedSeal`` and the
+        ``UploadReceipt`` s.
 
         ``kem`` selects the key-encapsulation mechanism and defaults to
-        ``'mlkem768x25519'`` — the post-quantum-safe X-Wing hybrid (ML-KEM-768 +
-        X25519). Pass ``'x25519'`` for the classical, higher-capacity path. The
-        recipient public-key length MUST match the chosen KEM (32 bytes for
-        ``'x25519'``, 1216 bytes for ``'mlkem768x25519'``); mixing KEMs across
-        recipients is not permitted.
+        ``'mlkem768x25519'`` — the post-quantum-safe X-Wing hybrid (ML-KEM-768
+        + X25519). Pass ``'x25519'`` for the classical, higher-capacity path.
+        The recipient public-key length MUST match the chosen KEM (32 bytes
+        for ``'x25519'``, 1216 bytes for ``'mlkem768x25519'``); one KEM covers
+        every item and mixing KEMs is not permitted.
 
         The sender SHOULD include their own recipient public key in
         ``recipients`` to retain decrypt access — the SDK does NOT inject
         the sender silently.
 
-        A ciphertext above the resumable threshold (~48 MiB) is uploaded as a
-        resumable session; ``chunk_bytes`` requests its chunk size (the server
-        clamps to its ``max_chunk_bytes``).
+        ``max_usd_micros`` refuses to publish when the internally fetched
+        quote exceeds the cap (USD micro-cents; 1 USD = 1,000,000). A
+        ciphertext above the resumable threshold (~48 MiB) is uploaded as a
+        resumable session; ``chunk_bytes`` requests its chunk size (the
+        server clamps to its ``max_chunk_bytes``).
         """
         config = _ResolvedPublishConfig(
             api_key=self._config.api_key,
@@ -523,12 +622,13 @@ class PoeNamespace:
         )
         return await _publish_sealed_impl(
             config,
-            content=content,
+            items=items,
             recipients=recipients,
-            quote_id=quote_id,
-            signer=signer,
             hash_alg=hash_alg,
             kem=kem,
+            signer=signer,
+            max_usd_micros=max_usd_micros,
+            supersedes=supersedes,
             idempotency_key=idempotency_key,
             chunk_bytes=chunk_bytes,
         )
@@ -537,18 +637,30 @@ class PoeNamespace:
         self,
         *,
         leaves: list[bytes | str],
-        quote_id: str,
         signer: Signer | None = None,
         hash_alg: str = "sha2-256",
+        leaf_alg: str | None = None,
+        max_usd_micros: int | None = None,
         idempotency_key: str | None = None,
         chunk_bytes: int | None = None,
     ) -> PublishMerkleResponse:
         """Merkle batch publish: compute the RFC 9162 §2.1.1 root over N
         caller-supplied 32-byte leaf hashes, upload the canonical leaves-list
-        CBOR to Arweave via /uploads, bind the root + leaf_count into
-        ``merkle[0]`` of an on-chain record, optionally sign, and submit.
+        CBOR to Arweave, bind the root + leaf_count into ``merkle[0]`` of an
+        on-chain record, optionally sign, and submit.
 
-        Only ``'sha2-256'`` leaves are supported in v1.
+        The helper owns the whole priced flow: it quotes internally from the
+        exact-width record-size estimate, enforces ``max_usd_micros`` (USD
+        micro-cents), uploads the leaves-list under a deterministic
+        idempotency key derived from its bytes (a retry of the same batch
+        never pays for its storage twice), refreshes the price lock when the
+        upload outlived it, and publishes. The response carries the exact
+        published record bytes.
+
+        ``leaf_alg`` is the advisory claim written into the uploaded
+        leaves-list naming how the leaves were computed (e.g. ``'sha2-256'``);
+        omitted when the leaves carry no such claim. Only ``'sha2-256'``
+        leaves are supported in v1.
 
         A leaves-list above the resumable threshold (~48 MiB) is uploaded as a
         resumable session; ``chunk_bytes`` requests its chunk size (the server
@@ -565,9 +677,10 @@ class PoeNamespace:
         return await _publish_merkle_impl(
             config,
             leaves=leaves,
-            quote_id=quote_id,
             signer=signer,
             hash_alg=cast("Any", hash_alg),
+            leaf_alg=leaf_alg,
+            max_usd_micros=max_usd_micros,
             idempotency_key=idempotency_key,
             chunk_bytes=chunk_bytes,
         )

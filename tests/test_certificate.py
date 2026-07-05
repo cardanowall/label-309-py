@@ -118,6 +118,35 @@ def test_omits_optional_anchor_fields_when_absent() -> None:
     assert "explorer_urls" not in cert["anchor"]
 
 
+def test_verification_block_asserts_issuer_independence() -> None:
+    leaves = _make_leaves(4)
+    merkle = _merkle_for(leaves)
+    cert = build_inclusion_certificate(
+        anchor=_anchor_for(),
+        merkle=merkle,
+        leaves=leaves,
+        targets=[CertificateTarget(leaf=leaves[1], leaf_alg="sha2-256")],
+    )
+
+    verification = cert["verification"]
+    # Independently verifiable: the proof recomputes from public data, so the
+    # issuer is never a trusted party.
+    assert verification["requires_issuer_trust"] is False
+    # The exact independent-tool list every conforming producer must emit.
+    assert verification["independent_tools"] == [
+        "cardanowall certificate verify <file>",
+        "cardanowall merkle verify (per item)",
+        "any RFC 9162 / COSE verifiable-data-structure verifier",
+    ]
+    # Time is asserted by the chain via public explorers, never by the issuer.
+    assert (
+        verification["time_asserted_by"] == "Cardano blockchain (block time), via public explorers"
+    )
+    # The method names the RFC 9162 recompute-and-compare procedure.
+    assert "RFC 9162" in verification["method"]
+    assert "recompute the Merkle root" in verification["method"]
+
+
 # --- tamper detection ----------------------------------------------------------
 
 

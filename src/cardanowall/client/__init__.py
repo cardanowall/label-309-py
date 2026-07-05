@@ -18,8 +18,10 @@ from .insufficient_scope_error import InsufficientScopeError
 from .internal_server_error import InternalServerError
 from .invalid_body_error import InvalidBodyError
 from .invalid_client_config_error import InvalidClientConfigError
+from .invalid_upload_receipt_error import InvalidUploadReceiptError
 from .label309_client import Label309Client
 from .malformed_cbor_error import MalformedCborError
+from .max_usd_exceeded_error import MaxUsdExceededError
 from .not_found_error import NotFoundError
 from .off_host_sign import (
     OffHostSignError,
@@ -41,9 +43,9 @@ from .publish import (
     PublishMerkleResponse,
     PublishPrehashedInput,
     PublishResponse,
-    PublishSealedInput,
     Signer,
     SupportedHashAlg,
+    SupportedKem,
 )
 from .quote_already_consumed_error import QuoteAlreadyConsumedError
 from .quote_expired_error import QuoteExpiredError
@@ -57,6 +59,25 @@ from .resumable_upload import (
     RESUMABLE_THRESHOLD_BYTES,
     ResumableUploadError,
     UploadCancelledError,
+)
+from .sealed import (
+    PREPARED_SEAL_JSON_VERSION,
+    PreparedSeal,
+    PreparedSealItem,
+    PreparedSealJsonError,
+    PublishSealedInput,
+    RngFill,
+    SealedSubmission,
+    SealPrepareError,
+    SubmitSealedError,
+    UploadReceipt,
+    encode_sealed_record,
+    publish_sealed,
+    quote_prepared_seal,
+    seal_prepare,
+    seal_prepare_with_rng,
+    sealed_record,
+    submit_sealed,
 )
 from .service_unavailable_error import ServiceUnavailableError
 from .types import (
@@ -72,6 +93,7 @@ from .unauthorized_error import UnauthenticatedError, UnauthorizedError
 from .validation_failed_error import ValidationFailedError
 
 __all__ = [
+    "PREPARED_SEAL_JSON_VERSION",
     "RESUMABLE_CHUNK_BYTES",
     "RESUMABLE_THRESHOLD_BYTES",
     "AccountNamespace",
@@ -84,9 +106,11 @@ __all__ = [
     "InternalServerError",
     "InvalidBodyError",
     "InvalidClientConfigError",
+    "InvalidUploadReceiptError",
     "Label309Client",
     "Label309HttpError",
     "MalformedCborError",
+    "MaxUsdExceededError",
     "NotFoundError",
     "OffHostSignError",
     "PartialUploadError",
@@ -94,6 +118,9 @@ __all__ = [
     "PoeNamespace",
     "PoeStatusSnapshot",
     "PoeWaitTimeoutError",
+    "PreparedSeal",
+    "PreparedSealItem",
+    "PreparedSealJsonError",
     "ProblemDetails",
     "ProblemErrorEntry",
     "PublishContentInput",
@@ -116,21 +143,34 @@ __all__ = [
     "ResumableSource",
     "ResumableSourceInput",
     "ResumableUploadError",
+    "RngFill",
+    "SealPrepareError",
+    "SealedSubmission",
     "ServiceUnavailableError",
     "Signer",
+    "SubmitSealedError",
     "SupportedHashAlg",
+    "SupportedKem",
     "UnauthenticatedError",
     "UnauthorizedError",
     "UploadCancelledError",
     "UploadProgress",
+    "UploadReceipt",
     "UploadResumableResult",
     "ValidationFailedError",
     "assemble_cose_sign1",
     "assemble_cose_sign1_hashed",
     "build_to_sign",
+    "encode_sealed_record",
     "extract_problem_extensions",
     "parse_http_error",
     "prepare_sig_structure",
     "prepare_sig_structure_hashed",
+    "publish_sealed",
+    "quote_prepared_seal",
+    "seal_prepare",
+    "seal_prepare_with_rng",
+    "sealed_record",
+    "submit_sealed",
     "to_resumable_source",
 ]
