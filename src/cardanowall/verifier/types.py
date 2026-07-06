@@ -108,7 +108,7 @@ class FetchOutbound(Protocol):
 # succeed on different items. An `enc`-bearing item for which the keyring
 # holds no credential of the applicable shape is reported
 # WRONG_DECRYPTION_INPUT_SHAPE.
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True, kw_only=True, repr=False)
 class DecryptionRecipient:
     """Recipient-key credential: a 32-byte X25519 scalar (`x25519`) or a
     32-byte X-Wing decapsulation seed (`mlkem768x25519`). Applies to items on
@@ -116,13 +116,22 @@ class DecryptionRecipient:
 
     recipient_secret_key: bytes
 
+    def __repr__(self) -> str:
+        # The recipient private key is secret: a repr in a log line, error
+        # chain, or traceback must never surface it.
+        return "DecryptionRecipient(recipient_secret_key=<redacted>)"
 
-@dataclass(frozen=True, kw_only=True)
+
+@dataclass(frozen=True, kw_only=True, repr=False)
 class DecryptionPassphrase:
     """Passphrase credential, normalized under the pinned profile before
     Argon2id. Applies to items on the `enc.passphrase` path."""
 
     passphrase: str
+
+    def __repr__(self) -> str:
+        # The passphrase is secret: never surface it via a repr.
+        return "DecryptionPassphrase(passphrase=<redacted>)"
 
 
 Decryption = DecryptionRecipient | DecryptionPassphrase

@@ -26,6 +26,8 @@ from cardanowall.client.max_usd_exceeded_error import MaxUsdExceededError
 from cardanowall.client.partial_upload_error import PartialUploadError
 from cardanowall.client.publish import PublishError
 from cardanowall.client.sealed import (
+    PassphraseKdfParams,
+    PreparedPassphraseSeal,
     PreparedSeal,
     PreparedSealJsonError,
     RngFill,
@@ -35,12 +37,15 @@ from cardanowall.client.sealed import (
     _document_of,
     _fingerprint,
     _validate_receipts,
+    encode_passphrase_sealed_record,
     encode_sealed_record,
+    passphrase_seal_prepare_with_rng,
+    passphrase_sealed_record,
     seal_prepare,
     seal_prepare_with_rng,
     sealed_record,
 )
-from cardanowall.poe_standard import encode_poe_record, validate
+from cardanowall.poe_standard import ValidateOk, encode_poe_record, validate
 
 FIXTURE_API_KEY = "opaque-bearer-fixture-token"
 QUOTE_ID = "01956b41-7c00-7000-8000-000000000001"
@@ -543,9 +548,10 @@ def test_submit_sealed_rejects_invalid_receipts_before_any_network() -> None:
         prepared = _deterministic_prepared([b"first plaintext"], 1)
         item = prepared.items[0]
         good_digest = hashlib.sha256(item.ciphertext).digest()
+        valid_uri = "ar://" + "A" * 43
         good = UploadReceipt(
             item_id=item.item_id,
-            uri="ar://x",
+            uri=valid_uri,
             ciphertext_sha256=good_digest,
             bytes=len(item.ciphertext),
         )
@@ -554,7 +560,7 @@ def test_submit_sealed_rejects_invalid_receipts_before_any_network() -> None:
             [
                 UploadReceipt(
                     item_id="00" * 32,
-                    uri="ar://x",
+                    uri=valid_uri,
                     ciphertext_sha256=good_digest,
                     bytes=len(item.ciphertext),
                 )
@@ -563,7 +569,7 @@ def test_submit_sealed_rejects_invalid_receipts_before_any_network() -> None:
             [
                 UploadReceipt(
                     item_id=item.item_id,
-                    uri="ar://x",
+                    uri=valid_uri,
                     ciphertext_sha256=b"\x00" * 32,
                     bytes=len(item.ciphertext),
                 )
@@ -572,16 +578,27 @@ def test_submit_sealed_rejects_invalid_receipts_before_any_network() -> None:
             [
                 UploadReceipt(
                     item_id=item.item_id,
-                    uri="ar://x",
+                    uri=valid_uri,
                     ciphertext_sha256=good_digest,
                     bytes=1,
                 )
             ],
-            # Empty URI.
+            # Empty URI — not a valid Arweave ar://<43-char txid>.
             [
                 UploadReceipt(
                     item_id=item.item_id,
                     uri="",
+                    ciphertext_sha256=good_digest,
+                    bytes=len(item.ciphertext),
+                )
+            ],
+            # Malformed Arweave URI (a sealed ciphertext receipt must be a strict
+            # ar://<43-char txid>): a fragment, wrong-length txid, or non-Arweave
+            # scheme is rejected pre-network.
+            [
+                UploadReceipt(
+                    item_id=item.item_id,
+                    uri="ar://tooshort",
                     ciphertext_sha256=good_digest,
                     bytes=len(item.ciphertext),
                 )
@@ -962,7 +979,7 @@ def test_validate_receipts_resolves_a_duplicate_item_id_to_the_first_index() -> 
 
     receipt = UploadReceipt(
         item_id=item.item_id,
-        uri="ar://x",
+        uri="ar://" + "A" * 43,
         ciphertext_sha256=hashlib.sha256(item.ciphertext).digest(),
         bytes=len(item.ciphertext),
     )
@@ -1051,3 +1068,116 @@ def test_sealed_helpers_are_importable_from_the_client_package() -> None:
     assert callable(quote_prepared_seal)
     assert callable(submit_sealed)
     assert callable(publish_sealed)
+
+
+# ---------------------------------------------------------------------------
+# Passphrase two-phase publishing (the shared-secret key path)
+# ---------------------------------------------------------------------------
+
+_PASSPHRASE = "correct horse battery staple"
+
+
+def _deterministic_passphrase_prepared(plaintexts: list[bytes]) -> PreparedPassphraseSeal:
+    """A reproducible passphrase prepared seal (counter rng from 0, registry
+    floor params) — the fastest Argon2 profile still passes the floor."""
+    return passphrase_seal_prepare_with_rng(
+        items=plaintexts,
+        passphrase=_PASSPHRASE,
+        params=PassphraseKdfParams(m=65536, t=3, p=1),
+        rng=_counter_rng(0),
+    )
+
+
+def test_submit_passphrase_sealed_exact_quote_equals_published_record_bytes() -> None:
+    """The passphrase quote is exact build-and-measure: the ``record_bytes`` it
+    prices must equal the length of the record actually published against a real
+    fixed-width Arweave receipt. A mis-charge would surface as a size mismatch
+    here (the finding the strict receipt-URI validation closed)."""
+
+    async def run() -> None:
+        prepared = _deterministic_passphrase_prepared([b"passphrase submit"])
+        ar_uri = "ar://" + "P" * 43
+        handler = _ScriptedHandler(
+            [
+                (200, _quote_body()),
+                (200, _uploads_body(ar_uri)),
+                (202, PUBLISH_BODY),
+            ]
+        )
+        async with _client(handler) as client:
+            out = await client.poe.submit_passphrase_sealed(prepared=prepared)
+
+        assert handler.call_count == 3
+        quote_body = handler.captured[0].json()
+        publish_body = handler.captured[2].json()
+        published = bytes.fromhex(publish_body["record"])
+        # The exact-measure quote priced precisely the bytes that were published.
+        assert quote_body["record_bytes"] == len(published)
+        assert out.record_bytes == published
+        assert out.uris == (ar_uri,)
+        # The upload rode the deterministic per-item passphrase idempotency key.
+        assert handler.captured[1].headers.get("idempotency-key") == (
+            prepared.upload_idempotency_key(0)
+        )
+        assert prepared.upload_idempotency_key(0).startswith("pwseal1-")
+        # The published bytes equal the directly-assembled record for the URI,
+        # and that record validates structurally.
+        direct = await encode_passphrase_sealed_record(prepared, [ar_uri])
+        assert direct == published
+        assert isinstance(validate(published), ValidateOk)
+
+    asyncio.run(run())
+
+
+def test_submit_passphrase_sealed_resumes_from_a_validated_receipt() -> None:
+    """A receipt from a prior attempt skips the ciphertext upload: the submit
+    quotes and publishes without a /poe/uploads call."""
+
+    async def run() -> None:
+        prepared = _deterministic_passphrase_prepared([b"resume me"])
+        ar_uri = "ar://" + "Q" * 43
+        receipt = UploadReceipt(
+            item_id=prepared.items[0].item_id,
+            uri=ar_uri,
+            ciphertext_sha256=hashlib.sha256(prepared.items[0].ciphertext).digest(),
+            bytes=len(prepared.items[0].ciphertext),
+        )
+        handler = _ScriptedHandler([(200, _quote_body()), (202, PUBLISH_BODY)])
+        async with _client(handler) as client:
+            out = await client.poe.submit_passphrase_sealed(prepared=prepared, uploaded=[receipt])
+        # No /poe/uploads request: quote then publish only.
+        assert [c.path for c in handler.captured] == ["/api/v1/poe/quote", "/api/v1/poe/publish"]
+        assert out.uris == (ar_uri,)
+        assert out.uploads[0].uri == ar_uri
+
+    asyncio.run(run())
+
+
+def test_submit_passphrase_sealed_rejects_a_non_arweave_receipt_uri() -> None:
+    """A sealed ciphertext always lives on Arweave, so a resume receipt whose
+    URI is not a strict ``ar://<43-char txid>`` is rejected pre-network."""
+
+    async def run() -> None:
+        prepared = _deterministic_passphrase_prepared([b"bad receipt"])
+        receipt = UploadReceipt(
+            item_id=prepared.items[0].item_id,
+            uri="ipfs://QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH",
+            ciphertext_sha256=hashlib.sha256(prepared.items[0].ciphertext).digest(),
+            bytes=len(prepared.items[0].ciphertext),
+        )
+        handler = _refusing_handler()
+        async with _client(handler) as client:
+            with pytest.raises(SubmitSealedError) as exc:
+                await client.poe.submit_passphrase_sealed(prepared=prepared, uploaded=[receipt])
+        assert isinstance(exc.value.cause, InvalidUploadReceiptError)
+        # The rejection is pre-network: no quote was spent.
+        assert handler.call_count == 0
+
+
+def test_passphrase_sealed_record_rejects_a_non_fetch_set_uri() -> None:
+    """The pure assembly seam refuses any URI outside the canonical fetch set,
+    so a producer never emits a record local validation would reject."""
+    prepared = _deterministic_passphrase_prepared([b"assembly seam"])
+    with pytest.raises(SealPrepareError) as exc:
+        passphrase_sealed_record(prepared, ["ar://tooshort"])
+    assert exc.value.code == SealPrepareError.INVALID_URI

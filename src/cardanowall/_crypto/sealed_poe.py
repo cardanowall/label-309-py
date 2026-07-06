@@ -291,10 +291,21 @@ class SealedPoeOutput:
 # is empty unwraps to a clean no-match (WRONG_RECIPIENT_KEY) without touching any
 # KEM primitive — it is NOT a programmer error, unlike an empty flat
 # ``recipient_secret_keys`` sequence.
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class RecipientKeyBundle:
     x25519_private_keys: Sequence[bytes]
     mlkem768x25519_secret_seeds: Sequence[bytes]
+
+    def __repr__(self) -> str:
+        # The recipient private keys / decapsulation seeds are secret: a repr in
+        # a log line, error chain, or traceback must never surface them, so show
+        # only their counts behind a redaction placeholder.
+        return (
+            f"RecipientKeyBundle(x25519_private_keys="
+            f"<redacted; {len(self.x25519_private_keys)} key(s)>, "
+            f"mlkem768x25519_secret_seeds="
+            f"<redacted; {len(self.mlkem768x25519_secret_seeds)} seed(s)>)"
+        )
 
 
 def _select_bundle_secrets(envelope: SealedEnvelope, bundle: RecipientKeyBundle) -> Sequence[bytes]:
@@ -305,11 +316,22 @@ def _select_bundle_secrets(envelope: SealedEnvelope, bundle: RecipientKeyBundle)
     )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class UnwrapResult:
     matched: bool
     plaintext: bytes | None
     reason: str | None
+
+    def __repr__(self) -> str:
+        # The recovered plaintext is secret: show only its byte length behind a
+        # redaction placeholder so a repr never surfaces decrypted content. The
+        # matched flag and the no-match reason discriminator are non-secret.
+        plaintext = (
+            f"<redacted; {len(self.plaintext)} byte(s)>" if self.plaintext is not None else "None"
+        )
+        return (
+            f"UnwrapResult(matched={self.matched!r}, plaintext={plaintext}, reason={self.reason!r})"
+        )
 
 
 # Argon2id work-factor parameters as carried on the wire (`enc.passphrase.params`).
@@ -347,11 +369,19 @@ TRIAL_DECRYPT_KIND_MATCH: Final[str] = "match"
 TRIAL_DECRYPT_KIND_NO_MATCH: Final[str] = "no_match"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class TrialDecryptOnlyResult:
     kind: str
     slot_idx: int | None
     cek: bytes | None
+
+    def __repr__(self) -> str:
+        # The recovered content-encryption key is secret: show only a redaction
+        # placeholder. The match kind and accepted-slot index are non-secret.
+        return (
+            f"TrialDecryptOnlyResult(kind={self.kind!r}, "
+            f"slot_idx={self.slot_idx!r}, cek=<redacted>)"
+        )
 
 
 # Labelled digest of the item's complete `hashes` map (every algorithm entry,

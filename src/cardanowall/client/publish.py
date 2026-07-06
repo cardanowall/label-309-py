@@ -47,9 +47,11 @@ from cardanowall._crypto.sealed_poe import (
 from cardanowall.estimate import MerkleShape, RecordShape, estimate_record_bytes
 from cardanowall.poe_standard import (
     EncryptionEnvelope,
+    Item,
     MerkleCommit,
     PoeRecord,
     encode_poe_record,
+    is_fetch_set_uri,
 )
 
 from .max_usd_exceeded_error import MaxUsdExceededError
@@ -74,6 +76,8 @@ from .types import (
 _ED25519_PUBLIC_KEY_LENGTH = 32
 _ED25519_SIGNATURE_LENGTH = 64
 _LEAF_DIGEST_LENGTH = 32
+# The transaction-hash width `supersedes` carries as lowercase hex.
+_SUPERSEDES_HEX_LENGTH = 64
 _STORAGE_TARGET_ARWEAVE: Literal["arweave"] = "arweave"
 
 # An Arweave transaction id is always 43 base64url characters, so a not-yet-
@@ -131,6 +135,10 @@ class PublishError(Exception):
     - ``"INVALID_DIGEST"`` — supplied hex digest is wrong length / non-hex.
     - ``"INVALID_RECIPIENT"`` — recipient public key is wrong length.
     - ``"UNSUPPORTED_HASH_ALG"`` — hash algorithm not registered.
+    - ``"INVALID_SUPERSEDES"`` — ``supersedes`` was not the 64-hex hash of the
+      superseded transaction.
+    - ``"INVALID_URI"`` — a content/mirror URI is not a well-formed member of
+      the record's ``{ar://, ipfs://}`` fetch set.
     """
 
     INVALID_SIGNER_PUBKEY = "INVALID_SIGNER_PUBKEY"
@@ -139,6 +147,8 @@ class PublishError(Exception):
     INVALID_DIGEST = "INVALID_DIGEST"
     INVALID_RECIPIENT = "INVALID_RECIPIENT"
     UNSUPPORTED_HASH_ALG = "UNSUPPORTED_HASH_ALG"
+    INVALID_SUPERSEDES = "INVALID_SUPERSEDES"
+    INVALID_URI = "INVALID_URI"
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{code}: {message}")
@@ -167,6 +177,16 @@ class PublishContentInput(TypedDict, total=False):
     content: bytes | str  # required
     quote_id: str  # required — UUID from POST /poe/quote
     hash_alg: SupportedHashAlg
+    # Additional content-hash algorithms co-hashed into the item's `hashes`
+    # map, unioned with `hash_alg` in first-seen order (dedup, default
+    # sha2-256). A single algorithm encodes identically to before co-hashing.
+    hash_algs: Sequence[SupportedHashAlg]
+    # Optional retrieval URIs for the anchored content, each a member of the
+    # `{ar://, ipfs://}` fetch set (already-pinned public content — a hash-only
+    # record omits them).
+    uris: Sequence[str]
+    # The 64-hex transaction hash of the record this one supersedes.
+    supersedes: str
     signer: Signer
     idempotency_key: str
 
@@ -182,6 +202,10 @@ class PublishPrehashedInput(TypedDict, total=False):
 
     hashes: dict[SupportedHashAlg, str]  # required
     quote_id: str  # required — UUID from POST /poe/quote
+    # Optional retrieval URIs, each a member of the `{ar://, ipfs://}` fetch set.
+    uris: Sequence[str]
+    # The 64-hex transaction hash of the record this one supersedes.
+    supersedes: str
     signer: Signer
     idempotency_key: str
 
@@ -199,6 +223,8 @@ class PublishMerkleInput(TypedDict, total=False):
     # how the leaves were computed (e.g. 'sha2-256'). Omitted when the leaves
     # carry no such claim (pass-through digests computed elsewhere).
     leaf_alg: str
+    # The 64-hex transaction hash of the record this batch supersedes.
+    supersedes: str
     signer: Signer
     # Refuse to publish when the quoted price exceeds this many USD
     # micro-cents (1 USD = 1,000,000).
@@ -251,6 +277,68 @@ def _hash_content(content: bytes, alg: SupportedHashAlg) -> bytes:
         PublishError.UNSUPPORTED_HASH_ALG,
         f"hash_alg must be 'sha2-256' or 'blake2b-256', got {alg!r}",
     )
+
+
+def resolve_hash_algs(
+    primary: SupportedHashAlg | None,
+    extra: Sequence[SupportedHashAlg],
+) -> list[SupportedHashAlg]:
+    """Resolve the effective co-hash algorithm set from a primary choice plus
+    any extra algorithms: the union in first-seen order, deduplicated by wire
+    id, defaulting to a single ``sha2-256`` when both are empty. A single
+    algorithm therefore encodes identically to the pre-co-hash behaviour."""
+    out: list[SupportedHashAlg] = []
+    for alg in ([primary] if primary is not None else []) + list(extra):
+        if alg not in out:
+            out.append(alg)
+    if not out:
+        out.append("sha2-256")
+    return out
+
+
+def parse_supersedes_hex(value: str) -> bytes | None:
+    """Parse a ``supersedes`` value into the 32-byte transaction hash the record
+    carries, or ``None`` when it is not exactly 64 hex characters. Shared by
+    every producer path so ``supersedes`` validation is identical across the
+    SDK."""
+    if len(value) != _SUPERSEDES_HEX_LENGTH:
+        return None
+    try:
+        return bytes.fromhex(value)
+    except ValueError:
+        return None
+
+
+def _resolve_supersedes(supersedes: str | None) -> bytes | None:
+    """Parse an optional ``supersedes`` value into record bytes, mapping a
+    malformed value to :class:`PublishError` with code ``INVALID_SUPERSEDES``."""
+    if supersedes is None:
+        return None
+    parsed = parse_supersedes_hex(supersedes)
+    if parsed is None:
+        raise PublishError(
+            PublishError.INVALID_SUPERSEDES,
+            "supersedes must be the 64-hex transaction hash",
+        )
+    return parsed
+
+
+def _validate_uris(uris: Sequence[str] | None) -> list[str] | None:
+    """Validate an optional URI list against the fetch set, returning it
+    unchanged when every entry is well-formed. The per-URI grammar is the SAME
+    strict :func:`cardanowall.poe_standard.is_fetch_set_uri` the canonical record
+    validator enforces, so a producer can never emit a record a verifier would
+    reject on its content URIs."""
+    if uris is None:
+        return None
+    resolved = list(uris)
+    for uri in resolved:
+        if not is_fetch_set_uri(uri):
+            raise PublishError(
+                PublishError.INVALID_URI,
+                f"{uri!r} is not a valid ar:// or ipfs:// fetch-set uri",
+            )
+    return resolved
 
 
 def _assert_signer(signer: Signer) -> bytes:
@@ -635,21 +723,36 @@ async def publish_content(
     content: bytes | str,
     quote_id: str,
     signer: Signer | None = None,
-    hash_alg: SupportedHashAlg = "sha2-256",
+    hash_alg: SupportedHashAlg | None = None,
+    hash_algs: Sequence[SupportedHashAlg] = (),
+    uris: Sequence[str] | None = None,
+    supersedes: str | None = None,
     idempotency_key: str | None = None,
 ) -> PublishResponse:
     """Hash-only PoE — anchor a single content blob's digest, optionally with
     one path-1 signature. No Arweave, no /uploads.
+
+    ``hash_alg`` plus ``hash_algs`` co-hash the content under the union of the
+    named algorithms (first-seen order, deduplicated, defaulting to a single
+    ``sha2-256``). ``uris`` are optional ``{ar://, ipfs://}`` retrieval pointers
+    for the already-pinned public content; ``supersedes`` links this record to
+    the transaction it replaces.
     """
     if signer is not None:
         _assert_signer(signer)
+    resolved_uris = _validate_uris(uris)
+    supersedes_bytes = _resolve_supersedes(supersedes)
     content_bytes = _to_bytes(content)
-    digest = _hash_content(content_bytes, hash_alg)
-
-    record: PoeRecord = {
-        "v": 1,
-        "items": [{"hashes": {hash_alg: digest}}],
+    hashes: dict[SupportedHashAlg, bytes] = {
+        alg: _hash_content(content_bytes, alg) for alg in resolve_hash_algs(hash_alg, hash_algs)
     }
+
+    item: Item = {"hashes": hashes}
+    if resolved_uris is not None:
+        item["uris"] = resolved_uris
+    record: PoeRecord = {"v": 1, "items": [item]}
+    if supersedes_bytes is not None:
+        record["supersedes"] = supersedes_bytes
     record_bytes = await _encode_record(record, signer)
     return await _post_publish(config, record_bytes.hex(), quote_id, idempotency_key)
 
@@ -668,13 +771,19 @@ async def publish_prehashed(
     hashes: dict[SupportedHashAlg, str],
     quote_id: str,
     signer: Signer | None = None,
+    uris: Sequence[str] | None = None,
+    supersedes: str | None = None,
     idempotency_key: str | None = None,
 ) -> PublishResponse:
     """Hash-already-computed PoE — anchor a precomputed content digest
-    (hex-encoded), optionally signed.
+    (hex-encoded), optionally signed. ``uris`` are optional
+    ``{ar://, ipfs://}`` retrieval pointers; ``supersedes`` links this record
+    to the transaction it replaces.
     """
     if signer is not None:
         _assert_signer(signer)
+    resolved_uris = _validate_uris(uris)
+    supersedes_bytes = _resolve_supersedes(supersedes)
     present = [(alg, hex_digest) for alg, hex_digest in hashes.items() if hex_digest]
     if not present:
         raise PublishError(
@@ -697,10 +806,12 @@ async def publish_prehashed(
             )
         decoded[alg] = digest_bytes
 
-    record: PoeRecord = {
-        "v": 1,
-        "items": [{"hashes": decoded}],
-    }
+    item: Item = {"hashes": decoded}
+    if resolved_uris is not None:
+        item["uris"] = resolved_uris
+    record: PoeRecord = {"v": 1, "items": [item]}
+    if supersedes_bytes is not None:
+        record["supersedes"] = supersedes_bytes
     record_bytes = await _encode_record(record, signer)
     return await _post_publish(config, record_bytes.hex(), quote_id, idempotency_key)
 
@@ -743,6 +854,7 @@ async def publish_merkle(
     hash_alg: Literal["sha2-256"] = "sha2-256",
     leaf_alg: str | None = None,
     max_usd_micros: int | None = None,
+    supersedes: str | None = None,
     idempotency_key: str | None = None,
     chunk_bytes: int | None = None,
 ) -> PublishMerkleResponse:
@@ -777,6 +889,7 @@ async def publish_merkle(
             PublishError.INVALID_LEAVES,
             "publish_merkle requires at least one leaf hash",
         )
+    supersedes_bytes = _resolve_supersedes(supersedes)
 
     leaves_bytes: list[bytes] = []
     for idx, leaf in enumerate(leaves):
@@ -801,7 +914,7 @@ async def publish_merkle(
     shape = RecordShape(
         items=(),
         signed=signer is not None,
-        supersedes=False,
+        supersedes=supersedes_bytes is not None,
         merkle=MerkleShape(alg="rfc9162-sha256", uris=(_arweave_uri_placeholder(),)),
     )
     quote_request = _QuoteRequest(
@@ -827,6 +940,8 @@ async def publish_merkle(
         "uris": [uri],
     }
     record: PoeRecord = {"v": 1, "merkle": [merkle_entry]}
+    if supersedes_bytes is not None:
+        record["supersedes"] = supersedes_bytes
     record_bytes = await _encode_record(record, signer)
     published = await _post_publish(config, record_bytes.hex(), quote["quote_id"], idempotency_key)
 

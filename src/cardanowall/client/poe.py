@@ -72,15 +72,26 @@ from .resumable_upload import (
     upload_resumable as _upload_resumable_impl,
 )
 from .sealed import (
+    PassphraseKdfParams,
+    PreparedPassphraseSeal,
     PreparedSeal,
     SealedSubmission,
     UploadReceipt,
 )
 from .sealed import (
+    publish_passphrase_sealed as _publish_passphrase_sealed_impl,
+)
+from .sealed import (
     publish_sealed as _publish_sealed_impl,
 )
 from .sealed import (
+    quote_prepared_passphrase_seal as _quote_prepared_passphrase_seal_impl,
+)
+from .sealed import (
     quote_prepared_seal as _quote_prepared_seal_impl,
+)
+from .sealed import (
+    submit_passphrase_sealed as _submit_passphrase_sealed_impl,
 )
 from .sealed import (
     submit_sealed as _submit_sealed_impl,
@@ -455,12 +466,20 @@ class PoeNamespace:
         content: bytes | str,
         quote_id: str,
         signer: Signer | None = None,
-        hash_alg: SupportedHashAlg = "sha2-256",
+        hash_alg: SupportedHashAlg | None = None,
+        hash_algs: Sequence[SupportedHashAlg] = (),
+        uris: Sequence[str] | None = None,
+        supersedes: str | None = None,
         idempotency_key: str | None = None,
     ) -> PublishResponse:
         """High-level hash-only publish: hash the supplied content, build a
         single-item Label 309 record, optionally sign with the caller-supplied
         signer, and submit. No Arweave, no /uploads — anchors the digest only.
+
+        ``hash_alg`` plus ``hash_algs`` co-hash the content under the union of
+        the named algorithms (default sha2-256). ``uris`` are optional
+        ``{ar://, ipfs://}`` retrieval pointers; ``supersedes`` links this
+        record to the transaction it replaces.
         """
         config = _ResolvedPublishConfig(
             api_key=self._config.api_key,
@@ -473,6 +492,9 @@ class PoeNamespace:
             quote_id=quote_id,
             signer=signer,
             hash_alg=hash_alg,
+            hash_algs=hash_algs,
+            uris=uris,
+            supersedes=supersedes,
             idempotency_key=idempotency_key,
         )
 
@@ -482,11 +504,15 @@ class PoeNamespace:
         hashes: dict[SupportedHashAlg, str],
         quote_id: str,
         signer: Signer | None = None,
+        uris: Sequence[str] | None = None,
+        supersedes: str | None = None,
         idempotency_key: str | None = None,
     ) -> PublishResponse:
         """Hash-already-computed PoE — anchor a precomputed content digest
         (hex-encoded) with optional path-1 signature. No Arweave, no
-        /uploads, no client-side hashing.
+        /uploads, no client-side hashing. ``uris`` are optional
+        ``{ar://, ipfs://}`` retrieval pointers; ``supersedes`` links this
+        record to the transaction it replaces.
         """
         config = _ResolvedPublishConfig(
             api_key=self._config.api_key,
@@ -498,6 +524,8 @@ class PoeNamespace:
             hashes=hashes,
             quote_id=quote_id,
             signer=signer,
+            uris=uris,
+            supersedes=supersedes,
             idempotency_key=idempotency_key,
         )
 
@@ -579,7 +607,7 @@ class PoeNamespace:
         *,
         items: Sequence[bytes | str],
         recipients: Sequence[bytes],
-        hash_alg: SupportedHashAlg = "sha2-256",
+        hash_algs: Sequence[SupportedHashAlg] = (),
         kem: SupportedKem = "mlkem768x25519",
         signer: Signer | None = None,
         max_usd_micros: int | None = None,
@@ -624,7 +652,7 @@ class PoeNamespace:
             config,
             items=items,
             recipients=recipients,
-            hash_alg=hash_alg,
+            hash_algs=hash_algs,
             kem=kem,
             signer=signer,
             max_usd_micros=max_usd_micros,
@@ -641,6 +669,7 @@ class PoeNamespace:
         hash_alg: str = "sha2-256",
         leaf_alg: str | None = None,
         max_usd_micros: int | None = None,
+        supersedes: str | None = None,
         idempotency_key: str | None = None,
         chunk_bytes: int | None = None,
     ) -> PublishMerkleResponse:
@@ -660,7 +689,8 @@ class PoeNamespace:
         ``leaf_alg`` is the advisory claim written into the uploaded
         leaves-list naming how the leaves were computed (e.g. ``'sha2-256'``);
         omitted when the leaves carry no such claim. Only ``'sha2-256'``
-        leaves are supported in v1.
+        leaves are supported in v1. ``supersedes`` links this batch to the
+        transaction it replaces.
 
         A leaves-list above the resumable threshold (~48 MiB) is uploaded as a
         resumable session; ``chunk_bytes`` requests its chunk size (the server
@@ -681,6 +711,124 @@ class PoeNamespace:
             hash_alg=cast("Any", hash_alg),
             leaf_alg=leaf_alg,
             max_usd_micros=max_usd_micros,
+            supersedes=supersedes,
+            idempotency_key=idempotency_key,
+            chunk_bytes=chunk_bytes,
+        )
+
+    async def quote_prepared_passphrase_seal(
+        self,
+        *,
+        prepared: PreparedPassphraseSeal,
+        signer: Signer | None = None,
+        supersedes: str | None = None,
+    ) -> QuoteResponse:
+        """Price a prepared passphrase seal without uploading anything.
+
+        ``prepared`` comes from
+        :func:`cardanowall.client.sealed.passphrase_seal_prepare`. ``signer``
+        and ``supersedes`` affect the price only through their presence; the
+        returned quote may later be passed to
+        :py:meth:`submit_passphrase_sealed` via its ``quote`` argument.
+        """
+        config = _ResolvedPublishConfig(
+            api_key=self._config.api_key,
+            base_url=self._config.base_url,
+            http_client=self._config.http_client,
+        )
+        return await _quote_prepared_passphrase_seal_impl(
+            config,
+            prepared=prepared,
+            signer=signer,
+            supersedes=supersedes,
+        )
+
+    async def submit_passphrase_sealed(
+        self,
+        *,
+        prepared: PreparedPassphraseSeal,
+        signer: Signer | None = None,
+        max_usd_micros: int | None = None,
+        quote: QuoteResponse | None = None,
+        supersedes: str | None = None,
+        idempotency_key: str | None = None,
+        chunk_bytes: int | None = None,
+        uploaded: Sequence[UploadReceipt] = (),
+    ) -> SealedSubmission:
+        """Phase 2 of the passphrase flow: submit a prepared passphrase seal —
+        quote → price-cap check → per-item ciphertext upload (skipping items
+        covered by validated ``uploaded`` receipts) → quote refresh if an
+        upload outlived the price lock → encode (optionally sign) → publish.
+
+        Uploads carry a deterministic per-item idempotency key derived from the
+        prepared artifact, so a crash-and-retry can never pay for its storage
+        twice.
+
+        Raises :class:`cardanowall.client.sealed.SubmitSealedError`; when the
+        failure happened after any upload completed, its ``uploads`` attribute
+        carries the finished receipts — persist them and resume by passing them
+        back via ``uploaded``.
+        """
+        config = _ResolvedPublishConfig(
+            api_key=self._config.api_key,
+            base_url=self._config.base_url,
+            http_client=self._config.http_client,
+        )
+        return await _submit_passphrase_sealed_impl(
+            config,
+            prepared=prepared,
+            signer=signer,
+            max_usd_micros=max_usd_micros,
+            quote=quote,
+            supersedes=supersedes,
+            idempotency_key=idempotency_key,
+            chunk_bytes=chunk_bytes,
+            uploaded=uploaded,
+        )
+
+    async def publish_passphrase_sealed(
+        self,
+        *,
+        items: Sequence[bytes | str],
+        passphrase: str,
+        hash_algs: Sequence[SupportedHashAlg] = (),
+        params: PassphraseKdfParams | None = None,
+        signer: Signer | None = None,
+        max_usd_micros: int | None = None,
+        supersedes: str | None = None,
+        idempotency_key: str | None = None,
+        chunk_bytes: int | None = None,
+    ) -> SealedSubmission:
+        """One-shot passphrase publish: seal every item under the shared
+        ``passphrase`` (Argon2id-stretched content key, no per-recipient KEM
+        slots), then quote internally, upload each ciphertext to Arweave, build
+        the record with the resulting ``ar://`` URIs, sign (optional), and
+        submit via /publish.
+
+        Convenient when nothing needs to survive a process crash; a flow that
+        must resume runs the two phases itself —
+        :func:`cardanowall.client.sealed.passphrase_seal_prepare` and
+        :py:meth:`submit_passphrase_sealed`.
+
+        ``hash_algs`` co-hashes each item under several content-hash algorithms
+        (default sha2-256); ``params`` sets the Argon2id work factors (default
+        m=65536, t=3, p=4). Anyone who knows the passphrase can decrypt, so
+        share it out of band with care.
+        """
+        config = _ResolvedPublishConfig(
+            api_key=self._config.api_key,
+            base_url=self._config.base_url,
+            http_client=self._config.http_client,
+        )
+        return await _publish_passphrase_sealed_impl(
+            config,
+            items=items,
+            passphrase=passphrase,
+            hash_algs=hash_algs,
+            params=params,
+            signer=signer,
+            max_usd_micros=max_usd_micros,
+            supersedes=supersedes,
             idempotency_key=idempotency_key,
             chunk_bytes=chunk_bytes,
         )

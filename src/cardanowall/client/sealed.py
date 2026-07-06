@@ -60,6 +60,7 @@ import binascii
 import builtins
 import json
 import re
+import secrets
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TypedDict, cast
@@ -69,14 +70,24 @@ from cardanowall._crypto.sealed_poe import (
     AEAD_CHACHA20_POLY1305_STREAM64K,
     KEM_MLKEM768X25519,
     KEM_X25519,
+    PASSPHRASE_KDF_ARGON2ID,
+    Argon2idParams,
     EciesSealedPoeError,
     SealedEnvelope,
     SealedPoeOutput,
     SealedSlot,
     ecies_sealed_poe_wrap,
+    passphrase_sealed_poe_seal,
 )
 from cardanowall.estimate import ItemShape, RecordShape, estimate_record_bytes
-from cardanowall.poe_standard import Item, PoeRecord
+from cardanowall.poe_standard import (
+    EncryptionEnvelope,
+    Item,
+    PoeRecord,
+    encode_poe_record,
+    is_arweave_tx_uri,
+    is_fetch_set_uri,
+)
 
 from .invalid_upload_receipt_error import InvalidUploadReceiptError
 from .publish import (
@@ -97,8 +108,33 @@ from .publish import (
     _ResolvedPublishConfig,
     _to_bytes,
     _upload_blob,
+    resolve_hash_algs,
 )
 from .types import PublishResponse, QuoteResponse
+
+# The exact byte length of a detached path-1 COSE_Sign1 (fully fixed-shape).
+# The passphrase quote is exact build-and-measure, so it charges this fixed
+# width for a signed record rather than the shape estimator. Mirrors
+# ``cardanowall.estimate._COSE_SIGN1_PATH1_BYTES``.
+_COSE_SIGN1_PATH1_BYTES = 109
+
+# Default Argon2id work factors for a passphrase seal: the registry floors for
+# memory (m = 65536 KiB) and iterations (t = 3) plus the RFC 9106 §4 recommended
+# parallelism (p = 4). Every SDK uses the same default so a CLI-sealed passphrase
+# record and a web-sealed one share work factors.
+_PASSPHRASE_DEFAULT_M = 65536
+_PASSPHRASE_DEFAULT_T = 3
+_PASSPHRASE_DEFAULT_P = 4
+
+# The 16-byte Argon2id salt drawn per passphrase envelope (the registry floor and
+# product default) and the 24-byte content nonce.
+_PASSPHRASE_SALT_BYTES = 16
+_PASSPHRASE_NONCE_BYTES = 24
+
+# The prefix of the deterministic per-item passphrase upload idempotency key.
+_PASSPHRASE_UPLOAD_KEY_PREFIX = "pwseal1-"  # noqa: S105 — an upload-key prefix, not a secret
+# The domain tag the passphrase-seal fingerprint is computed over.
+_PASSPHRASE_FINGERPRINT_DOMAIN = b"prepared_passphrase_seal_v1"
 
 #: The version literal of the portable prepared-seal serialization.
 PREPARED_SEAL_JSON_VERSION = "prepared_seal_json_v1"
@@ -151,6 +187,10 @@ class SealPrepareError(Exception):
       storage URI per prepared item.
     - ``"INVALID_SUPERSEDES"`` — ``supersedes`` was not the 64-hex hash of
       the superseded transaction.
+    - ``"INVALID_URI"`` — a storage URI is not a well-formed member of the
+      record's ``{ar://, ipfs://}`` fetch set (the same grammar the canonical
+      record validator enforces), so an assembled record would fail local
+      validation on its content URIs.
     - ``"CRYPTO_FAILURE"`` — the sealed-PoE wrap or another cryptographic
       step failed.
     """
@@ -160,6 +200,7 @@ class SealPrepareError(Exception):
     INVALID_RECIPIENT = "INVALID_RECIPIENT"
     URI_COUNT_MISMATCH = "URI_COUNT_MISMATCH"
     INVALID_SUPERSEDES = "INVALID_SUPERSEDES"
+    INVALID_URI = "INVALID_URI"
     CRYPTO_FAILURE = "CRYPTO_FAILURE"
 
     def __init__(self, code: str, message: str) -> None:
@@ -725,7 +766,7 @@ def seal_prepare(
     items: Sequence[bytes | str],
     recipients: Sequence[bytes],
     kem: SupportedKem = "mlkem768x25519",
-    hash_alg: SupportedHashAlg = "sha2-256",
+    hash_algs: Sequence[SupportedHashAlg] = (),
 ) -> PreparedSeal:
     """Seal every item to the shared recipient set, drawing every secret from
     the operating-system CSPRNG. Pure and offline: no I/O, no network.
@@ -738,11 +779,16 @@ def seal_prepare(
     (it would otherwise seal one item per character/byte) — wrap a lone value
     in a list, e.g. ``items=[value]``.
 
+    ``hash_algs`` lists the content-hash algorithms each item is co-hashed
+    under (empty defaults to a single ``sha2-256``); every digest is bound into
+    the envelope's slots MAC. A single algorithm encodes byte-identically to a
+    single-hash seal.
+
     Raises :class:`SealPrepareError` when ``items`` is a bare ``str``/``bytes``
     value, the input carries no items, the recipient set is empty or a key is
     the wrong length for the chosen KEM, or the cryptographic wrap fails.
     """
-    return _prepare(items=items, recipients=recipients, kem=kem, hash_alg=hash_alg, rng=None)
+    return _prepare(items=items, recipients=recipients, kem=kem, hash_algs=hash_algs, rng=None)
 
 
 def seal_prepare_with_rng(
@@ -750,7 +796,7 @@ def seal_prepare_with_rng(
     items: Sequence[bytes | str],
     recipients: Sequence[bytes],
     kem: SupportedKem = "mlkem768x25519",
-    hash_alg: SupportedHashAlg = "sha2-256",
+    hash_algs: Sequence[SupportedHashAlg] = (),
     rng: RngFill,
 ) -> PreparedSeal:
     """Deterministic twin of :func:`seal_prepare` for known-answer tests and
@@ -765,7 +811,7 @@ def seal_prepare_with_rng(
 
     Raises the same :class:`SealPrepareError` cases as :func:`seal_prepare`.
     """
-    return _prepare(items=items, recipients=recipients, kem=kem, hash_alg=hash_alg, rng=rng)
+    return _prepare(items=items, recipients=recipients, kem=kem, hash_algs=hash_algs, rng=rng)
 
 
 def _prepare(
@@ -773,7 +819,7 @@ def _prepare(
     items: Sequence[bytes | str],
     recipients: Sequence[bytes],
     kem: SupportedKem,
-    hash_alg: SupportedHashAlg,
+    hash_algs: Sequence[SupportedHashAlg],
     rng: RngFill | None,
 ) -> PreparedSeal:
     """The shared prepare path: ``rng is None`` sources secrets from the OS
@@ -809,11 +855,15 @@ def _prepare(
             f"a recipient public key is not {expected_length} bytes for kem={kem!r}",
         )
 
+    resolved_algs = resolve_hash_algs(None, hash_algs)
     prepared_items: list[PreparedSealItem] = []
     for item in items:
         content = bytes(_to_bytes(item))
-        digest = _hash_content(content, hash_alg)
-        hashes: dict[str, bytes] = {hash_alg: digest}
+        # Every digest is bound into the slot-set MAC, so the envelope commits
+        # to exactly the `hashes` map this record will carry. A single algorithm
+        # produces the same one-entry map (and identical bytes) as before
+        # co-hashing.
+        hashes: dict[str, bytes] = {alg: _hash_content(content, alg) for alg in resolved_algs}
         try:
             if rng is None:
                 sealed = ecies_sealed_poe_wrap(
@@ -830,7 +880,10 @@ def _prepare(
             PreparedSealItem(
                 item_id=sha256(sealed.ciphertext).hex(),
                 ciphertext=sealed.ciphertext,
-                hashes=((hash_alg, digest),),
+                # The item's hash map is sorted by algorithm id (byte order) so
+                # it matches the canonical order the record encoder and the
+                # portable serialization both emit.
+                hashes=tuple(sorted(hashes.items(), key=lambda pair: pair[0].encode("utf-8"))),
                 envelope=sealed.envelope,
             )
         )
@@ -932,6 +985,21 @@ def _shuffled_order(count: int, rng: RngFill) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
+def _validate_fetch_set_uris(uris: Sequence[str]) -> None:
+    """Reject any storage URI that is not a well-formed fetch-set member before
+    it is embedded as a record URI. This is the one seam every sealed URI — a
+    fresh gateway upload, a resumed receipt, or an air-gapped caller's
+    out-of-band URI — flows through on its way into the record, and it enforces
+    the exact grammar the canonical validator uses, so no assembled record can
+    carry a URI a downstream verifier would reject."""
+    for uri in uris:
+        if not is_fetch_set_uri(uri):
+            raise SealPrepareError(
+                SealPrepareError.INVALID_URI,
+                f"{uri!r} is not a valid ar:// or ipfs:// fetch-set uri",
+            )
+
+
 def sealed_record(
     prepared: PreparedSeal,
     uris: Sequence[str],
@@ -945,14 +1013,15 @@ def sealed_record(
     replaces, when any.
 
     Raises :class:`SealPrepareError` with code ``URI_COUNT_MISMATCH`` on a
-    wrong URI count and ``INVALID_SUPERSEDES`` on a malformed supersedes
-    hash.
+    wrong URI count, ``INVALID_URI`` when a storage URI is not a fetch-set
+    member, and ``INVALID_SUPERSEDES`` on a malformed supersedes hash.
     """
     if len(uris) != len(prepared.items):
         raise SealPrepareError(
             SealPrepareError.URI_COUNT_MISMATCH,
             f"expected {len(prepared.items)} storage uri(s), one per item, got {len(uris)}",
         )
+    _validate_fetch_set_uris(uris)
     supersedes_bytes = _parse_supersedes_hex(supersedes) if supersedes is not None else None
     items: list[Item] = []
     for prepared_item, uri in zip(prepared.items, uris, strict=True):
@@ -1181,8 +1250,12 @@ def _validate_receipts(
 ) -> dict[int, UploadReceipt]:
     """Validate resume receipts against the prepared material, keyed by item
     index. Every field must match — an unknown ``item_id``, a digest or byte
-    count that differs from the prepared ciphertext, an empty URI, or a
-    duplicate receipt is rejected outright rather than skipped."""
+    count that differs from the prepared ciphertext, a URI that is not a valid
+    Arweave ``ar://<43-char txid>`` (a sealed ciphertext is always stored on
+    Arweave, so the receipt URI is fixed-width — this both rejects a
+    hand-crafted URI that would fail canonical validation and keeps the
+    pre-upload exact-size quote exact), or a duplicate receipt is rejected
+    outright rather than skipped."""
     by_index: dict[int, UploadReceipt] = {}
     # First match wins when two prepared items share an item_id (identical
     # ciphertext): a receipt resolves to the earliest such item, matching the
@@ -1207,8 +1280,11 @@ def _validate_receipts(
                 f"receipt for {receipt.item_id} declares {receipt.bytes} byte(s), "
                 f"prepared ciphertext is {len(item.ciphertext)}"
             )
-        if not receipt.uri:
-            raise InvalidUploadReceiptError(f"receipt for {receipt.item_id} carries an empty uri")
+        if not is_arweave_tx_uri(receipt.uri):
+            raise InvalidUploadReceiptError(
+                f"receipt for {receipt.item_id} carries {receipt.uri!r}, "
+                "not a valid Arweave ar://<43-char txid> uri"
+            )
         if index in by_index:
             raise InvalidUploadReceiptError(f"duplicate receipt for {receipt.item_id}")
         # Rebuilt rather than stored as passed: a caller-held bytearray digest
@@ -1238,7 +1314,9 @@ class PublishSealedInput(TypedDict, total=False):
 
     items: Sequence[bytes | str]  # required
     recipients: Sequence[bytes]  # required
-    hash_alg: SupportedHashAlg
+    # The content-hash algorithms each item is co-hashed under (empty defaults
+    # to a single sha2-256); every digest is bound into the slots MAC.
+    hash_algs: Sequence[SupportedHashAlg]
     kem: SupportedKem
     signer: Signer
     # Refuse to publish when the quoted price exceeds this many USD
@@ -1255,7 +1333,7 @@ async def publish_sealed(
     *,
     items: Sequence[bytes | str],
     recipients: Sequence[bytes],
-    hash_alg: SupportedHashAlg = "sha2-256",
+    hash_algs: Sequence[SupportedHashAlg] = (),
     kem: SupportedKem = "mlkem768x25519",
     signer: Signer | None = None,
     max_usd_micros: int | None = None,
@@ -1270,13 +1348,576 @@ async def publish_sealed(
     must resume (CI jobs, large ciphertexts) runs the two phases itself and
     persists the :class:`PreparedSeal` and the :class:`UploadReceipt` s.
 
+    ``hash_algs`` co-hashes each item under several content-hash algorithms
+    (empty defaults to a single ``sha2-256``).
+
     Raises :class:`SubmitSealedError`; see :func:`submit_sealed`.
     """
     try:
-        prepared = seal_prepare(items=items, recipients=recipients, kem=kem, hash_alg=hash_alg)
+        prepared = seal_prepare(items=items, recipients=recipients, kem=kem, hash_algs=hash_algs)
     except Exception as cause:
         raise SubmitSealedError((), cause) from cause
     return await submit_sealed(
+        config,
+        prepared=prepared,
+        signer=signer,
+        max_usd_micros=max_usd_micros,
+        supersedes=supersedes,
+        idempotency_key=idempotency_key,
+        chunk_bytes=chunk_bytes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Passphrase sealed publishing (the shared-secret key path)
+# ---------------------------------------------------------------------------
+#
+# A passphrase seal delivers the content key through an Argon2id-stretched
+# passphrase instead of per-recipient KEM slots, so its envelope carries a
+# ``passphrase`` block (``{alg, salt, params}``) and no ``slots`` / ``slots_mac``
+# / ``kem``. It mirrors the recipient two-phase surface: an offline
+# :func:`passphrase_seal_prepare`, a :func:`quote_prepared_passphrase_seal` price
+# preview, and an online :func:`submit_passphrase_sealed` with resumable
+# :class:`UploadReceipt` s — so a caller prepares and publishes a
+# passphrase-sealed record with the same crash-safety as the recipient path.
+#
+# The prepared passphrase seal has no portable ``to_json`` form: there is nothing
+# recipient-blind to serialize (the passphrase itself is the whole secret), so
+# resumability comes from the :class:`UploadReceipt` s alone.
+
+
+@dataclass(frozen=True)
+class PassphraseKdfParams:
+    """The Argon2id cost parameters a passphrase seal is built under.
+
+    The default is the product's producer default: the registry floors for
+    memory (``m = 65536`` KiB) and iterations (``t = 3``) plus the RFC 9106 §4
+    recommended parallelism (``p = 4``). Every SDK uses the same default so a
+    CLI-sealed passphrase record and a web-sealed one share work factors.
+    """
+
+    #: Argon2id memory cost in KiB (``>= 65536``).
+    m: int = _PASSPHRASE_DEFAULT_M
+    #: Argon2id iteration count (``>= 3``).
+    t: int = _PASSPHRASE_DEFAULT_T
+    #: Argon2id parallelism (``>= 1``).
+    p: int = _PASSPHRASE_DEFAULT_P
+
+
+@dataclass(frozen=True)
+class PreparedPassphraseItem:
+    """One prepared passphrase item: the sealed form of one plaintext."""
+
+    #: Lowercase-hex SHA-256 of the ciphertext — the item's stable identity.
+    item_id: str
+    #: The ``commitment(32) || STREAM`` ciphertext blob destined for storage.
+    ciphertext: bytes
+    #: The item's content-hash claims as ``(algorithm id, digest)`` pairs,
+    #: sorted by algorithm id (byte order). Bound into the in-ciphertext key
+    #: commitment.
+    hashes: tuple[tuple[str, bytes], ...]
+    #: The per-item Argon2id salt carried in the on-chain ``passphrase`` block.
+    salt: bytes
+    #: The per-item 24-byte content nonce.
+    nonce: bytes
+    #: The Argon2id cost parameters carried in the ``passphrase`` block.
+    params: PassphraseKdfParams
+
+
+@dataclass(frozen=True)
+class PreparedPassphraseSeal:
+    """The phase-1 artifact of a passphrase seal: every item sealed, nothing
+    uploaded. Unlike the recipient :class:`PreparedSeal` there is no portable
+    ``to_json`` form — resumability comes from the :class:`UploadReceipt` s."""
+
+    #: The prepared items, in input order.
+    items: tuple[PreparedPassphraseItem, ...]
+    #: Lowercase-hex SHA-256 fingerprint over the prepared items' identities.
+    prepared_sha256: str
+
+    def upload_idempotency_key(self, item_index: int) -> str:
+        """The deterministic idempotency key for the item's ciphertext upload:
+        ``"pwseal1-" + prepared_sha256[:32] + "-" + item_index``.
+
+        Deriving the key from the artifact (not from upload-time randomness)
+        lets a crash-and-retry replay the original upload instead of paying for
+        a second one.
+
+        Raises :class:`IndexError` if ``item_index`` is out of range.
+        """
+        if not 0 <= item_index < len(self.items):
+            raise IndexError(
+                f"item_index {item_index} out of range for {len(self.items)} prepared item(s)"
+            )
+        fingerprint_prefix = self.prepared_sha256[:_UPLOAD_KEY_FINGERPRINT_CHARS]
+        return f"{_PASSPHRASE_UPLOAD_KEY_PREFIX}{fingerprint_prefix}-{item_index}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — passphrase_seal_prepare
+# ---------------------------------------------------------------------------
+
+
+def passphrase_seal_prepare(
+    *,
+    items: Sequence[bytes | str],
+    passphrase: str,
+    hash_algs: Sequence[SupportedHashAlg] = (),
+    params: PassphraseKdfParams | None = None,
+) -> PreparedPassphraseSeal:
+    """Seal every item under the shared passphrase, drawing every salt and
+    nonce from the operating-system CSPRNG. Pure and offline: no I/O, no
+    network.
+
+    ``items`` must be a sequence of items; a bare ``str``/``bytes`` value is
+    rejected (it would otherwise seal one item per character/byte). ``hash_algs``
+    co-hashes each item under several content-hash algorithms (empty defaults to
+    a single ``sha2-256``); every digest is bound into the in-ciphertext key
+    commitment.
+
+    Raises :class:`SealPrepareError` when ``items`` is a bare ``str``/``bytes``
+    value, the input carries no items, or the cryptographic seal fails (a
+    passphrase that normalizes to the empty string, below-floor Argon2id
+    parameters, or an unavailable OS CSPRNG).
+    """
+    return _prepare_passphrase(
+        items=items, passphrase=passphrase, hash_algs=hash_algs, params=params, rng=None
+    )
+
+
+def passphrase_seal_prepare_with_rng(
+    *,
+    items: Sequence[bytes | str],
+    passphrase: str,
+    hash_algs: Sequence[SupportedHashAlg] = (),
+    params: PassphraseKdfParams | None = None,
+    rng: RngFill,
+) -> PreparedPassphraseSeal:
+    """Deterministic twin of :func:`passphrase_seal_prepare` for known-answer
+    tests: every salt and nonce is drawn from the caller-supplied ``rng``, in
+    item order (salt before nonce per item).
+
+    **Not secure for production use**: ``rng`` carries the salt/nonce
+    separation guarantee — a weak source yields predictable salts with no
+    error. Production code calls :func:`passphrase_seal_prepare`.
+
+    Raises the same :class:`SealPrepareError` cases as
+    :func:`passphrase_seal_prepare`.
+    """
+    return _prepare_passphrase(
+        items=items, passphrase=passphrase, hash_algs=hash_algs, params=params, rng=rng
+    )
+
+
+def _draw_passphrase_bytes(rng: RngFill | None, count: int) -> bytes:
+    """Draw ``count`` bytes from the supplied RNG, or the OS CSPRNG when none is
+    given."""
+    if rng is None:
+        return secrets.token_bytes(count)
+    return _draw(rng, count)
+
+
+def _prepare_passphrase(
+    *,
+    items: Sequence[bytes | str],
+    passphrase: str,
+    hash_algs: Sequence[SupportedHashAlg],
+    params: PassphraseKdfParams | None,
+    rng: RngFill | None,
+) -> PreparedPassphraseSeal:
+    """The shared passphrase-prepare path: ``rng is None`` sources secrets from
+    the OS CSPRNG."""
+    if isinstance(items, (str, bytes, bytearray)):
+        raise SealPrepareError(
+            SealPrepareError.INVALID_ITEMS,
+            "items must be a sequence of items (each bytes or str), not a single "
+            "str or bytes value; wrap a lone value in a list, e.g. items=[value]",
+        )
+    if len(items) == 0:
+        raise SealPrepareError(SealPrepareError.NO_ITEMS, "at least one item is required")
+    effective_params = params if params is not None else PassphraseKdfParams()
+    crypto_params = Argon2idParams(m=effective_params.m, t=effective_params.t, p=effective_params.p)
+    resolved_algs = resolve_hash_algs(None, hash_algs)
+
+    prepared_items: list[PreparedPassphraseItem] = []
+    for item in items:
+        content = bytes(_to_bytes(item))
+        # Salt precedes nonce per item; the pinned draw order keeps the
+        # deterministic KAT identical across SDKs.
+        salt = _draw_passphrase_bytes(rng, _PASSPHRASE_SALT_BYTES)
+        nonce = _draw_passphrase_bytes(rng, _PASSPHRASE_NONCE_BYTES)
+        # Every digest is bound into the in-ciphertext key commitment, so the
+        # envelope commits to exactly the `hashes` map this record will carry.
+        hashes: dict[str, bytes] = {alg: _hash_content(content, alg) for alg in resolved_algs}
+        try:
+            sealed = passphrase_sealed_poe_seal(
+                plaintext=content,
+                passphrase=passphrase,
+                hashes=hashes,
+                params=crypto_params,
+                salt=salt,
+                nonce=nonce,
+            )
+        except EciesSealedPoeError as e:
+            raise SealPrepareError(SealPrepareError.CRYPTO_FAILURE, str(e)) from e
+        prepared_items.append(
+            PreparedPassphraseItem(
+                item_id=sha256(sealed.ciphertext).hex(),
+                ciphertext=sealed.ciphertext,
+                hashes=tuple(sorted(hashes.items(), key=lambda pair: pair[0].encode("utf-8"))),
+                salt=salt,
+                nonce=nonce,
+                params=effective_params,
+            )
+        )
+
+    prepared_sha256 = _passphrase_fingerprint(prepared_items)
+    return PreparedPassphraseSeal(items=tuple(prepared_items), prepared_sha256=prepared_sha256)
+
+
+def _passphrase_fingerprint(items: Sequence[PreparedPassphraseItem]) -> str:
+    """The lowercase-hex SHA-256 fingerprint over the prepared items: the domain
+    tag followed by each item's ``item_id`` (as ASCII) in order. Each ciphertext
+    (and thus its ``item_id``) already binds the passphrase, salt, params,
+    nonce, and hashes, so this is a complete content fingerprint of the prepared
+    set."""
+    buf = bytearray(_PASSPHRASE_FINGERPRINT_DOMAIN)
+    for item in items:
+        buf.extend(item.item_id.encode("ascii"))
+    return sha256(bytes(buf)).hex()
+
+
+# ---------------------------------------------------------------------------
+# Passphrase pure assembly seams
+# ---------------------------------------------------------------------------
+
+
+def _passphrase_envelope_to_wire(item: PreparedPassphraseItem) -> EncryptionEnvelope:
+    """Build the record ``enc`` block for one prepared passphrase item: the
+    scheme-1 envelope with a ``passphrase`` key path and no slots. The ``params``
+    map emits in canonical-CBOR key order (``m``, ``p``, ``t``) by the encoder."""
+    return cast(
+        "EncryptionEnvelope",
+        {
+            "scheme": 1,
+            "aead": AEAD_CHACHA20_POLY1305_STREAM64K,
+            "nonce": item.nonce,
+            "passphrase": {
+                "alg": PASSPHRASE_KDF_ARGON2ID,
+                "salt": item.salt,
+                "params": {"m": item.params.m, "t": item.params.t, "p": item.params.p},
+            },
+        },
+    )
+
+
+def passphrase_sealed_record(
+    prepared: PreparedPassphraseSeal,
+    uris: Sequence[str],
+    supersedes: str | None = None,
+) -> PoeRecord:
+    """Assemble the Label 309 record from prepared passphrase material and the
+    uploaded storage URIs.
+
+    ``uris`` must carry exactly one storage URI per prepared item, in item
+    order. ``supersedes`` is the 64-hex hash of the transaction this record
+    replaces, when any.
+
+    Raises :class:`SealPrepareError` with code ``URI_COUNT_MISMATCH`` on a
+    wrong URI count, ``INVALID_URI`` when a storage URI is not a fetch-set
+    member, and ``INVALID_SUPERSEDES`` on a malformed supersedes hash.
+    """
+    if len(uris) != len(prepared.items):
+        raise SealPrepareError(
+            SealPrepareError.URI_COUNT_MISMATCH,
+            f"expected {len(prepared.items)} storage uri(s), one per item, got {len(uris)}",
+        )
+    _validate_fetch_set_uris(uris)
+    supersedes_bytes = _parse_supersedes_hex(supersedes) if supersedes is not None else None
+    items: list[Item] = []
+    for prepared_item, uri in zip(prepared.items, uris, strict=True):
+        items.append(
+            {
+                "hashes": cast("dict[SupportedHashAlg, bytes]", dict(prepared_item.hashes)),
+                "uris": [uri],
+                "enc": _passphrase_envelope_to_wire(prepared_item),
+            }
+        )
+    record: PoeRecord = {"v": 1, "items": items}
+    if supersedes_bytes is not None:
+        record["supersedes"] = supersedes_bytes
+    return record
+
+
+async def encode_passphrase_sealed_record(
+    prepared: PreparedPassphraseSeal,
+    uris: Sequence[str],
+    supersedes: str | None = None,
+    signer: Signer | None = None,
+) -> bytes:
+    """Canonical-bytes twin of :func:`passphrase_sealed_record`: assemble the
+    record and encode it, attaching a path-1 COSE_Sign1 first when a signer is
+    supplied. Air-gapped flows archive these exact bytes.
+
+    Raises :class:`SealPrepareError`, :class:`~.publish.PublishError`, or an
+    encoding error on an assembly, signer, or encoding failure.
+    """
+    if signer is not None:
+        _assert_signer(signer)
+    record = passphrase_sealed_record(prepared, uris, supersedes)
+    return await _encode_record(record, signer)
+
+
+def _passphrase_quote_request(
+    prepared: PreparedPassphraseSeal, *, signed: bool, supersedes: str | None
+) -> _QuoteRequest:
+    """The byte counts a prepared passphrase seal is priced against.
+
+    Unlike the recipient path (whose slot count feeds a size estimate), a
+    passphrase envelope is fixed-shape, so the record side is measured exactly:
+    assemble the record over fixed-width ``ar://`` URI placeholders — plus a
+    fixed-width path-1 signature placeholder when signed — and canonically
+    encode it. A real ``ar://`` URI and a real path-1 COSE_Sign1 are both
+    fixed-width, so the measured length is the exact published ``record_bytes``.
+    """
+    placeholders = [_arweave_uri_placeholder() for _ in prepared.items]
+    record = passphrase_sealed_record(prepared, placeholders, supersedes)
+    if signed:
+        record["sigs"] = [{"cose_sign1": b"\x00" * _COSE_SIGN1_PATH1_BYTES}]
+    return _QuoteRequest(
+        record_bytes=len(encode_poe_record(record)),
+        recipient_count=0,
+        file_bytes_total=sum(len(item.ciphertext) for item in prepared.items),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Passphrase quoting
+# ---------------------------------------------------------------------------
+
+
+async def quote_prepared_passphrase_seal(
+    config: _ResolvedPublishConfig,
+    *,
+    prepared: PreparedPassphraseSeal,
+    signer: Signer | None = None,
+    supersedes: str | None = None,
+) -> QuoteResponse:
+    """Price a prepared passphrase seal without uploading anything — the preview
+    UIs show before the user commits to storage.
+
+    ``signer`` and ``supersedes`` only affect the price through their presence
+    (a signed or superseding record is larger); the signer is not invoked.
+
+    Raises a signer-shape or HTTP error.
+    """
+    if signer is not None:
+        _assert_signer(signer)
+    request = _passphrase_quote_request(prepared, signed=signer is not None, supersedes=supersedes)
+    return await _post_quote(config, request)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — submit_passphrase_sealed
+# ---------------------------------------------------------------------------
+
+
+async def submit_passphrase_sealed(
+    config: _ResolvedPublishConfig,
+    *,
+    prepared: PreparedPassphraseSeal,
+    signer: Signer | None = None,
+    max_usd_micros: int | None = None,
+    quote: QuoteResponse | None = None,
+    supersedes: str | None = None,
+    idempotency_key: str | None = None,
+    chunk_bytes: int | None = None,
+    uploaded: Sequence[UploadReceipt] = (),
+) -> SealedSubmission:
+    """Submit a prepared passphrase seal: quote → price-cap check → per-item
+    ciphertext upload (skipping items covered by validated receipts) → quote
+    refresh if an upload outlived the price lock → encode (optionally sign) →
+    publish.
+
+    Uploads carry the deterministic per-item idempotency key
+    (:meth:`PreparedPassphraseSeal.upload_idempotency_key`), so a
+    crash-and-retry of the same prepared item can never pay for its storage
+    twice.
+
+    Raises :class:`SubmitSealedError`; when the failure happened after any
+    upload completed, :attr:`SubmitSealedError.uploads` carries the finished
+    receipts — persist them and resume via ``uploaded``.
+    """
+    try:
+        if signer is not None:
+            _assert_signer(signer)
+        if supersedes is not None:
+            _parse_supersedes_hex(supersedes)
+        resumed = _validate_passphrase_receipts(prepared, uploaded)
+    except Exception as cause:
+        raise SubmitSealedError((), cause) from cause
+
+    def resumed_receipts() -> list[UploadReceipt]:
+        return [receipt for _, receipt in sorted(resumed.items())]
+
+    request = _passphrase_quote_request(prepared, signed=signer is not None, supersedes=supersedes)
+    if quote is not None and _quote_is_fresh(quote):
+        active_quote = cast("QuoteResponse", dict(quote))
+    else:
+        try:
+            active_quote = await _post_quote(config, request)
+        except Exception as cause:
+            raise SubmitSealedError(resumed_receipts(), cause) from cause
+    try:
+        _enforce_max_usd_micros(max_usd_micros, active_quote)
+    except Exception as cause:
+        raise SubmitSealedError(resumed_receipts(), cause) from cause
+
+    uploads: list[UploadReceipt] = []
+    for index, item in enumerate(prepared.items):
+        receipt = resumed.pop(index, None)
+        if receipt is not None:
+            uploads.append(receipt)
+            continue
+        key = prepared.upload_idempotency_key(index)
+        try:
+            uri = await _upload_blob(config, item.ciphertext, key, chunk_bytes)
+        except Exception as cause:
+            uploads.extend(receipt for _, receipt in sorted(resumed.items()))
+            raise SubmitSealedError(uploads, cause) from cause
+        uploads.append(
+            UploadReceipt(
+                item_id=item.item_id,
+                uri=uri,
+                ciphertext_sha256=sha256(item.ciphertext),
+                bytes=len(item.ciphertext),
+            )
+        )
+
+    try:
+        active_quote = await _refresh_quote_if_stale(config, active_quote, request, max_usd_micros)
+        uris = tuple(receipt.uri for receipt in uploads)
+        record_bytes = await encode_passphrase_sealed_record(
+            prepared, uris, supersedes=supersedes, signer=signer
+        )
+        response = await _post_publish(
+            config, record_bytes.hex(), active_quote["quote_id"], idempotency_key
+        )
+    except Exception as cause:
+        raise SubmitSealedError(uploads, cause) from cause
+
+    return SealedSubmission(
+        response=response,
+        record_bytes=record_bytes,
+        uris=uris,
+        uploads=tuple(uploads),
+        quote=active_quote,
+    )
+
+
+def _validate_passphrase_receipts(
+    prepared: PreparedPassphraseSeal, uploaded: Sequence[UploadReceipt]
+) -> dict[int, UploadReceipt]:
+    """Validate resume receipts against the prepared passphrase material, keyed
+    by item index. Every field must match — an unknown ``item_id``, a digest or
+    byte count that differs from the prepared ciphertext, a URI that is not a
+    valid Arweave ``ar://<43-char txid>``, or a duplicate receipt is rejected
+    outright rather than skipped."""
+    by_index: dict[int, UploadReceipt] = {}
+    item_index_by_id: dict[str, int] = {}
+    for i, item in enumerate(prepared.items):
+        item_index_by_id.setdefault(item.item_id, i)
+    for receipt in uploaded:
+        index = item_index_by_id.get(receipt.item_id)
+        if index is None:
+            raise InvalidUploadReceiptError(
+                f"item_id {receipt.item_id} does not belong to the prepared passphrase seal"
+            )
+        item = prepared.items[index]
+        if bytes(receipt.ciphertext_sha256) != sha256(item.ciphertext):
+            raise InvalidUploadReceiptError(
+                f"receipt for {receipt.item_id} has a ciphertext_sha256 that does not "
+                "match the prepared ciphertext"
+            )
+        if receipt.bytes != len(item.ciphertext):
+            raise InvalidUploadReceiptError(
+                f"receipt for {receipt.item_id} declares {receipt.bytes} byte(s), "
+                f"prepared ciphertext is {len(item.ciphertext)}"
+            )
+        if not is_arweave_tx_uri(receipt.uri):
+            raise InvalidUploadReceiptError(
+                f"receipt for {receipt.item_id} carries {receipt.uri!r}, "
+                "not a valid Arweave ar://<43-char txid> uri"
+            )
+        if index in by_index:
+            raise InvalidUploadReceiptError(f"duplicate receipt for {receipt.item_id}")
+        by_index[index] = UploadReceipt(
+            item_id=receipt.item_id,
+            uri=receipt.uri,
+            ciphertext_sha256=bytes(receipt.ciphertext_sha256),
+            bytes=receipt.bytes,
+        )
+    return by_index
+
+
+# ---------------------------------------------------------------------------
+# Passphrase one-shot wrapper
+# ---------------------------------------------------------------------------
+
+
+class PublishPassphraseSealedInput(TypedDict, total=False):
+    """Keyword arguments of :py:meth:`PoeNamespace.publish_passphrase_sealed`.
+
+    The helper quotes internally from the exact build-and-measure record size;
+    there is no caller-supplied quote id. Flows that must survive a crash
+    (resume uploads from receipts) use the two-phase
+    :func:`passphrase_seal_prepare` / :func:`submit_passphrase_sealed` surface
+    instead.
+    """
+
+    items: Sequence[bytes | str]  # required
+    passphrase: str  # required
+    hash_algs: Sequence[SupportedHashAlg]
+    params: PassphraseKdfParams
+    signer: Signer
+    # Refuse to publish when the quoted price exceeds this many USD
+    # micro-cents (1 USD = 1,000,000).
+    max_usd_micros: int
+    # The 64-hex transaction hash of the record this one supersedes.
+    supersedes: str
+    idempotency_key: str
+    chunk_bytes: int
+
+
+async def publish_passphrase_sealed(
+    config: _ResolvedPublishConfig,
+    *,
+    items: Sequence[bytes | str],
+    passphrase: str,
+    hash_algs: Sequence[SupportedHashAlg] = (),
+    params: PassphraseKdfParams | None = None,
+    signer: Signer | None = None,
+    max_usd_micros: int | None = None,
+    supersedes: str | None = None,
+    idempotency_key: str | None = None,
+    chunk_bytes: int | None = None,
+) -> SealedSubmission:
+    """One-shot passphrase publish: :func:`passphrase_seal_prepare` followed by
+    :func:`submit_passphrase_sealed`.
+
+    Convenient when nothing needs to survive a process crash; a flow that must
+    resume runs the two phases itself and persists the
+    :class:`UploadReceipt` s.
+
+    Raises :class:`SubmitSealedError`; see :func:`submit_passphrase_sealed`.
+    """
+    try:
+        prepared = passphrase_seal_prepare(
+            items=items, passphrase=passphrase, hash_algs=hash_algs, params=params
+        )
+    except Exception as cause:
+        raise SubmitSealedError((), cause) from cause
+    return await submit_passphrase_sealed(
         config,
         prepared=prepared,
         signer=signer,
@@ -1327,20 +1968,31 @@ def _is_lowercase_hex(text: str, length: int) -> bool:
 __all__ = [
     "PREPARED_SEAL_JSON_VERSION",
     "InvalidUploadReceiptError",
+    "PassphraseKdfParams",
+    "PreparedPassphraseItem",
+    "PreparedPassphraseSeal",
     "PreparedSeal",
     "PreparedSealItem",
     "PreparedSealJsonError",
+    "PublishPassphraseSealedInput",
     "PublishSealedInput",
     "RngFill",
     "SealPrepareError",
     "SealedSubmission",
     "SubmitSealedError",
     "UploadReceipt",
+    "encode_passphrase_sealed_record",
     "encode_sealed_record",
+    "passphrase_seal_prepare",
+    "passphrase_seal_prepare_with_rng",
+    "passphrase_sealed_record",
+    "publish_passphrase_sealed",
     "publish_sealed",
+    "quote_prepared_passphrase_seal",
     "quote_prepared_seal",
     "seal_prepare",
     "seal_prepare_with_rng",
     "sealed_record",
+    "submit_passphrase_sealed",
     "submit_sealed",
 ]

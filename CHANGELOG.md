@@ -9,6 +9,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > change in backward-incompatible ways until a 1.0 release. Pre-1.0 versions do
 > not carry the stability guarantees of [Semantic Versioning](https://semver.org/).
 
+## [0.11.0] - 2026-07-06
+
+### Added
+
+- Passphrase two-phase sealed publishing on a dedicated surface — `passphrase_seal_prepare` then `submit_passphrase_sealed` (or the one-shot `publish_passphrase_sealed`), all exported from the package root. Every item's content-encryption key is wrapped by an Argon2id-derived key (`PassphraseKdfParams`, defaults `m=65536, t=3, p=4`) so anyone holding the passphrase can open the record, and `quote_prepared_passphrase_seal` / `passphrase_sealed_record` / `encode_passphrase_sealed_record` give the passphrase path the same quote-preview / offline-prepare / air-gap seams as the recipient path.
+- Co-hash support. `resolve_hash_algs` accepts a plural set of hash algorithms so a prepared, content, or pre-hashed input can commit to the same content under more than one digest; the item record lists every co-hash. Sealed prepare accepts the same multi-hash set. The vector loader still accepts the singular `hash_alg`, so existing callers are unaffected.
+- Plural `uris` and `supersedes` on content and pre-hashed inputs (`parse_supersedes_hex`, fetch-set URI validation), mirroring the fields already available on the sealed and Merkle inputs.
+
+### Changed
+
+- Secret-bearing values now self-redact: a recipient key bundle and the prepared-seal secrets render a count-only summary through `repr()`, so a stray log line or serialized error can no longer leak a recipient private key or a sealed plaintext. Mirrors the Rust SDK's redacting `Debug`.
+- The structural validator accepts co-hash item records (an item carrying more than one hash of the same content), and the fetch-set URI predicates are single-sourced so the three SDKs validate URIs identically.
+
 ## [0.10.0] - 2026-07-05
 
 ### Breaking

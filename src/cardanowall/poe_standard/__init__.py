@@ -43,6 +43,9 @@ from .validator import (
     ValidateResult,
     ValidationIssue,
     ValidatorRole,
+    fetch_set_uri_rejection,
+    is_arweave_tx_uri,
+    is_fetch_set_uri,
     validate,
 )
 
@@ -83,7 +86,10 @@ __all__ = [
     "encode_poe_record",
     "encode_record_body_for_signing",
     "error_code_registry_index",
+    "fetch_set_uri_rejection",
+    "is_arweave_tx_uri",
     "is_extension_key",
+    "is_fetch_set_uri",
     "is_valid_cid",
     "severity_of",
     "validate",

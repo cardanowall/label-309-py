@@ -824,54 +824,82 @@ _URI_SCHEME_RE: Final[re.Pattern[str]] = re.compile(r"\A[a-z][a-z0-9+.\-]*\Z", r
 _ARWEAVE_TXID_BODY_RE: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9_-]{43}\Z")
 
 
-def _check_one_uri(uri: str, path: _Path, issues: list[ValidationIssue]) -> None:
-    # Absolute URI, no fragment, scheme in `{ar://, ipfs://}`.
+def _is_arweave_txid(body: str) -> bool:
+    """Whether ``body`` is a valid Arweave transaction id: exactly 43 unpadded
+    base64url characters (``[A-Za-z0-9_-]``)."""
+    return _ARWEAVE_TXID_BODY_RE.match(body) is not None
+
+
+def fetch_set_uri_rejection(uri: str) -> str | None:
+    """The specific reason ``uri`` is not a well-formed member of a record's
+    fetch set, or ``None`` when it is. This is the single source of truth for
+    the fetch-set URI grammar: an absolute URI with no fragment, a scheme in
+    ``{ar://, ipfs://}``, an ``ar://`` body of exactly 43 base64url characters
+    (an Arweave txid), or an ``ipfs://`` body whose first path segment is a CID
+    valid under the Label 309 profile. RFC 3986 §3.1: the scheme is
+    case-insensitive, so the SCHEME alone is case-folded; the body is matched
+    verbatim — a base64url Arweave txid and a base58btc CID are both
+    case-significant.
+
+    The canonical record validator and every producer-side pre-check delegate
+    here, so a producer can never emit a URI a downstream verifier would reject.
+    """
     if "#" in uri:
-        issues.append(
-            _issue(
-                "INVALID_URI",
-                path,
-                "URI contains a fragment identifier ('#'), which is forbidden",
-            )
-        )
-        return
+        return "URI contains a fragment identifier ('#'), which is forbidden"
     sep_idx = uri.find("://")
     if sep_idx <= 0 or _URI_SCHEME_RE.match(uri[:sep_idx]) is None:
-        issues.append(
-            _issue("INVALID_URI", path, "URI is not absolute (missing scheme://hierarchical-part)")
-        )
-        return
-    # RFC 3986 §3.1: the scheme is case-insensitive, so case-fold the SCHEME
-    # ONLY, then ALWAYS validate the body. The body is matched verbatim — a
-    # base64url Arweave txid and a base58btc CID are case-significant.
+        return "URI is not absolute (missing scheme://hierarchical-part)"
     scheme = uri[:sep_idx].lower()
     rest = uri[sep_idx + len("://") :]
     if scheme == "ar":
-        if _ARWEAVE_TXID_BODY_RE.match(rest) is None:
-            issues.append(
-                _issue(
-                    "INVALID_URI",
-                    path,
-                    "ar:// URI does not match `^ar://[A-Za-z0-9_-]{43}$` "
-                    "(43-char base64url txid, no path/query/fragment)",
-                )
-            )
-        return
+        if _is_arweave_txid(rest):
+            return None
+        return (
+            "ar:// URI does not match `^ar://[A-Za-z0-9_-]{43}$` "
+            "(43-char base64url txid, no path/query/fragment)"
+        )
     if scheme == "ipfs":
         # Full offline CID parse (not a prefix heuristic).
         cid = rest.split("/", 1)[0]
-        if not is_valid_cid(cid):
-            issues.append(
-                _issue(
-                    "INVALID_URI",
-                    path,
-                    "ipfs:// URI is not a valid CID under the Label 309 profile",
-                )
-            )
-        return
-    issues.append(
-        _issue("INVALID_URI", path, "unsupported URI scheme; v1 PoE URI set is {ar://, ipfs://}")
-    )
+        if is_valid_cid(cid):
+            return None
+        return "ipfs:// URI is not a valid CID under the Label 309 profile"
+    return "unsupported URI scheme; v1 PoE URI set is {ar://, ipfs://}"
+
+
+def is_fetch_set_uri(uri: str) -> bool:
+    """Whether ``uri`` is a well-formed member of a record's fetch set under the
+    strict Label 309 grammar (see :func:`fetch_set_uri_rejection`). Producer
+    helpers call this to reject a malformed content or mirror URI early, using
+    the exact grammar the canonical record validator enforces — the early check
+    and the canonical check can never diverge because they are the same
+    function."""
+    return fetch_set_uri_rejection(uri) is None
+
+
+def is_arweave_tx_uri(uri: str) -> bool:
+    """Whether ``uri`` is an absolute Arweave transaction URI: ``ar://`` followed
+    by a valid 43-character base64url txid, with no fragment, path, or query.
+
+    This is the exact form a sealed-ciphertext upload receipt carries — the
+    gateway is the only Arweave writer and every sealed ciphertext is stored on
+    Arweave — so the sealed submit path constrains resume-receipt URIs to it. A
+    URI accepted here is always a valid fetch-set member (so the assembled
+    record still passes canonical validation), and its encoded width is fixed at
+    ``5 + 43`` bytes, which is what keeps the pre-upload exact-size quote exact.
+    """
+    if not uri.startswith("ar://"):
+        return False
+    return _is_arweave_txid(uri[len("ar://") :])
+
+
+def _check_one_uri(uri: str, path: _Path, issues: list[ValidationIssue]) -> None:
+    # Absolute URI, no fragment, scheme in `{ar://, ipfs://}`. Delegated to the
+    # single-source grammar so the canonical check can never diverge from the
+    # producer-side pre-checks that share it.
+    reason = fetch_set_uri_rejection(uri)
+    if reason is not None:
+        issues.append(_issue("INVALID_URI", path, reason))
 
 
 # =============================================================================

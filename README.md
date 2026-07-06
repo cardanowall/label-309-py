@@ -48,7 +48,7 @@ import asyncio
 from cardanowall import verify_tx, VerifyTxInput
 
 report = asyncio.run(verify_tx(VerifyTxInput(tx_hash="<64-char hex tx hash>")))
-print(report.verdict)  # "valid" | "pending" | "failed"
+print(report.verdict)  # "valid" | "pending" | "unverifiable" | "failed"
 ```
 
 ### Validate raw record bytes — pure, no I/O
@@ -106,6 +106,10 @@ The hash-only flows (`publish_content`, `publish_prehashed`) and the low-level
 `publish` / `publish_batch` take a caller-supplied `quote_id`: request a quote
 first (it locks the USD price for a 15-minute TTL) and pass the returned
 `quote_id` to the call. The quote is consumed atomically with the record insert.
+`publish_content` also co-hashes the content under several algorithms
+(`hash_algs=["sha2-256", "blake2b-256"]`, bound into one item), and both content
+flows accept optional `uris` (already-pinned `ar://` / `ipfs://` content mirrors)
+and a `supersedes` link to an earlier record.
 
 The internally-quoting helpers price their exact record shape themselves and
 take **no** `quote_id`: `publish_merkle`, and the sealed flow's `submit_sealed`
@@ -193,6 +197,42 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+### Publish a passphrase-sealed PoE
+
+To deliver to someone who has no Label 309 identity, seal to a **shared
+passphrase** instead of recipient keys: anyone who knows it can open the record,
+with no delivery address involved. The passphrase surface mirrors the recipient
+one — the pure `passphrase_seal_prepare(...)` feeding `submit_passphrase_sealed(...)`
+(with `quote_prepared_passphrase_seal(...)` for a preview and `UploadReceipt`
+resume), and `publish_passphrase_sealed(...)` as the one-shot wrapper. Read the
+passphrase from the environment or a prompt, never a source-embedded literal:
+
+```python
+import asyncio
+import os
+from cardanowall import Label309Client
+
+async def main() -> None:
+    passphrase = os.environ["SEAL_PASSPHRASE"]
+    async with Label309Client(
+        base_url="https://gateway.example.com/api/v1",
+        api_key="<opaque-bearer>",
+    ) as client:
+        submission = await client.poe.publish_passphrase_sealed(
+            items=[b"quarterly numbers"],            # a LIST, one sealed item each
+            passphrase=passphrase,
+            hash_algs=["sha2-256", "blake2b-256"],   # co-hash the item under both
+            max_usd_micros=500_000,                  # refuse above $0.50
+        )
+        print(submission.response["id"], submission.uris)
+
+asyncio.run(main())
+```
+
+A recipient opens it by passing the passphrase to `verify_tx` — a
+`DecryptionPassphrase` credential joins the same keyring as any recipient key
+and is tried against every sealed item.
+
 ## API overview
 
 ### Verifier (`cardanowall.verifier`, top-level re-exports)
@@ -218,13 +258,16 @@ fetches sealed-PoE ciphertext bounded by `DEFAULT_OUTBOUND_MAX_BYTES`.
 `Label309Client(base_url=..., api_key=..., http_client=...)` exposes four
 namespaces:
 
-- `client.poe` — `quote(...)`, `publish_content(...)`, `publish_merkle(...)`
-  (one-call high-level flows), the two-phase sealed surface — the pure
-  `seal_prepare(...)` (from `cardanowall.client`) feeding
-  `quote_prepared_seal(...)` / `submit_sealed(...)`, with
-  `publish_sealed(...)` as the one-shot wrapper — plus the low-level
-  `uploads(...)`, `publish(...)`, `publish_batch(...)` wire-shape methods.
-  A `PreparedSeal` serializes to the portable `prepared_seal_json_v1`
+- `client.poe` — `quote(...)`, `publish_content(...)` (with `hash_algs`
+  co-hashing + optional `uris`), `publish_merkle(...)` (one-call high-level
+  flows), the two-phase sealed surface — the pure `seal_prepare(...)` (to
+  recipients) / `passphrase_seal_prepare(...)` (to a shared passphrase), both
+  from `cardanowall.client`, feeding `quote_prepared_seal(...)` /
+  `submit_sealed(...)` and `quote_prepared_passphrase_seal(...)` /
+  `submit_passphrase_sealed(...)`, with `publish_sealed(...)` /
+  `publish_passphrase_sealed(...)` as the one-shot wrappers — plus the
+  low-level `uploads(...)`, `publish(...)`, `publish_batch(...)` wire-shape
+  methods. A `PreparedSeal` serializes to the portable `prepared_seal_json_v1`
   artifact (`to_json()` / `from_json()`), so a failed publish retries from
   persisted material and `UploadReceipt`s without ever re-encrypting.
 - `client.records` — `get(tx_hash)` to read a record by transaction hash.

@@ -200,6 +200,93 @@ def test_publish_content_supports_blake2b_256() -> None:
     asyncio.run(run())
 
 
+_SUPERSEDES_HEX = "ab" * 32
+
+
+def test_publish_content_co_hashes_and_threads_uris_and_supersedes() -> None:
+    """publish_content() co-hashes under the union of hash_alg + hash_algs,
+    carries the optional fetch-set uris, and links a supersedes transaction."""
+
+    async def run() -> None:
+        captured: dict[str, object] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            captured.update(json.loads(req.content))
+            return httpx.Response(202, json=PUBLISH_BODY)
+
+        content = b"co-hash content payload"
+        ar_uri = "ar://" + "C" * 43
+        async with _client_with_handler(handler) as client:
+            await client.poe.publish_content(
+                content=content,
+                quote_id=QUOTE_ID,
+                hash_algs=["sha2-256", "blake2b-256"],
+                uris=[ar_uri],
+                supersedes=_SUPERSEDES_HEX,
+            )
+
+        record_bytes = bytes.fromhex(cast("str", captured["record"]))
+        result = validate(record_bytes)
+        assert result.ok
+        item = result.record["items"][0]
+        assert item["hashes"]["sha2-256"] == hashlib.sha256(content).digest()
+        assert "blake2b-256" in item["hashes"]
+        assert item["uris"] == [ar_uri]
+        assert result.record["supersedes"] == bytes.fromhex(_SUPERSEDES_HEX)
+
+    asyncio.run(run())
+
+
+def test_publish_content_rejects_a_non_fetch_set_uri() -> None:
+    async def run() -> None:
+        async with _client_with_handler(lambda req: httpx.Response(500)) as client:
+            with pytest.raises(PublishError) as exc:
+                await client.poe.publish_content(
+                    content="x", quote_id=QUOTE_ID, uris=["ar://tooshort"]
+                )
+        assert exc.value.code == PublishError.INVALID_URI
+
+    asyncio.run(run())
+
+
+def test_publish_content_rejects_malformed_supersedes() -> None:
+    async def run() -> None:
+        async with _client_with_handler(lambda req: httpx.Response(500)) as client:
+            with pytest.raises(PublishError) as exc:
+                await client.poe.publish_content(
+                    content="x", quote_id=QUOTE_ID, supersedes="not-64-hex"
+                )
+        assert exc.value.code == PublishError.INVALID_SUPERSEDES
+
+    asyncio.run(run())
+
+
+def test_publish_prehashed_threads_uris_and_supersedes() -> None:
+    async def run() -> None:
+        captured: dict[str, object] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            captured.update(json.loads(req.content))
+            return httpx.Response(202, json=PUBLISH_BODY)
+
+        ar_uri = "ar://" + "D" * 43
+        async with _client_with_handler(handler) as client:
+            await client.poe.publish_prehashed(
+                hashes={"sha2-256": "11" * 32},
+                quote_id=QUOTE_ID,
+                uris=[ar_uri],
+                supersedes=_SUPERSEDES_HEX,
+            )
+
+        record_bytes = bytes.fromhex(cast("str", captured["record"]))
+        result = validate(record_bytes)
+        assert result.ok
+        assert result.record["items"][0]["uris"] == [ar_uri]
+        assert result.record["supersedes"] == bytes.fromhex(_SUPERSEDES_HEX)
+
+    asyncio.run(run())
+
+
 def test_publish_content_threads_idempotency_key_into_header() -> None:
     async def run() -> None:
         captured: dict[str, str | None] = {}
@@ -441,6 +528,33 @@ def test_publish_merkle_binds_root_and_leaf_count() -> None:
         assert merkle[0]["leaf_count"] == 4
         assert merkle[0]["root"] == expected_root
         assert len(result.record["sigs"]) == 1
+
+    asyncio.run(run())
+
+
+def test_publish_merkle_threads_supersedes_into_the_record() -> None:
+    async def run() -> None:
+        leaves = [hashlib.sha256(bytes([i])).digest() for i in range(2)]
+        ar_uri = "ar://" + ("W" * 43)
+        seen: dict[str, Any] = {"publish_body": None}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/api/v1/poe/quote":
+                return httpx.Response(200, json=QUOTE_BODY)
+            if req.url.path == "/api/v1/poe/uploads":
+                return httpx.Response(200, json=_uploads_response(ar_uri))
+            if req.url.path == "/api/v1/poe/publish":
+                seen["publish_body"] = json.loads(req.content)
+                return httpx.Response(202, json=PUBLISH_BODY)
+            raise AssertionError(f"unexpected {req.url.path}")
+
+        async with _client_with_handler(handler) as client:
+            await client.poe.publish_merkle(leaves=list(leaves), supersedes=_SUPERSEDES_HEX)
+
+        record_bytes = bytes.fromhex(seen["publish_body"]["record"])
+        result = validate(record_bytes)
+        assert result.ok
+        assert result.record["supersedes"] == bytes.fromhex(_SUPERSEDES_HEX)
 
     asyncio.run(run())
 
