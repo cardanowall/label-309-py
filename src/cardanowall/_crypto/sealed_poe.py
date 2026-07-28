@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac as stdlib_hmac
+import itertools
 import secrets
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -150,6 +151,12 @@ _PASSPHRASE_PARAM_MAX: Final[int] = (1 << 32) - 1
 _ARGON2_M_MIN: Final[int] = 65536
 _ARGON2_T_MIN: Final[int] = 3
 _ARGON2_P_MIN: Final[int] = 1
+
+# The smallest well-formed passphrase-path blob: the 32-byte commitment header
+# plus the lone tag of an empty final STREAM chunk. Shared by the buffered open
+# (a plain length check) and the streaming open (whose lookahead enforces the
+# same pre-KDF floor).
+_MIN_PASSPHRASE_BLOB_LENGTH: Final[int] = _COMMITMENT_LENGTH + TAG_SIZE
 
 if len(CARDANO_POE_HKDF_INFO_KEK) != 18:
     raise RuntimeError("CARDANO_POE_HKDF_INFO_KEK byte-length invariant violated (expected 18)")
@@ -839,7 +846,7 @@ def _seal_stream_body(
     plaintext: Iterable[bytes],
     cancel: Callable[[], bool] | None,
 ) -> Iterator[bytes]:
-    # EOF lookahead (R1): source read boundaries are not STREAM chunk boundaries,
+    # EOF lookahead: source read boundaries are not STREAM chunk boundaries,
     # and a final chunk may itself be a FULL CHUNK_SIZE (stream_seal makes the
     # last 64 KiB the final chunk with NO trailing empty chunk; an exact multiple
     # of CHUNK_SIZE ends in a full final chunk). So we accumulate input into an
@@ -1378,7 +1385,7 @@ def ecies_sealed_poe_unwrap_stream(
     tag-verified plaintext chunk; ``result`` is resolved when the generator is
     exhausted (or on the first mid-stream tamper, which stops it).
 
-    Tentative-until-hash contract (R2): per-chunk Poly1305 + the final flag give
+    Tentative-until-hash contract: per-chunk Poly1305 + the final flag give
     per-segment integrity and truncation resistance, but the yielded bytes are
     TENTATIVE. The whole-item hash recompute is per-item and caller-owned; this
     API does NOT perform it. The caller MUST check ``result.matched`` AND recompute
@@ -1412,7 +1419,7 @@ def _unwrap_stream_body(
     cancel: Callable[[], bool] | None,
     result: StreamUnwrapResult,
 ) -> Iterator[bytes]:
-    # EOF lookahead (R1): consume SEALED_CHUNK_SIZE-byte sealed chunks and keep
+    # EOF lookahead: consume SEALED_CHUNK_SIZE-byte sealed chunks and keep
     # ONE PENDING; on end-of-input open the pending chunk as final=True EVEN IF it
     # is exactly SEALED_CHUNK_SIZE (a full final chunk is valid — `stream_open`
     # treats len % SEALED_CHUNK_SIZE == 0 as a full final chunk). The pending one
@@ -1623,20 +1630,10 @@ def passphrase_sealed_poe_seal(
     return PassphraseSealedPoeOutput(envelope=envelope, ciphertext=blob)
 
 
-def passphrase_sealed_poe_open(
-    *,
-    envelope: PassphraseEnvelope,
-    ciphertext: bytes,
-    passphrase: str,
-    hashes: Mapping[str, bytes],
-) -> UnwrapResult:
-    # Typed caller-input rejections fire in a pinned order — the item's hash
-    # claim, then passphrase normalization, then the envelope shape — and every
-    # one of them strictly precedes any blob-dependent generic failure, so a
-    # malformed call is reported the same way whatever blob accompanies it.
-    hashes_hash = item_hashes_hash(hashes)
-    password = _normalize_passphrase_input(passphrase)
-
+# Envelope-shape validation shared by the buffered and streaming opens, in a
+# pinned order (scheme, aead, alg, nonce, salt, params) so both surfaces reject
+# a malformed envelope with the identical typed error.
+def _assert_passphrase_envelope(envelope: PassphraseEnvelope) -> None:
     if envelope.scheme != 1:
         raise EciesSealedPoeError(
             EciesSealedPoeError.UNSUPPORTED_ENVELOPE_SCHEME,
@@ -1661,6 +1658,22 @@ def passphrase_sealed_poe_open(
     _assert_passphrase_salt(envelope.salt)
     _assert_argon2id_params(envelope.params)
 
+
+def passphrase_sealed_poe_open(
+    *,
+    envelope: PassphraseEnvelope,
+    ciphertext: bytes,
+    passphrase: str,
+    hashes: Mapping[str, bytes],
+) -> UnwrapResult:
+    # Typed caller-input rejections fire in a pinned order — the item's hash
+    # claim, then passphrase normalization, then the envelope shape — and every
+    # one of them strictly precedes any blob-dependent generic failure, so a
+    # malformed call is reported the same way whatever blob accompanies it.
+    hashes_hash = item_hashes_hash(hashes)
+    password = _normalize_passphrase_input(passphrase)
+    _assert_passphrase_envelope(envelope)
+
     # A passphrase-path blob shorter than 48 bytes — the 32-byte commitment
     # header plus the 16-byte STREAM floor — cannot be well-formed; rejecting
     # it before the KDF spends no Argon2 work on it (the blob is public input,
@@ -1668,7 +1681,7 @@ def passphrase_sealed_poe_open(
     # on this path it surfaces as the single generic failure; wrong passphrase,
     # tampered parameters, and tampered ciphertext are indistinguishable by
     # design.
-    if len(ciphertext) < _COMMITMENT_LENGTH + TAG_SIZE:
+    if len(ciphertext) < _MIN_PASSPHRASE_BLOB_LENGTH:
         return UnwrapResult(matched=False, plaintext=None, reason=UNWRAP_REASON_TAMPERED_CIPHERTEXT)
 
     cek = _argon2id_cek(password, envelope.salt, envelope.params)
@@ -1688,3 +1701,191 @@ def passphrase_sealed_poe_open(
     except StreamTamperedError:
         return UnwrapResult(matched=False, plaintext=None, reason=UNWRAP_REASON_TAMPERED_CIPHERTEXT)
     return UnwrapResult(matched=True, plaintext=plaintext, reason=None)
+
+
+def passphrase_sealed_poe_seal_stream(
+    *,
+    # The plaintext as an iterable of byte chunks. Source read boundaries are
+    # NOT STREAM chunk boundaries: the input is re-chunked internally to
+    # exactly CHUNK_SIZE (64 KiB) before sealing, so the producer may yield any
+    # sizes.
+    plaintext: Iterable[bytes],
+    passphrase: str,
+    # The item's complete hashes map; its labelled digest is bound into the
+    # passphrase transcript exactly as on the buffered seal.
+    hashes: Mapping[str, bytes],
+    # Argon2id work factors. The default is the registry floor profile with the
+    # recommended parallelism (m = 65536 KiB, t = 3, p = 4).
+    params: Argon2idParams | None = None,
+    # Cooperative cancellation: checked before each chunk is read and sealed.
+    # When it returns True the generator raises EciesSealedPoeError(CANCELLED)
+    # and stops producing ciphertext.
+    cancel: Callable[[], bool] | None = None,
+    # Test-only deterministic overrides — production callers MUST NOT pass
+    # these; the salt MUST be freshly drawn per envelope (it is the sole
+    # cross-record separator for a reused passphrase).
+    salt: bytes | None = None,
+    nonce: bytes | None = None,
+) -> tuple[PassphraseEnvelope, Iterator[bytes]]:
+    """Streaming passphrase seal: the envelope and the 32-byte commitment are
+    resolved up front; the body is sealed lazily as the returned generator is
+    consumed.
+
+    The commitment header is a pure function of the passphrase, the KDF
+    inputs, the nonce, and the item's ``hashes`` — never the plaintext — so it
+    is derived eagerly through the exact same helpers the buffered
+    ``passphrase_sealed_poe_seal`` uses. The generator yields the commitment
+    first, then the sealed STREAM re-chunked to exactly CHUNK_SIZE with the
+    same one-chunk EOF lookahead as the KEM-slots streaming seal. Concatenating
+    every yielded chunk is byte-identical to the buffered seal's blob
+    (``commitment(32) || STREAM chunks``) for the same
+    passphrase/salt/params/nonce/hashes. Typed caller-input rejections fire
+    eagerly, in the buffered seal's exact order, so both surfaces report a
+    malformed call identically.
+    """
+    params = params if params is not None else Argon2idParams(m=65536, t=3, p=4)
+    _assert_argon2id_params(params)
+    salt = salt if salt is not None else secrets.token_bytes(32)
+    _assert_passphrase_salt(salt)
+    nonce = nonce if nonce is not None else secrets.token_bytes(_NONCE_LENGTH)
+    if len(nonce) != _NONCE_LENGTH:
+        raise EciesSealedPoeError(
+            EciesSealedPoeError.NONCE_LENGTH_MISMATCH,
+            f"nonce MUST be exactly {_NONCE_LENGTH} bytes, got {len(nonce)}",
+        )
+
+    hashes_hash = item_hashes_hash(hashes)
+    cek = _argon2id_cek(_normalize_passphrase_input(passphrase), salt, params)
+    commitment = _passphrase_commitment(cek, _compute_pw_hash(nonce, salt, params, hashes_hash))
+    payload_key = _passphrase_payload_key(cek, nonce)
+
+    envelope = PassphraseEnvelope(
+        scheme=1,
+        aead=AEAD_CHACHA20_POLY1305_STREAM64K,
+        nonce=nonce,
+        alg=PASSPHRASE_KDF_ARGON2ID,
+        salt=salt,
+        params=params,
+    )
+    return envelope, _passphrase_seal_stream_body(commitment, payload_key, plaintext, cancel)
+
+
+def _passphrase_seal_stream_body(
+    commitment: bytes,
+    payload_key: bytes,
+    plaintext: Iterable[bytes],
+    cancel: Callable[[], bool] | None,
+) -> Iterator[bytes]:
+    # The blob layout is commitment(32) || STREAM chunks: emit the header
+    # first, then drive the exact same re-chunking body loop the KEM-slots
+    # streaming seal uses — one shared implementation of the EOF lookahead.
+    yield commitment
+    yield from _seal_stream_body(payload_key, plaintext, cancel)
+
+
+# Streaming passphrase-open outcome, resolved when the generator is exhausted
+# (``opened`` is None until then). Deliberately two-state with no reason
+# discriminator: a short blob, a commitment mismatch (wrong passphrase,
+# tampered salt / params / header fields, or an envelope spliced onto a
+# different hash claim), and a mid-body STREAM failure are the passphrase
+# path's single generic rejection, indistinguishable by design — exactly as on
+# the buffered ``passphrase_sealed_poe_open``. The tentative-until-hash
+# contract matches ``StreamUnwrapResult``: yielded bytes stay TENTATIVE until
+# the caller's whole-item hash recompute passes, and on ``opened=False``
+# anything already yielded is partial and MUST be discarded.
+@dataclass
+class PassphraseStreamOpenResult:
+    opened: bool | None
+
+
+def passphrase_sealed_poe_open_stream(
+    *,
+    envelope: PassphraseEnvelope,
+    # The ciphertext blob (commitment(32) || STREAM chunks) as an iterable of
+    # byte chunks. Source read boundaries are NOT STREAM chunk boundaries: the
+    # body is re-chunked internally to exactly SEALED_CHUNK_SIZE before
+    # opening.
+    ciphertext: Iterable[bytes],
+    passphrase: str,
+    hashes: Mapping[str, bytes],
+    # Cooperative cancellation: checked before each sealed chunk is read and
+    # opened. When it returns True the generator raises
+    # EciesSealedPoeError(CANCELLED).
+    cancel: Callable[[], bool] | None = None,
+) -> tuple[Iterator[bytes], PassphraseStreamOpenResult]:
+    """Streaming passphrase open: the commitment is verified up front, then
+    the body is opened lazily as the returned generator is consumed.
+
+    Returns ``(plaintext_chunks, result)``. The blob's first 48 bytes (the
+    commitment header plus the lone tag of the smallest well-formed STREAM)
+    are read into a lookahead eagerly; a source that ends before that floor is
+    the same generic rejection the buffered open gives a short blob, and the
+    Argon2id derivation is never run for it. The candidate CEK is then
+    derived, the commitment recomputed over the received envelope fields and
+    the item's ``hashes``, and compared in constant time **before any STREAM
+    chunk is opened** — a rejection resolves ``result`` eagerly and yields
+    nothing. On a match the lookahead's body bytes are replayed ahead of the
+    remaining source and each opened, tag-verified plaintext chunk is yielded;
+    ``result`` is resolved when the generator is exhausted (or on the first
+    mid-body failure, which stops it).
+
+    Typed caller-input rejections raise eagerly, in the buffered open's pinned
+    order — the item's hash claim, then passphrase normalization, then the
+    envelope shape — strictly before any blob-dependent work. Every
+    blob-dependent failure is the single generic ``opened=False``.
+
+    Tentative-until-hash contract: per-chunk Poly1305 + the final flag give
+    per-segment integrity and truncation resistance, but the yielded bytes are
+    TENTATIVE. The caller MUST check ``result.opened`` AND recompute the
+    plaintext item hash against the record's ``hashes`` before releasing the
+    bytes.
+    """
+    result = PassphraseStreamOpenResult(opened=None)
+    hashes_hash = item_hashes_hash(hashes)
+    password = _normalize_passphrase_input(passphrase)
+    _assert_passphrase_envelope(envelope)
+
+    # Fill the 48-byte lookahead. A source that ends below the well-formedness
+    # floor cannot be a passphrase-path blob; rejecting it here spends no
+    # Argon2 work on it, exactly as the buffered open's length check does.
+    source = iter(ciphertext)
+    lookahead = bytearray()
+    while len(lookahead) < _MIN_PASSPHRASE_BLOB_LENGTH:
+        piece = next(source, None)
+        if piece is None:
+            result.opened = False
+            return iter(()), result
+        lookahead += piece
+
+    cek = _argon2id_cek(password, envelope.salt, envelope.params)
+
+    # The commitment is verified in constant time BEFORE any STREAM chunk is
+    # opened: the wrong-passphrase signal is the commitment, never a Poly1305
+    # tag deep in the stream. A mismatch yields nothing.
+    expected = _passphrase_commitment(
+        cek, _compute_pw_hash(envelope.nonce, envelope.salt, envelope.params, hashes_hash)
+    )
+    if not compare_ct(expected, bytes(lookahead[:_COMMITMENT_LENGTH])):
+        result.opened = False
+        return iter(()), result
+
+    payload_key = _passphrase_payload_key(cek, envelope.nonce)
+    # Replay the lookahead's body bytes (past the commitment header) ahead of
+    # the remaining source, then drive the shared open loop.
+    body = itertools.chain([bytes(lookahead[_COMMITMENT_LENGTH:])], source)
+    return _passphrase_open_stream_body(payload_key, body, cancel, result), result
+
+
+def _passphrase_open_stream_body(
+    payload_key: bytes,
+    body: Iterable[bytes],
+    cancel: Callable[[], bool] | None,
+    result: PassphraseStreamOpenResult,
+) -> Iterator[bytes]:
+    # The body loop is the exact same re-chunking open loop the KEM-slots
+    # streaming unwrap drives; its tamper classification collapses into the
+    # passphrase path's single generic rejection (a wrong-key arm cannot
+    # occur: the commitment already matched).
+    inner = StreamUnwrapResult(matched=None, reason=None)
+    yield from _unwrap_stream_body(payload_key, body, cancel, inner)
+    result.opened = inner.matched is True

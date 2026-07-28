@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from . import certificate, estimate, hash, merkle
 from ._crypto.sealed_poe import (
+    PassphraseStreamOpenResult,
     RecipientKeyBundle,
     StreamUnwrapResult,
     ecies_sealed_poe_seal_stream,
@@ -9,7 +10,9 @@ from ._crypto.sealed_poe import (
     ecies_sealed_poe_unwrap_stream,
     ecies_sealed_poe_wrap,
     passphrase_sealed_poe_open,
+    passphrase_sealed_poe_open_stream,
     passphrase_sealed_poe_seal,
+    passphrase_sealed_poe_seal_stream,
 )
 from ._crypto.stream import sha256_stream, stream_sealed_length
 from .client import (
@@ -141,6 +144,7 @@ __all__ = [
     "NotFoundError",
     "ParsedAgeRecipient",
     "PartialUploadError",
+    "PassphraseStreamOpenResult",
     "PoeFailedError",
     "PoeRecord",
     "PoeWaitTimeoutError",
@@ -198,7 +202,9 @@ __all__ = [
     "parse_age_recipient",
     "parse_identity_seed",
     "passphrase_sealed_poe_open",
+    "passphrase_sealed_poe_open_stream",
     "passphrase_sealed_poe_seal",
+    "passphrase_sealed_poe_seal_stream",
     "recipient_secret_keys_from_seed",
     "recipients_from_seed",
     "sha256_stream",

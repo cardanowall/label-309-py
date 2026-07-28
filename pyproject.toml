@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cardanowall-sdk"
-version = "0.11.0"
+version = "0.12.0"
 description = "Python SDK for the CardanoWall protocol — parity twin of @cardanowall/sdk-ts. Implements the Label 309 cryptographic primitives byte-identically with the TypeScript reference."
 readme = "README.md"
 license = "Apache-2.0"
@@ -51,10 +51,8 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cardanowall"]
-# _tools holds maintainer-only fixture regenerators and a live-mainnet canary,
-# invoked via `python -m cardanowall._tools.X` from the monorepo source. They
-# reach into sibling packages and are not part of the published SDK, so they are
-# excluded from the wheel.
+# _tools holds maintainer-only fixture regenerators and a live-mainnet canary.
+# They are not part of the published SDK, so they are excluded from the wheel.
 exclude = ["src/cardanowall/_tools"]
 
 [tool.hatch.build.targets.wheel.force-include]

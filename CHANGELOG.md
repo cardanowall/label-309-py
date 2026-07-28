@@ -9,6 +9,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > change in backward-incompatible ways until a 1.0 release. Pre-1.0 versions do
 > not carry the stability guarantees of [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] - 2026-07-28
+
+### Breaking
+
+- The size estimator's `ItemShape` carries an explicit `enc` shape instead of a bare optional KEM, because a passphrase envelope and a KEM envelope encode to very different widths. A recipient-sealed item is now `KemEncShape(kem, recipient_count)` and a passphrase-sealed item is `PassphraseEncShape()`; an unsealed item still leaves `enc` as `None`.
+
+### Added
+
+- Streaming passphrase sealing and opening — `passphrase_sealed_poe_seal_stream` and `passphrase_sealed_poe_open_stream` (with `PassphraseStreamOpenResult`), the streaming twins of the buffered passphrase pair. They drive the same segmented-STREAM seam and the same KDF and commitment helpers as the buffered functions, so their output is byte-identical to the buffered path at any read granularity, and a multi-gigabyte payload never has to be held in memory. The open stream fills a 48-byte lookahead before running Argon2id, preserving the buffered path's pre-KDF rejection of a too-short blob, and compares the commitment in constant time before opening any chunk.
+- The estimator prices the 4-key passphrase envelope, charged from the crypto layer's authoritative Argon2id and salt floor constants rather than numbers pinned in the estimator.
+
 ## [0.11.0] - 2026-07-06
 
 ### Added

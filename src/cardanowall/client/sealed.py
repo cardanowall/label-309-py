@@ -79,7 +79,7 @@ from cardanowall._crypto.sealed_poe import (
     ecies_sealed_poe_wrap,
     passphrase_sealed_poe_seal,
 )
-from cardanowall.estimate import ItemShape, RecordShape, estimate_record_bytes
+from cardanowall.estimate import ItemShape, KemEncShape, RecordShape, estimate_record_bytes
 from cardanowall.poe_standard import (
     EncryptionEnvelope,
     Item,
@@ -1097,8 +1097,7 @@ def _prepared_quote_request(
             ItemShape(
                 hash_algs=tuple(alg for alg, _ in item.hashes),
                 uris=(_arweave_uri_placeholder(),),
-                recipient_count=len(item.envelope.slots),
-                kem=prepared.kem,
+                enc=KemEncShape(kem=prepared.kem, recipient_count=len(item.envelope.slots)),
             )
             for item in prepared.items
         ),

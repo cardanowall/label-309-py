@@ -29,6 +29,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from cardanowall._crypto.sealed_poe import (
+    _ARGON2_M_MIN,
+    _ARGON2_P_MIN,
+    _ARGON2_T_MIN,
+    PASSPHRASE_SALT_MIN_BYTES,
+)
+
 # Pre-quote ceiling on the canonical record size, set just under the gateway's
 # ~14,500-byte record ceiling. A record (by its shape) estimated above this can
 # be rejected before a quote is requested with a clear "record too large / too
@@ -67,6 +74,8 @@ _DIGEST_BYTES = 32
 _AEAD_ID_BYTES = 27
 # The longest KEM identifier (`mlkem768x25519`, 14 bytes).
 _KEM_ID_BYTES = 14
+# The sole passphrase-KDF identifier (`argon2id`, 8 bytes).
+_PASSPHRASE_ALG_ID_BYTES = 8
 # The exact byte length of a detached **path-1** COSE_Sign1, which is fully
 # fixed-shape: a 4-element array (0x84) of the 38-byte protected header
 # ({1: -8, 4: <32-byte kid>}, encoded as a 40-byte byte string), an empty
@@ -101,6 +110,10 @@ _EPK_KEY = 3  # "epk"
 _KEM_CT_KEY = 6  # "kem_ct"
 _WRAP_KEY = 4  # "wrap"
 _COSE_SIGN1_KEY = 10  # "cose_sign1"
+_PASSPHRASE_KEY = 10  # "passphrase"
+_SALT_KEY = 4  # "salt"
+_PARAMS_KEY = 6  # "params"
+_PARAM_NAME_KEY = 1  # "m" / "t" / "p"
 
 
 def _cbor_header_len(n: int) -> int:
@@ -151,6 +164,41 @@ def _utf8_len(value: str) -> int:
 
 
 @dataclass(frozen=True)
+class KemEncShape:
+    """The KEM-slots key-delivery shape of a sealed item's ``enc`` envelope.
+
+    Each classical ``x25519`` slot carries a 32-byte ``epk`` + 48-byte
+    ``wrap``; each hybrid ``mlkem768x25519`` slot carries a 1120-byte
+    ``kem_ct`` + 48-byte ``wrap``; the envelope also carries the KEM id and
+    the 32-byte ``slots_mac``. ``recipient_count`` is the number of recipient
+    slots.
+    """
+
+    kem: EstimateKem
+    recipient_count: int
+
+
+@dataclass(frozen=True)
+class PassphraseEncShape:
+    """The Argon2id passphrase key-delivery shape of a sealed item's ``enc``
+    envelope (``{scheme, aead, nonce, passphrase: {alg, salt, params}}`` — no
+    slots).
+
+    Charged at the canonical producer shape: the fixed ``argon2id``
+    identifier, a 16-byte salt, and integer widths that cover the whole ``m``
+    wire range plus ``t`` / ``p`` up to CBOR's one-byte immediate range (23) —
+    every parameter set the reference producers emit. A producer choosing a
+    longer salt or larger ``t`` / ``p`` must size its envelope by building and
+    measuring it.
+    """
+
+
+# The `enc` envelope shape of a sealed item: which key-delivery path the
+# scheme-1 envelope uses, since the two encode to very different widths.
+EncShape = KemEncShape | PassphraseEncShape
+
+
+@dataclass(frozen=True)
 class ItemShape:
     """The shape of one content item to size. Every field maps to a CBOR
     component whose maximum encoded width the estimate sums.
@@ -158,16 +206,14 @@ class ItemShape:
     ``hash_algs`` lists the content-hash algorithm ids the item will carry
     (e.g. ``["sha2-256", "blake2b-256"]``); each contributes a key string plus
     a 32-byte digest value. ``uris`` lists the off-chain URIs, each charged its
-    full string width (empty for a hash-only item). ``recipient_count`` is the
-    number of sealed-envelope slots (0 for an unsealed item), and ``kem`` names
-    the KEM the envelope is sealed under — ``None`` for an unsealed item (no
-    ``enc`` block is charged).
+    full string width (empty for a hash-only item). ``enc`` is the sealed
+    envelope's shape when sealed — ``None`` for an unsealed item (no ``enc``
+    block is charged).
     """
 
     hash_algs: Sequence[str]
     uris: Sequence[str] = ()
-    recipient_count: int = 0
-    kem: EstimateKem | None = None
+    enc: EncShape | None = None
 
 
 @dataclass(frozen=True)
@@ -204,36 +250,60 @@ def _uris_bytes(uris: Sequence[str]) -> int:
     return total
 
 
-def _envelope_bytes(item: ItemShape, kem: EstimateKem) -> int:
-    """The `enc` scheme-1 envelope: `{scheme, aead, nonce, kem, slots,
-    slots_mac}` (6 keys) plus one slot per recipient."""
-    env = _container_header(6)
+def _envelope_bytes(enc: EncShape) -> int:
+    """The `enc` scheme-1 envelope, by key-delivery path: the slots shape
+    `{scheme, aead, nonce, kem, slots, slots_mac}` (6 keys) plus one slot per
+    recipient, or the passphrase shape
+    `{scheme, aead, nonce, passphrase: {alg, salt, params}}` (4 keys) at the
+    canonical producer widths (see :class:`PassphraseEncShape`)."""
+    if isinstance(enc, KemEncShape):
+        env = _container_header(6)
+        env += _str_bytes(_SCHEME_KEY) + _uint_bytes(1)  # scheme is the value 1
+        env += _str_bytes(_AEAD_KEY) + _str_bytes(_AEAD_ID_BYTES)
+        env += _str_bytes(_NONCE_KEY) + _str_bytes(_ENVELOPE_NONCE_BYTES)
+        env += _str_bytes(_KEM_KEY) + _str_bytes(_KEM_ID_BYTES)
+        env += _str_bytes(_SLOTS_MAC_KEY) + _str_bytes(_SLOTS_MAC_BYTES)
+        # slots: an array of per-recipient slot maps.
+        env += _str_bytes(_SLOTS_KEY) + _container_header(enc.recipient_count)
+        if enc.kem == "x25519":
+            # `{epk: 32, wrap: 48}` — a 2-key map.
+            per_slot = (
+                _container_header(2)
+                + _str_bytes(_EPK_KEY)
+                + _str_bytes(_SLOT_EPK_BYTES)
+                + _str_bytes(_WRAP_KEY)
+                + _str_bytes(_SLOT_WRAP_BYTES)
+            )
+        else:
+            # `{kem_ct: 1120, wrap: 48}` — a 2-key map.
+            per_slot = (
+                _container_header(2)
+                + _str_bytes(_KEM_CT_KEY)
+                + _str_bytes(_SLOT_KEM_CT_BYTES)
+                + _str_bytes(_WRAP_KEY)
+                + _str_bytes(_SLOT_WRAP_BYTES)
+            )
+        return env + per_slot * enc.recipient_count
+
+    # The 4-key passphrase envelope map: no kem, no slots, no slots_mac — the
+    # key commitment lives inside the ciphertext blob, not on chain.
+    env = _container_header(4)
     env += _str_bytes(_SCHEME_KEY) + _uint_bytes(1)  # scheme is the value 1
     env += _str_bytes(_AEAD_KEY) + _str_bytes(_AEAD_ID_BYTES)
     env += _str_bytes(_NONCE_KEY) + _str_bytes(_ENVELOPE_NONCE_BYTES)
-    env += _str_bytes(_KEM_KEY) + _str_bytes(_KEM_ID_BYTES)
-    env += _str_bytes(_SLOTS_MAC_KEY) + _str_bytes(_SLOTS_MAC_BYTES)
-    # slots: an array of per-recipient slot maps.
-    env += _str_bytes(_SLOTS_KEY) + _container_header(item.recipient_count)
-    if kem == "x25519":
-        # `{epk: 32, wrap: 48}` — a 2-key map.
-        per_slot = (
-            _container_header(2)
-            + _str_bytes(_EPK_KEY)
-            + _str_bytes(_SLOT_EPK_BYTES)
-            + _str_bytes(_WRAP_KEY)
-            + _str_bytes(_SLOT_WRAP_BYTES)
-        )
-    else:
-        # `{kem_ct: 1120, wrap: 48}` — a 2-key map.
-        per_slot = (
-            _container_header(2)
-            + _str_bytes(_KEM_CT_KEY)
-            + _str_bytes(_SLOT_KEM_CT_BYTES)
-            + _str_bytes(_WRAP_KEY)
-            + _str_bytes(_SLOT_WRAP_BYTES)
-        )
-    return env + per_slot * item.recipient_count
+    # passphrase: `{alg, salt, params: {m, t, p}}` at the canonical producer
+    # widths — the fixed `argon2id` id, a 16-byte salt, and the registry-floor
+    # parameter integers (`m`'s floor already charges the full 4-byte-extension
+    # uint width, covering every wire-range `m`).
+    params = _container_header(3)
+    params += _str_bytes(_PARAM_NAME_KEY) + _uint_bytes(_ARGON2_M_MIN)
+    params += _str_bytes(_PARAM_NAME_KEY) + _uint_bytes(_ARGON2_T_MIN)
+    params += _str_bytes(_PARAM_NAME_KEY) + _uint_bytes(_ARGON2_P_MIN)
+    block = _container_header(3)
+    block += _str_bytes(_ALG_KEY) + _str_bytes(_PASSPHRASE_ALG_ID_BYTES)
+    block += _str_bytes(_SALT_KEY) + _str_bytes(PASSPHRASE_SALT_MIN_BYTES)
+    block += _str_bytes(_PARAMS_KEY) + params
+    return env + _str_bytes(_PASSPHRASE_KEY) + block
 
 
 def _item_bytes(item: ItemShape) -> int:
@@ -243,7 +313,7 @@ def _item_bytes(item: ItemShape) -> int:
     item_keys = 1  # hashes
     if item.uris:
         item_keys += 1
-    if item.kem is not None:
+    if item.enc is not None:
         item_keys += 1
     total = _container_header(item_keys)
     # hashes: a map of (alg-id -> 32-byte digest).
@@ -251,8 +321,8 @@ def _item_bytes(item: ItemShape) -> int:
     for alg in item.hash_algs:
         total += _str_bytes(_utf8_len(alg)) + _str_bytes(_DIGEST_BYTES)
     total += _uris_bytes(item.uris)
-    if item.kem is not None:
-        total += _str_bytes(_ENC_KEY) + _envelope_bytes(item, item.kem)
+    if item.enc is not None:
+        total += _str_bytes(_ENC_KEY) + _envelope_bytes(item.enc)
     return total
 
 
@@ -317,9 +387,12 @@ def estimate_record_bytes(shape: RecordShape) -> int:
 
 __all__ = [
     "MAX_RECORD_BYTES",
+    "EncShape",
     "EstimateKem",
     "ItemShape",
+    "KemEncShape",
     "MerkleShape",
+    "PassphraseEncShape",
     "RecordShape",
     "estimate_record_bytes",
 ]

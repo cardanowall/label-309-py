@@ -9,6 +9,8 @@ boundaries) and asserts the concatenated output equals the pinned
 ``expected_ciphertext_hex``, across the empty / 1-byte / exact-64-KiB /
 exact-2x-64-KiB / just-over-64-KiB sizes; the streaming unwrap is fed the pinned
 ciphertext in odd chunks and asserts the streamed plaintext and the outcome.
+The passphrase streaming pair is validated the same way, against the pinned
+``passphrase-n1`` vector and its own buffered twin.
 """
 
 from __future__ import annotations
@@ -22,6 +24,9 @@ from typing import Any, cast
 import pytest
 
 from cardanowall._crypto.sealed_poe import (
+    Argon2idParams,
+    EciesSealedPoeError,
+    PassphraseEnvelope,
     RecipientKeyBundle,
     SealedEnvelope,
     SealedSlot,
@@ -30,6 +35,9 @@ from cardanowall._crypto.sealed_poe import (
     ecies_sealed_poe_seal_stream,
     ecies_sealed_poe_unwrap_stream,
     ecies_sealed_poe_wrap,
+    passphrase_sealed_poe_open_stream,
+    passphrase_sealed_poe_seal,
+    passphrase_sealed_poe_seal_stream,
 )
 from cardanowall._crypto.stream import CHUNK_SIZE, stream_seal
 
@@ -499,3 +507,303 @@ def test_stream_unwrap_result_is_distinct_type() -> None:
     # exhaustion (matched=None until then).
     pending = StreamUnwrapResult(matched=None, reason=None)
     assert pending.matched is None
+
+
+# ---------------------------------------------------------------------------
+# The passphrase path — streaming twin of the buffered pair, validated against
+# the same pinned passphrase-n1 vector with ZERO new crypto vectors.
+# ---------------------------------------------------------------------------
+
+# Deterministic passphrase inputs for the size-matrix equivalence and the
+# outcome tests: registry-floor parameters and a fixed salt / nonce so the
+# buffered and streamed seals are directly comparable.
+_PW = "correct horse battery staple"
+_PW_SALT = b"\x55" * 16
+_PW_NONCE = b"\x66" * 24
+_PW_PARAMS = Argon2idParams(m=65536, t=3, p=1)
+_PW_HASHES = {"sha2-256": b"\x2e" * 32}
+_PW_ENVELOPE = PassphraseEnvelope(
+    scheme=1,
+    aead="chacha20-poly1305-stream64k",
+    nonce=_PW_NONCE,
+    alg="argon2id",
+    salt=_PW_SALT,
+    params=_PW_PARAMS,
+)
+
+
+def _pw_stream_seal(plaintext: bytes, sizes: list[int]) -> bytes:
+    _envelope, gen = passphrase_sealed_poe_seal_stream(
+        plaintext=_chunked(plaintext, sizes),
+        passphrase=_PW,
+        hashes=_PW_HASHES,
+        params=_PW_PARAMS,
+        salt=_PW_SALT,
+        nonce=_PW_NONCE,
+    )
+    return b"".join(gen)
+
+
+def test_passphrase_seal_stream_matches_the_pinned_vector() -> None:
+    # Stream-sealing the vector plaintext at odd producer granularities (whose
+    # boundaries are NOT STREAM chunk boundaries) must reproduce the pinned
+    # blob (commitment || STREAM) byte-for-byte.
+    vector = _load("passphrase-n1.json")["vector"]
+    plaintext = bytes.fromhex(str(vector["plaintext_hex"]))
+    hashes = _hashes_from_fixture(vector["hashes"])
+    params = Argon2idParams(
+        m=int(vector["params"]["m"]), t=int(vector["params"]["t"]), p=int(vector["params"]["p"])
+    )
+    for sizes in ([1], [7], [31], [max(len(plaintext), 1)]):
+        envelope, gen = passphrase_sealed_poe_seal_stream(
+            plaintext=_chunked(plaintext, sizes),
+            passphrase=str(vector["passphrase"]),
+            hashes=hashes,
+            params=params,
+            salt=bytes.fromhex(str(vector["salt_hex"])),
+            nonce=bytes.fromhex(str(vector["nonce_hex"])),
+        )
+        blob = b"".join(gen)
+        assert blob.hex() == vector["expected_ciphertext_hex"], sizes
+        assert blob[:32].hex() == vector["expected_commitment_hex"], sizes
+        assert envelope.alg == "argon2id"
+
+
+def test_passphrase_open_stream_recovers_the_pinned_vector() -> None:
+    vector = _load("passphrase-n1.json")["vector"]
+    blob = bytes.fromhex(str(vector["expected_ciphertext_hex"]))
+    hashes = _hashes_from_fixture(vector["hashes"])
+    envelope = PassphraseEnvelope(
+        scheme=1,
+        aead="chacha20-poly1305-stream64k",
+        nonce=bytes.fromhex(str(vector["nonce_hex"])),
+        alg="argon2id",
+        salt=bytes.fromhex(str(vector["salt_hex"])),
+        params=Argon2idParams(
+            m=int(vector["params"]["m"]),
+            t=int(vector["params"]["t"]),
+            p=int(vector["params"]["p"]),
+        ),
+    )
+    # 47 / 48 straddle the lookahead floor; the rest cut across the STREAM grid.
+    for sizes in ([1], [7], [47], [48], [len(blob)]):
+        gen, result = passphrase_sealed_poe_open_stream(
+            envelope=envelope,
+            ciphertext=_chunked(blob, sizes),
+            passphrase=str(vector["passphrase"]),
+            hashes=hashes,
+        )
+        plaintext = b"".join(gen)
+        assert result.opened is True, sizes
+        assert plaintext.hex() == vector["expected_plaintext_hex"], sizes
+
+
+@pytest.mark.parametrize("size", [0, 1, CHUNK_SIZE, 2 * CHUNK_SIZE, 2 * CHUNK_SIZE + 4242])
+def test_passphrase_stream_seal_equals_buffered_across_the_chunk_matrix(size: int) -> None:
+    # The chunk-boundary size matrix vs the buffered seal: empty (the sole
+    # empty-final-chunk case), one byte, an exact 64 KiB chunk (full-size final
+    # chunk), an exact multiple (NO trailing empty chunk), and an odd
+    # multi-chunk length — each streamed at source granularities that cut
+    # across the 64 KiB grid.
+    plaintext = bytes((i * 7) & 0xFF for i in range(size))
+    buffered = passphrase_sealed_poe_seal(
+        plaintext=plaintext,
+        passphrase=_PW,
+        hashes=_PW_HASHES,
+        params=_PW_PARAMS,
+        salt=_PW_SALT,
+        nonce=_PW_NONCE,
+    )
+    for sizes in ([1], [65537], [CHUNK_SIZE]):
+        envelope, gen = passphrase_sealed_poe_seal_stream(
+            plaintext=_chunked(plaintext, sizes),
+            passphrase=_PW,
+            hashes=_PW_HASHES,
+            params=_PW_PARAMS,
+            salt=_PW_SALT,
+            nonce=_PW_NONCE,
+        )
+        assert envelope == buffered.envelope, (size, sizes)
+        assert b"".join(gen) == buffered.ciphertext, (size, sizes)
+
+    # And the streamed open recovers the plaintext from the buffered blob at a
+    # grid-straddling source granularity.
+    gen, result = passphrase_sealed_poe_open_stream(
+        envelope=buffered.envelope,
+        ciphertext=_chunked(buffered.ciphertext, [65537]),
+        passphrase=_PW,
+        hashes=_PW_HASHES,
+    )
+    assert b"".join(gen) == plaintext, size
+    assert result.opened is True, size
+
+
+def test_passphrase_open_stream_wrong_passphrase_rejects_with_nothing_yielded() -> None:
+    blob = _pw_stream_seal(bytes(100), [100])
+    gen, result = passphrase_sealed_poe_open_stream(
+        envelope=_PW_ENVELOPE,
+        ciphertext=_chunked(blob, [17]),
+        passphrase="not the passphrase",
+        hashes=_PW_HASHES,
+    )
+    # A commitment mismatch resolves eagerly and yields nothing.
+    assert result.opened is False
+    assert list(gen) == []
+
+
+def test_passphrase_open_stream_flipped_commitment_byte_rejects_with_nothing_yielded() -> None:
+    blob = bytearray(_pw_stream_seal(bytes(100), [100]))
+    blob[0] ^= 0x01  # inside the 32-byte commitment header
+    gen, result = passphrase_sealed_poe_open_stream(
+        envelope=_PW_ENVELOPE,
+        ciphertext=_chunked(bytes(blob), [17]),
+        passphrase=_PW,
+        hashes=_PW_HASHES,
+    )
+    assert result.opened is False
+    assert list(gen) == []
+
+
+def test_passphrase_open_stream_flipped_final_tag_rejects_mid_body() -> None:
+    # Flip a byte in the final chunk's tag: the commitment still matches (the
+    # header is intact), so the failure surfaces mid-body as the same single
+    # generic rejection; the already-yielded first chunk is quarantine the
+    # caller discards.
+    plaintext = bytes((i * 3) & 0xFF for i in range(CHUNK_SIZE + 33))
+    blob = bytearray(_pw_stream_seal(plaintext, [CHUNK_SIZE]))
+    blob[-1] ^= 0x01
+    gen, result = passphrase_sealed_poe_open_stream(
+        envelope=_PW_ENVELOPE,
+        ciphertext=_chunked(bytes(blob), [65537]),
+        passphrase=_PW,
+        hashes=_PW_HASHES,
+    )
+    yielded = b"".join(gen)
+    assert result.opened is False
+    # The intact first chunk was released before the tamper was detected.
+    assert yielded == plaintext[:CHUNK_SIZE]
+
+
+def test_passphrase_open_stream_source_below_floor_rejects_without_kdf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 47 bytes is one short of the 48-byte well-formedness floor (32-byte
+    # commitment + lone final tag): the lookahead rejects it exactly as the
+    # buffered open's length check does, before any Argon2 work.
+    import cardanowall._crypto.sealed_poe as sealed_poe_module
+
+    def _kdf_must_not_run(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("argon2id_v13 must not run for a source below the structural floor")
+
+    monkeypatch.setattr(sealed_poe_module, "argon2id_v13", _kdf_must_not_run)
+    gen, result = passphrase_sealed_poe_open_stream(
+        envelope=_PW_ENVELOPE,
+        ciphertext=_chunked(b"\x00" * 47, [5]),
+        passphrase=_PW,
+        hashes=_PW_HASHES,
+    )
+    assert result.opened is False
+    assert list(gen) == []
+
+
+def test_passphrase_stream_typed_rejections_mirror_the_buffered_pair() -> None:
+    # Seal: a 15-byte salt is the buffered seal's typed rejection, raised
+    # eagerly before any plaintext is consumed.
+    with pytest.raises(EciesSealedPoeError) as exc:
+        passphrase_sealed_poe_seal_stream(
+            plaintext=[b"body"],
+            passphrase=_PW,
+            hashes=_PW_HASHES,
+            params=_PW_PARAMS,
+            salt=b"\x01" * 15,
+            nonce=_PW_NONCE,
+        )
+    assert exc.value.code == "ENC_PASSPHRASE_SALT_TOO_SHORT"
+
+    # Open: below-floor params are a typed error even when the blob is also
+    # below the structural floor — the envelope shape strictly precedes any
+    # blob-dependent work.
+    below_floor = PassphraseEnvelope(
+        scheme=1,
+        aead="chacha20-poly1305-stream64k",
+        nonce=_PW_NONCE,
+        alg="argon2id",
+        salt=_PW_SALT,
+        params=Argon2idParams(m=8, t=1, p=1),
+    )
+    with pytest.raises(EciesSealedPoeError) as exc:
+        passphrase_sealed_poe_open_stream(
+            envelope=below_floor,
+            ciphertext=[b"\x00" * 47],
+            passphrase=_PW,
+            hashes=_PW_HASHES,
+        )
+    assert exc.value.code == "ENC_PASSPHRASE_ARGON2_PARAMS_TOO_LOW"
+
+    # Open: an unsupported aead identifier is a typed error.
+    bad_aead = PassphraseEnvelope(
+        scheme=1,
+        aead="aes-gcm",
+        nonce=_PW_NONCE,
+        alg="argon2id",
+        salt=_PW_SALT,
+        params=_PW_PARAMS,
+    )
+    with pytest.raises(EciesSealedPoeError) as exc:
+        passphrase_sealed_poe_open_stream(
+            envelope=bad_aead,
+            ciphertext=[b"\x00" * 47],
+            passphrase=_PW,
+            hashes=_PW_HASHES,
+        )
+    assert exc.value.code == "UNSUPPORTED_AEAD_ALG"
+
+
+def test_passphrase_streaming_seal_returns_envelope_before_body_consumed() -> None:
+    # The envelope and the commitment are resolved up front: available before
+    # a single body chunk is iterated (the body generator is lazy).
+    def never_iterated() -> Iterator[bytes]:
+        raise AssertionError("plaintext iterated before body consumed")
+        yield b""  # pragma: no cover
+
+    envelope, _body = passphrase_sealed_poe_seal_stream(
+        plaintext=never_iterated(),
+        passphrase=_PW,
+        hashes=_PW_HASHES,
+        params=_PW_PARAMS,
+        salt=_PW_SALT,
+        nonce=_PW_NONCE,
+    )
+    assert envelope.scheme == 1
+    assert envelope.salt == _PW_SALT
+
+
+def test_passphrase_seal_stream_cancel_raises() -> None:
+    _envelope, gen = passphrase_sealed_poe_seal_stream(
+        plaintext=[b"a" * CHUNK_SIZE, b"b" * CHUNK_SIZE],
+        passphrase=_PW,
+        hashes=_PW_HASHES,
+        params=_PW_PARAMS,
+        salt=_PW_SALT,
+        nonce=_PW_NONCE,
+        cancel=lambda: True,
+    )
+    with pytest.raises(EciesSealedPoeError) as exc:
+        list(gen)
+    assert exc.value.code == "CANCELLED"
+
+
+def test_passphrase_open_stream_cancel_raises() -> None:
+    blob = _pw_stream_seal(bytes(2 * CHUNK_SIZE), [CHUNK_SIZE])
+    gen, result = passphrase_sealed_poe_open_stream(
+        envelope=_PW_ENVELOPE,
+        ciphertext=_chunked(blob, [CHUNK_SIZE + 16]),
+        passphrase=_PW,
+        hashes=_PW_HASHES,
+        cancel=lambda: True,
+    )
+    with pytest.raises(EciesSealedPoeError) as exc:
+        list(gen)
+    assert exc.value.code == "CANCELLED"
+    # The outcome stays unresolved on cancellation.
+    assert result.opened is None

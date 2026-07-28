@@ -18,6 +18,8 @@ drift apart silently.
 
 from __future__ import annotations
 
+from typing import cast
+
 from cardanowall import (
     PoeRecord,
     derive_mlkem768x25519_keypair_from_seed,
@@ -33,13 +35,15 @@ from cardanowall.estimate import (
     MAX_RECORD_BYTES,
     EstimateKem,
     ItemShape,
+    KemEncShape,
     MerkleShape,
+    PassphraseEncShape,
     RecordShape,
     _cbor_header_len,
     estimate_record_bytes,
 )
 from cardanowall.merkle import MERKLE_ALG_ID, merkle_sha2_256_root
-from cardanowall.poe_standard import Item
+from cardanowall.poe_standard import EncryptionEnvelope, Item
 
 # 48 characters — the cross-SDK parity-table URI (5-byte scheme + 43-byte id).
 URI = "ar://0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"
@@ -115,7 +119,7 @@ def _assert_tight(shape: RecordShape, record: PoeRecord, slack: int) -> None:
 
 
 def test_parity_table_matches_cross_sdk_literals() -> None:
-    """The exact same six literals are asserted in the TypeScript and Rust
+    """The exact same seven literals are asserted in the TypeScript and Rust
     estimator tests; a change here is a cross-SDK breaking change."""
     assert len(URI) == 48
     t1 = RecordShape(items=[ItemShape(hash_algs=["sha2-256"])])
@@ -135,7 +139,13 @@ def test_parity_table_matches_cross_sdk_literals() -> None:
     assert estimate_record_bytes(t4) == 292
 
     t5 = RecordShape(
-        items=[ItemShape(hash_algs=["sha2-256"], uris=[URI], recipient_count=2, kem="x25519")]
+        items=[
+            ItemShape(
+                hash_algs=["sha2-256"],
+                uris=[URI],
+                enc=KemEncShape(kem="x25519", recipient_count=2),
+            )
+        ]
     )
     assert estimate_record_bytes(t5) == 472
 
@@ -144,13 +154,24 @@ def test_parity_table_matches_cross_sdk_literals() -> None:
             ItemShape(
                 hash_algs=["sha2-256"],
                 uris=[URI],
-                recipient_count=11,
-                kem="mlkem768x25519",
+                enc=KemEncShape(kem="mlkem768x25519", recipient_count=11),
             )
         ],
         signed=True,
     )
     assert estimate_record_bytes(t6) == 13459
+
+    t7 = RecordShape(
+        items=[
+            ItemShape(
+                hash_algs=["sha2-256", "blake2b-256"],
+                uris=[URI],
+                enc=PassphraseEncShape(),
+            )
+        ],
+        signed=True,
+    )
+    assert estimate_record_bytes(t7) == 457
 
 
 # ---------------------------------------------------------------------------
@@ -275,8 +296,7 @@ def test_sealed_x25519_many_recipients_is_bounded() -> None:
             ItemShape(
                 hash_algs=["sha2-256"],
                 uris=[uri],
-                recipient_count=recipient_count,
-                kem="x25519",
+                enc=KemEncShape(kem="x25519", recipient_count=recipient_count),
             )
         ]
     )
@@ -297,14 +317,85 @@ def test_sealed_xwing_signed_is_bounded() -> None:
             ItemShape(
                 hash_algs=["sha2-256"],
                 uris=[uri],
-                recipient_count=recipient_count,
-                kem="mlkem768x25519",
+                enc=KemEncShape(kem="mlkem768x25519", recipient_count=recipient_count),
             )
         ],
         signed=True,
     )
     record: PoeRecord = {"v": 1, "items": [item]}
     _assert_upper_bound(shape, _signed(record, b"\x33" * 32))
+
+
+def _passphrase_envelope_wire(salt: bytes, m: int, t: int, p: int) -> EncryptionEnvelope:
+    """A real scheme-1 passphrase envelope (4 keys, no slots) with the given
+    salt and Argon2id parameters, exactly as the passphrase publish path
+    lowers it into the record."""
+    return cast(
+        "EncryptionEnvelope",
+        {
+            "scheme": 1,
+            "aead": "chacha20-poly1305-stream64k",
+            "nonce": b"\x66" * 24,
+            "passphrase": {
+                "alg": "argon2id",
+                "salt": salt,
+                "params": {"m": m, "t": t, "p": p},
+            },
+        },
+    )
+
+
+def test_sealed_passphrase_signed_is_a_tight_upper_bound() -> None:
+    """A signed passphrase-sealed record at the canonical producer shape
+    (16-byte salt, registry-floor parameters): the estimate must bound the
+    real encoding and stay tight — the only slack is the fixed safety margin
+    plus the fixed-id maxima."""
+    uri = "ar://0123456789abcdefghijklmnopqrstuvwxyzABCDEF"
+    shape = RecordShape(
+        items=[
+            ItemShape(
+                hash_algs=["sha2-256", "blake2b-256"],
+                uris=[uri],
+                enc=PassphraseEncShape(),
+            )
+        ],
+        signed=True,
+    )
+    record: PoeRecord = {
+        "v": 1,
+        "items": [
+            {
+                "hashes": {"sha2-256": b"\xab" * 32, "blake2b-256": b"\xcd" * 32},
+                "uris": [uri],
+                "enc": _passphrase_envelope_wire(b"\x55" * 16, 65536, 3, 1),
+            },
+        ],
+    }
+    _assert_tight(shape, _signed(record, b"\x2c" * 32), 64)
+
+
+def test_passphrase_charge_covers_the_in_contract_parameter_region() -> None:
+    """The passphrase charge stays an upper bound across the whole in-contract
+    parameter region: ``m`` anywhere in the u32 wire range (its floor already
+    charges the 4-byte-extension uint width) and ``t`` / ``p`` up to CBOR's
+    one-byte immediate maximum of 23."""
+    shape = RecordShape(items=[ItemShape(hash_algs=["sha2-256"], enc=PassphraseEncShape())])
+    for m, t, p in [
+        (65536, 3, 1),
+        (2**32 - 1, 3, 1),
+        (65536, 23, 23),
+        (2**32 - 1, 23, 23),
+    ]:
+        record: PoeRecord = {
+            "v": 1,
+            "items": [
+                {
+                    "hashes": {"sha2-256": b"\xab" * 32},
+                    "enc": _passphrase_envelope_wire(b"\x55" * 16, m, t, p),
+                },
+            ],
+        }
+        _assert_upper_bound(shape, record)
 
 
 # ---------------------------------------------------------------------------
@@ -363,8 +454,7 @@ def test_estimate_is_tight_for_sealed_xwing_signed() -> None:
             ItemShape(
                 hash_algs=["sha2-256"],
                 uris=[uri],
-                recipient_count=recipient_count,
-                kem="mlkem768x25519",
+                enc=KemEncShape(kem="mlkem768x25519", recipient_count=recipient_count),
             )
         ],
         signed=True,
@@ -389,8 +479,7 @@ def test_realistic_many_xwing_record_under_ceiling_is_not_rejected() -> None:
             ItemShape(
                 hash_algs=["sha2-256"],
                 uris=[uri],
-                recipient_count=recipient_count,
-                kem="mlkem768x25519",
+                enc=KemEncShape(kem="mlkem768x25519", recipient_count=recipient_count),
             )
         ],
         signed=True,
@@ -443,6 +532,11 @@ def test_absurd_recipient_count_stays_above_ceiling() -> None:
     the cross-SDK property the saturating TS/RS arithmetic protects: an absurd
     recipient count can never come out under the ceiling check."""
     shape = RecordShape(
-        items=[ItemShape(hash_algs=["sha2-256"], recipient_count=2**53, kem="mlkem768x25519")]
+        items=[
+            ItemShape(
+                hash_algs=["sha2-256"],
+                enc=KemEncShape(kem="mlkem768x25519", recipient_count=2**53),
+            )
+        ]
     )
     assert estimate_record_bytes(shape) >= MAX_RECORD_BYTES
